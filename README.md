@@ -1,2 +1,5 @@
-# enterprise-mlops-access-test
-Private repository for testing access. No application code or customer data.
+# Enterprise MLOps CI on AWS
+
+Sample repository for enterprise MLOps and CI/CD workflows on AWS.
+
+Implementation and usage examples will be added in a future update.
