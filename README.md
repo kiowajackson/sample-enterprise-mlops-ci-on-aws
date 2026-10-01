@@ -10,8 +10,8 @@ It starts one small, billable Processing job using synthetic values and displays
 
 ## Development notebook
 
-[03B_model_development.ipynb](examples/notebooks/03B_model_development.ipynb) runs Prepare, Train, Evaluate and Predict directly in Python.
+[03B_model_development.ipynb](examples/notebooks/03B_model_development.ipynb) walks through the training and batch entry points directly in Python. Prepare exposes feature selection and the splits; Train shows transformed X/y and the checkpoint; Evaluate shows metrics and held-out predictions. It then runs batch preprocessing, the real serving handler through an in-process request client, and postprocessing. Direct Predict remains a separate comparison.
 
 Download it into `examples/notebooks/` in your existing application checkout and open it with a fresh kernel. It needs the application's `mlops-models/` source, model configuration and `examples/data/` CSVs. This branch contains notebooks, not the full application source.
 
-The development notebook uses the current kernel's modeling packages and does not need Docker, the SageMaker SDK, CDK or AWS credentials for its local CSV example. Outputs are cleared before publication.
+The development notebook uses the current kernel's modeling packages plus Flask, an existing application dependency. It does not need Docker, the SageMaker SDK, CDK or AWS credentials for its local CSV example. Package validation uses explicit local-development mode; registry approval, registration, CreateModel and managed jobs are not performed. Outputs are cleared before publication.
