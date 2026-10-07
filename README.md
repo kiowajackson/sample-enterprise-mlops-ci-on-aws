@@ -2,6 +2,22 @@
 
 Sample enterprise MLOps and CI/CD workflows on AWS.
 
+## Deployment diagnostics
+
+[00F_deployment_diagnostics.ipynb](examples/notebooks/00F_deployment_diagnostics.ipynb)
+runs with no required settings and makes no cloud changes by default. Individual
+cells show the actual AWS/Docker commands, original errors and independent results.
+It checks identity, Python packages, Docker, Cloud9, S3, ECR, existing roles/pipelines,
+build projects and standard CDK bootstrap visibility. The last cell prints one summary.
+
+Separate switches test pipeline create/update/start, S3 write/read/delete, ECR
+repository creation, and Docker pull/build/push using an approved base/repository.
+The pipeline probe launches no jobs and needs no container. It does not establish
+runtime job permissions. Cleanup cells remove only this kernel's probe resources.
+Run it in Studio and in the proposed builder to compare actual capabilities.
+The notebook stands alone; no application checkout, CDK or SageMaker SDK is required.
+Outputs are cleared. Older notebooks remain available below.
+
 ## Quick access check
 
 [00E_check_access_defaults.ipynb](examples/notebooks/00E_check_access_defaults.ipynb) reproduces access errors with the current notebook role and an automatically selected AWS image. There are no required settings. CreatePipeline, UpdatePipeline and StartPipelineExecution come first, with the actual boto3 calls visible and the original exceptions printed. Starting the probe launches one small, billable Processing job.
