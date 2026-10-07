@@ -17,3 +17,20 @@ For S3, supply a bucket or leave it blank to use the first listed bucket; the no
 Download it into `examples/notebooks/` in your existing application checkout and open it with a fresh kernel. It needs the application's `mlops-models/` source, model configuration and `examples/data/` CSVs. This branch contains notebooks, not the full application source.
 
 The development notebook uses the current kernel's modeling packages plus Flask, an existing application dependency. It does not need Docker, the SageMaker SDK, CDK or AWS credentials for its local CSV example. Package validation uses explicit local-development mode; registry approval, registration, CreateModel and managed jobs are not performed. Outputs are cleared before publication.
+
+
+## Remote build and managed execution
+
+[03E_build_and_run_managed.ipynb](examples/notebooks/03E_build_and_run_managed.ipynb)
+packages the selected model with the application's existing Dockerfile and locked
+dependencies, uploads the source ZIP, and asks an approved CodeBuild project to build
+and push the image. It then creates or updates a separate development pipeline and
+runs Prepare → Train → Evaluate, with visible boto3 calls and log/output inspection.
+The notebook itself needs neither Docker nor CDK.
+
+Download it into `examples/notebooks/` in the existing application checkout.
+Provide an approved S3 prefix, an existing build-only CodeBuild project, a pipeline
+role and a separate job role. Supply an approved base-image digest when required.
+The platform team provisions the builder and roles; ECR repository creation is
+included when permitted. Builds and managed jobs incur normal AWS charges.
+The optional final cell deletes only the development pipeline. Outputs are cleared.
