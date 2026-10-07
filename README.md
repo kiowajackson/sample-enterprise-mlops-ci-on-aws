@@ -2,11 +2,13 @@
 
 Sample enterprise MLOps and CI/CD workflows on AWS.
 
-## Managed access check
+## Quick access check
 
-[00D_check_managed_pipeline.ipynb](examples/notebooks/00D_check_managed_pipeline.ipynb) shows one explicit boto3 command per check, followed by its response or exact error. S3, existing SageMaker resources, ECR metadata, CloudWatch and CDK bootstrap reads are checked independently. A failed pipeline creation does not stop those checks. No application checkout, Docker, CDK or SageMaker SDK is required.
+[00E_check_access_defaults.ipynb](examples/notebooks/00E_check_access_defaults.ipynb) reproduces access errors with the current notebook role and an automatically selected AWS image. There are no required settings. CreatePipeline, UpdatePipeline and StartPipelineExecution come first, with the actual boto3 calls visible and the original exceptions printed. Starting the probe launches one small, billable Processing job.
 
-Start with the read-only checks. Configure the input bucket/key to test direct S3 access even if listing buckets is denied. S3 writes and pipeline create/start each have explicit switches, off by default. The managed probe uses separate pipeline and job roles and starts one small, billable Processing job with synthetic values. Separate cleanup cells remove only the probe pipeline and its scratch object. Results remain below each command and are also saved locally. Keep outputs and account-specific settings in your environment; the published notebook has cleared outputs.
+For S3, supply a bucket or leave it blank to use the first listed bucket; the notebook selects a file and reads up to 1 KiB without printing its contents. Pipeline failure does not stop these checks. Later cells inspect execution, job status and logs. The final cleanup cell is optional. No reporting helpers, custom error framework or application checkout are required. Outputs are cleared before publication.
+
+[00D_check_managed_pipeline.ipynb](examples/notebooks/00D_check_managed_pipeline.ipynb) remains available for explicitly chosen resources and more extensive checks, including separate pipeline/job roles and S3 writes.
 
 ## Development notebook
 
