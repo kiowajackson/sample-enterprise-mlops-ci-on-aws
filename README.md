@@ -2,6 +2,26 @@
 
 Sample enterprise MLOps and CI/CD workflows on AWS.
 
+## Run code in existing managed images
+
+[00G_check_managed_images.ipynb](examples/notebooks/00G_check_managed_images.ipynb)
+compares an AWS-provided scikit-learn image with a platform image discovered by a
+repository-name fragment (`model-build` by default). Paste the full working IAM
+role ARN, including its path; the notebook never guesses it or calls IAM.
+Supply a separate job role when available. Enable either test independently.
+
+Each test creates a small, billable Processing pipeline, runs a visible Python
+command, waits for completion and prints actual job details and CloudWatch output.
+No local Docker, image build/copy, CDK, input data or S3 write is required. The
+initial code prints Python/module availability and a calculation; an alternative
+small scikit-learn fit/predict command is included. Longer source folders require
+an approved S3 input location. Runtime and orchestration roles still need their
+respective permissions; technical success does not establish image-use approval.
+
+The notebook also inspects Studio's Docker proxy/settings without starting a
+daemon or changing the domain. Cleanup of its own pipelines is explicit and
+optional. It requires only boto3 and Python's standard library. Outputs are cleared.
+
 ## Deployment diagnostics
 
 [00F_deployment_diagnostics.ipynb](examples/notebooks/00F_deployment_diagnostics.ipynb)
