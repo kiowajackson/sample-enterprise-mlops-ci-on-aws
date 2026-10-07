@@ -4,9 +4,9 @@ Sample enterprise MLOps and CI/CD workflows on AWS.
 
 ## Managed access check
 
-[00D_check_managed_pipeline.ipynb](examples/notebooks/00D_check_managed_pipeline.ipynb) checks whether the current AWS role can create, update and execute a SageMaker pipeline using a standard AWS container. It runs independently with boto3; no application checkout, Docker, CDK or SageMaker SDK is required.
+[00D_check_managed_pipeline.ipynb](examples/notebooks/00D_check_managed_pipeline.ipynb) shows one explicit boto3 command per check, followed by its response or exact error. S3, existing SageMaker resources, ECR metadata, CloudWatch and CDK bootstrap reads are checked independently. A failed pipeline creation does not stop those checks. No application checkout, Docker, CDK or SageMaker SDK is required.
 
-It starts one small, billable Processing job using synthetic values and displays a single access summary. S3 output is optional. An optional final cell removes the probe pipeline and is off by default. Keep execution outputs and account-specific settings in your environment.
+Start with the read-only checks. Configure the input bucket/key to test direct S3 access even if listing buckets is denied. S3 writes and pipeline create/start each have explicit switches, off by default. The managed probe uses separate pipeline and job roles and starts one small, billable Processing job with synthetic values. Separate cleanup cells remove only the probe pipeline and its scratch object. Results remain below each command and are also saved locally. Keep outputs and account-specific settings in your environment; the published notebook has cleared outputs.
 
 ## Development notebook
 
