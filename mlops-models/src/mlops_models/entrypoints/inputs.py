@@ -68,7 +68,7 @@ def print_path_checks(read_paths=(), write_paths=()):
     import shutil
     import tempfile
 
-    process = {"event": "path_check_process", "revision": "paths-v2", "uid": os.geteuid(),
+    process = {"event": "path_check_process", "revision": "paths-v3", "uid": os.geteuid(),
                "gid": os.getegid(), "groups": os.getgroups(), "cwd": os.getcwd()}
     try:
         for line in Path("/proc/self/status").read_text().splitlines():
@@ -112,10 +112,16 @@ def print_path_checks(read_paths=(), write_paths=()):
                 record["mount"] = max(candidates, key=lambda mount: len(mount["path"]))
             if parent.is_dir():
                 record["free_bytes"] = shutil.disk_usage(parent).free
-            if path in reads and path.is_file():
-                with path.open("rb") as stream:
-                    stream.read(1)
-                record["file_read"] = "ok"
+            if path in reads:
+                # A Processing input is usually a directory: verify one real CSV without logging its data.
+                sample = next(path.rglob("*.csv"), None) if path.is_dir() else path
+                if sample is not None and sample.is_file():
+                    record["sample_input_file"] = str(sample)
+                    with sample.open("rb") as stream:
+                        stream.read(1)
+                    record["file_read"] = "ok"
+                else:
+                    record["file_read"] = "no input CSV found"
             if path in writes:
                 record["probe_directory"] = str(parent)
                 with tempfile.NamedTemporaryFile(prefix=".mlops-path-check-", dir=parent) as probe:
