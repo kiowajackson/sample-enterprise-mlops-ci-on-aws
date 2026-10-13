@@ -49,6 +49,86 @@ def upload_processing_outputs(config, output_dir, scratch):
     print(json.dumps({"event": "processing_outputs_uploaded", "files": len(uploads)}), flush=True)
 
 
+def print_training_path_checks(output_dir, model_dir):
+    """Temporarily diagnose Training write locations without changing their permissions."""
+    import pwd
+    import shutil
+
+    process = {"event": "training_path_checks", "revision": "training-paths-v1",
+               "uid": os.getuid(), "effective_uid": os.geteuid(),
+               "gid": os.getgid(), "effective_gid": os.getegid(), "groups": os.getgroups(),
+               "cwd": os.getcwd(), "output_dir": str(output_dir), "model_dir": str(model_dir),
+               "environment": {key: os.environ[key] for key in (
+                   "HOME", "TMPDIR", "TMP", "TEMP", "SM_OUTPUT_DIR", "SM_OUTPUT_DATA_DIR", "SM_MODEL_DIR"
+               ) if key in os.environ}}
+    home = os.environ.get("HOME")
+    try:
+        user = pwd.getpwuid(os.geteuid())
+        process.update(user=user.pw_name, account_home=user.pw_dir)
+        home = user.pw_dir
+    except KeyError:
+        process["account_home"] = "No passwd entry for the effective UID"
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key in {"Umask", "CapEff", "NoNewPrivs"}:
+                process[key] = value.strip()
+    except OSError as error:
+        process["process_details_error"] = str(error)
+    mounts = []
+    try:
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            fields = line.split()
+            separator = fields.index("-")
+            mounts.append({"path": fields[4].replace("\\040", " "), "options": fields[5],
+                           "filesystem": fields[separator + 1]})
+    except (OSError, ValueError, IndexError) as error:
+        process["mount_details_error"] = str(error)
+    print(json.dumps(process), flush=True)
+
+    paths = [output_dir, Path(output_dir) / "checkpoint", Path(output_dir).parent,
+             model_dir, Path(model_dir).parent, "/tmp", "/var/tmp", home,
+             *(os.environ.get(key) for key in ("HOME", "TMPDIR", "TMP", "TEMP"))]
+    for path in dict.fromkeys(Path(p).absolute() for p in paths if p):
+        record = {"event": "training_path_check", "path": str(path)}
+        try:
+            record["exists"] = path.exists()
+            parent = path
+            while not parent.exists() and parent != parent.parent:
+                parent = parent.parent
+            info = parent.stat()
+            record.update(inspected_path=str(parent), owner_uid=info.st_uid, owner_gid=info.st_gid,
+                          mode=oct(info.st_mode & 0o7777),
+                          write_access=os.access(parent, os.W_OK, effective_ids=True),
+                          probe_scope="requested path" if path.exists() else "nearest existing parent",
+                          free_bytes=shutil.disk_usage(parent).free)
+            candidates = [mount for mount in mounts if parent.resolve().is_relative_to(mount["path"])]
+            if candidates:
+                record["mount"] = max(candidates, key=lambda mount: len(mount["path"]))
+            # Test both operations independently; a denied path must not prevent later checks.
+            for kind in ("file", "directory"):
+                try:
+                    if kind == "file":
+                        with tempfile.NamedTemporaryFile(prefix=".mlops-training-check-", dir=parent) as probe:
+                            probe.write(b"training path check\n")
+                            probe.flush()
+                            probe.seek(0)
+                            matches = probe.read() == b"training path check\n"
+                    else:
+                        with tempfile.TemporaryDirectory(prefix=".mlops-training-check-", dir=parent) as work:
+                            probe = Path(work) / "check.txt"
+                            probe.write_bytes(b"training path check\n")
+                            matches = probe.read_bytes() == b"training path check\n"
+                    record[kind + "_probe"] = {"status": "ok", "readback_matches": matches}
+                except OSError as error:
+                    record[kind + "_probe"] = {"status": "failed", "errno": error.errno,
+                                               "error_type": type(error).__name__, "error": str(error)}
+        except OSError as error:
+            record.update(error=str(error), errno=error.errno, error_type=type(error).__name__)
+        print(json.dumps(record), flush=True)
+    print(json.dumps({"event": "training_path_checks_complete", "revision": "training-paths-v1"}), flush=True)
+
+
 def main():
     """Load source, dispatch one step, then publish its application-managed outputs."""
     parser = argparse.ArgumentParser(add_help=False)
@@ -83,6 +163,11 @@ def main():
                               "source": str(source),
                               "identity": json.loads(identity.read_text()) if identity.exists() else {}}),
                   flush=True)
+            if selected.step == "train":
+                from mlops_models.runtime.job_paths import job_paths
+                _, output_path, model_path = job_paths("train")
+                print_training_path_checks(selected.output or output_path, selected.model_dir or model_path)
+
             # main() is the stable command interface, including for older checkpoints.
             from mlops_models.entrypoints.__main__ import main as dispatch_command
             if checkpoint is not None:
