@@ -24,13 +24,15 @@ def sample_type(values):
 
 
 def generate_sample(metadata_csv, output_dir, *, rows=100, record_id="customer_id",
-                    event_time="feature_asof_dt", asof="2026-01-01T00:00:00Z", type_overrides=None):
+                    event_time="feature_asof_dt", asof="2026-01-01T00:00:00Z", type_overrides=None,
+                    deduplicate=False):
     """Repeat ref_val1..5 as rows, preserving column_name and retaining its source mapping.
 
     Return local sample, mapping and source-metadata paths. No AWS calls.
     Type/length codes are retained, not interpreted as a confirmed data dictionary.
     Configured ID/time columns may repeat across source tables. Generate them once
     in the sample; group_columns adds them to every Feature Store group.
+    For dummy data, deduplicate=True keeps the first definition of each column.
     """
     if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
         raise ValueError("rows must be a positive integer.")
@@ -48,6 +50,14 @@ def generate_sample(metadata_csv, output_dir, *, rows=100, record_id="customer_i
     unknown = set(overrides) - {row["column_name"] for row in metadata}
     if unknown:
         raise ValueError(f"Unknown type override columns: {sorted(unknown)}")
+
+    if deduplicate:
+        first_by_name = {}
+        for row in metadata:
+            row["column_name"] = row["column_name"].strip()
+            first_by_name.setdefault(row["column_name"].lower(), row)
+        print(f"Dummy metadata: removed {len(metadata) - len(first_by_name)} duplicate column definitions.")
+        metadata = list(first_by_name.values())
 
     # Shared keys already have generated values; they are not ordinary features.
     key_names = {record_id.lower(), event_time.lower()}
