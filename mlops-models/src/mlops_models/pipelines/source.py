@@ -207,6 +207,19 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
         if kind == "inference":
             configure_approved_inference(body, group, source_uri, batch_runtime, region)
         apply_job_settings(body, infrastructure or {})
+        if kind == "training":
+            train = next(step for step in walk_steps(body["Steps"]) if step["Name"] == "Train")["Arguments"]
+            if not train.get("EnableNetworkIsolation", False):
+                # Source-delivered ordinary Training uploads its artifacts from writable scratch.
+                # Keep these separate from SageMaker's native <job>/output artifacts.
+                run = join(output, {"Get": "Execution.PipelineExecutionId"})
+                model_uri = join(run, "model/application/model.tar.gz")
+                train["Environment"].update(
+                    MLOPS_TRAINING_MODEL_URI=model_uri,
+                    MLOPS_TRAINING_REPORTS_URI=join(run, "reports/training/output.tar.gz"),
+                    MLOPS_TRAINING_KMS_KEY=train["OutputDataConfig"].get("KmsKeyId", ""))
+                # Evaluate already depends on Train; registry reads its reported checkpoint_uri.
+                body = replace(body, [({"Get": "Steps.Train.ModelArtifacts.S3ModelArtifacts"}, model_uri)])
         for step in walk_steps(body["Steps"]):
             if step["Type"] != "Processing":
                 continue

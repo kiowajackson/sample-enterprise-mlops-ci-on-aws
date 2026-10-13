@@ -4,7 +4,8 @@ The publisher copies this file beside mlops_models in S3. SageMaker downloads it
 as a source input. Evaluation/inference use the code retained in model.tar.gz.
 For application-managed Processing outputs, this script supplies a writable
 scratch directory and uploads completed outputs to their configured S3 locations.
-Ordinary Training keeps SageMaker's output handling. HPO uses the image entrypoint.
+Ordinary Training can also save in scratch and upload its model/report archives.
+The pipeline then evaluates that explicit model URI. HPO uses the image entrypoint.
 """
 
 import argparse
@@ -49,84 +50,34 @@ def upload_processing_outputs(config, output_dir, scratch):
     print(json.dumps({"event": "processing_outputs_uploaded", "files": len(uploads)}), flush=True)
 
 
-def print_training_path_checks(output_dir, model_dir):
-    """Temporarily diagnose Training write locations without changing their permissions."""
-    import pwd
-    import shutil
+def upload_training_outputs(work):
+    """Upload the completed model (including code) and auxiliary reports from Training scratch."""
+    import boto3
 
-    process = {"event": "training_path_checks", "revision": "training-paths-v1",
-               "uid": os.getuid(), "effective_uid": os.geteuid(),
-               "gid": os.getgid(), "effective_gid": os.getegid(), "groups": os.getgroups(),
-               "cwd": os.getcwd(), "output_dir": str(output_dir), "model_dir": str(model_dir),
-               "environment": {key: os.environ[key] for key in (
-                   "HOME", "TMPDIR", "TMP", "TEMP", "SM_OUTPUT_DIR", "SM_OUTPUT_DATA_DIR", "SM_MODEL_DIR"
-               ) if key in os.environ}}
-    home = os.environ.get("HOME")
-    try:
-        user = pwd.getpwuid(os.geteuid())
-        process.update(user=user.pw_name, account_home=user.pw_dir)
-        home = user.pw_dir
-    except KeyError:
-        process["account_home"] = "No passwd entry for the effective UID"
-    try:
-        for line in Path("/proc/self/status").read_text().splitlines():
-            key, _, value = line.partition(":")
-            if key in {"Umask", "CapEff", "NoNewPrivs"}:
-                process[key] = value.strip()
-    except OSError as error:
-        process["process_details_error"] = str(error)
-    mounts = []
-    try:
-        for line in Path("/proc/self/mountinfo").read_text().splitlines():
-            fields = line.split()
-            separator = fields.index("-")
-            mounts.append({"path": fields[4].replace("\\040", " "), "options": fields[5],
-                           "filesystem": fields[separator + 1]})
-    except (OSError, ValueError, IndexError) as error:
-        process["mount_details_error"] = str(error)
-    print(json.dumps(process), flush=True)
-
-    paths = [output_dir, Path(output_dir) / "checkpoint", Path(output_dir).parent,
-             model_dir, Path(model_dir).parent, "/tmp", "/var/tmp", home,
-             *(os.environ.get(key) for key in ("HOME", "TMPDIR", "TMP", "TEMP"))]
-    for path in dict.fromkeys(Path(p).absolute() for p in paths if p):
-        record = {"event": "training_path_check", "path": str(path)}
-        try:
-            record["exists"] = path.exists()
-            parent = path
-            while not parent.exists() and parent != parent.parent:
-                parent = parent.parent
-            info = parent.stat()
-            record.update(inspected_path=str(parent), owner_uid=info.st_uid, owner_gid=info.st_gid,
-                          mode=oct(info.st_mode & 0o7777),
-                          write_access=os.access(parent, os.W_OK, effective_ids=True),
-                          probe_scope="requested path" if path.exists() else "nearest existing parent",
-                          free_bytes=shutil.disk_usage(parent).free)
-            candidates = [mount for mount in mounts if parent.resolve().is_relative_to(mount["path"])]
-            if candidates:
-                record["mount"] = max(candidates, key=lambda mount: len(mount["path"]))
-            # Test both operations independently; a denied path must not prevent later checks.
-            for kind in ("file", "directory"):
-                try:
-                    if kind == "file":
-                        with tempfile.NamedTemporaryFile(prefix=".mlops-training-check-", dir=parent) as probe:
-                            probe.write(b"training path check\n")
-                            probe.flush()
-                            probe.seek(0)
-                            matches = probe.read() == b"training path check\n"
-                    else:
-                        with tempfile.TemporaryDirectory(prefix=".mlops-training-check-", dir=parent) as work:
-                            probe = Path(work) / "check.txt"
-                            probe.write_bytes(b"training path check\n")
-                            matches = probe.read_bytes() == b"training path check\n"
-                    record[kind + "_probe"] = {"status": "ok", "readback_matches": matches}
-                except OSError as error:
-                    record[kind + "_probe"] = {"status": "failed", "errno": error.errno,
-                                               "error_type": type(error).__name__, "error": str(error)}
-        except OSError as error:
-            record.update(error=str(error), errno=error.errno, error_type=type(error).__name__)
-        print(json.dumps(record), flush=True)
-    print(json.dumps({"event": "training_path_checks_complete", "revision": "training-paths-v1"}), flush=True)
+    model = work / "model"
+    if not model.is_dir() or not any(model.iterdir()):
+        raise FileNotFoundError(f"Training produced no model files: {model}")
+    encryption = ({"ServerSideEncryption": "aws:kms",
+                   "SSEKMSKeyId": os.environ["MLOPS_TRAINING_KMS_KEY"]}
+                  if os.getenv("MLOPS_TRAINING_KMS_KEY") else {})
+    s3 = boto3.client("s3")
+    for directory, variable in ((work / "output", "MLOPS_TRAINING_REPORTS_URI"),
+                                (model, "MLOPS_TRAINING_MODEL_URI")):
+        uri = os.environ[variable]
+        location = urlparse(uri)
+        if location.scheme != "s3" or not location.netloc or not location.path.strip("/"):
+            raise ValueError(f"Invalid Training output URI: {uri}")
+        archive_path = work / (directory.name + ".tar.gz")
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for path in sorted(directory.iterdir()):
+                archive.add(path, arcname=path.name)
+        print(json.dumps({"event": "training_output_upload", "source": str(archive_path),
+                          "destination": uri, "bytes": archive_path.stat().st_size}), flush=True)
+        s3.upload_file(str(archive_path), location.netloc, location.path.lstrip("/"),
+                       ExtraArgs=encryption)
+    print(json.dumps({"event": "training_outputs_uploaded",
+                      "model_uri": os.environ["MLOPS_TRAINING_MODEL_URI"],
+                      "reports_uri": os.environ["MLOPS_TRAINING_REPORTS_URI"]}), flush=True)
 
 
 def main():
@@ -139,11 +90,16 @@ def main():
     source = Path(__file__).resolve().parent
     original_directory, original_arguments = Path.cwd(), sys.argv[:]
     original_path = sys.path[:]
+    managed_training = selected.step == "train" and bool(os.getenv("MLOPS_TRAINING_MODEL_URI"))
+    training_variables = ("TMPDIR", "TMP", "TEMP", "SM_MODEL_DIR", "SM_OUTPUT_DATA_DIR", "SM_OUTPUT_DIR")
+    original_environment = {key: os.environ.get(key) for key in training_variables}
+    original_tempdir = tempfile.tempdir
 
     try:
-        # Train reads mounted source directly; only Processing needs loader scratch space.
-        workspace = (nullcontext() if selected.step == "train" else
-                     tempfile.TemporaryDirectory(prefix="mlops-step-", dir="/tmp"))
+        # This non-root image can use /var/tmp even when Training's /tmp is read-only.
+        workspace = (nullcontext() if selected.step == "train" and not managed_training else
+                     tempfile.TemporaryDirectory(prefix="mlops-step-",
+                                                 dir="/var/tmp" if managed_training else "/tmp"))
         with workspace as work:
             checkpoint = None
             if selected.step in {"evaluate", "preprocess", "score", "postprocess"}:
@@ -163,10 +119,19 @@ def main():
                               "source": str(source),
                               "identity": json.loads(identity.read_text()) if identity.exists() else {}}),
                   flush=True)
-            if selected.step == "train":
-                from mlops_models.runtime.job_paths import job_paths
-                _, output_path, model_path = job_paths("train")
-                print_training_path_checks(selected.output or output_path, selected.model_dir or model_path)
+            if managed_training:
+                work = Path(work)
+                for name in ("tmp", "output", "model"):
+                    (work / name).mkdir()
+                os.environ.update(TMPDIR=str(work / "tmp"), TMP=str(work / "tmp"), TEMP=str(work / "tmp"),
+                                  SM_MODEL_DIR=str(work / "model"), SM_OUTPUT_DATA_DIR=str(work / "output"),
+                                  SM_OUTPUT_DIR=str(work / "output"))
+                tempfile.tempdir = str(work / "tmp")
+                sys.argv.extend(["--output", str(work / "output"), "--model-dir", str(work / "model")])
+                print(json.dumps({"event": "training_output_directories", "revision": "training-outputs-v1",
+                                  "uid": os.geteuid(), "output": str(work / "output"),
+                                  "model": str(work / "model"), "temporary": tempfile.gettempdir(),
+                                  "model_uri": os.environ["MLOPS_TRAINING_MODEL_URI"]}), flush=True)
 
             # main() is the stable command interface, including for older checkpoints.
             from mlops_models.entrypoints.__main__ import main as dispatch_command
@@ -186,12 +151,21 @@ def main():
                 print(json.dumps({"event": "processing_output_directory", "step": selected.step,
                                   "configured": str(output_dir), "writable": str(scratch)}), flush=True)
             dispatch_command()
+            if managed_training:
+                upload_training_outputs(work)
             if output_config is not None:
                 upload_processing_outputs(output_config, output_dir, scratch)
     finally:
         os.chdir(original_directory)
         sys.argv[:] = original_arguments
         sys.path[:] = original_path
+        if managed_training:
+            tempfile.tempdir = original_tempdir
+            for key, value in original_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":
