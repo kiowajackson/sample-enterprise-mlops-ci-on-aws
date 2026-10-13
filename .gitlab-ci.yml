@@ -1,0 +1,24 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
+
+stages:
+  - check
+
+check_models:
+  stage: check
+  image: public.ecr.aws/docker/library/python:3.11-slim-bookworm@sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b
+  tags:
+    - arch:amd64
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends nodejs
+    - "python -m pip install --require-hashes --only-binary=:all: -r release/requirements-build.lock.txt"
+    # Both example models use this same pinned AutoGluon runtime.
+    - "python -m pip install --require-hashes --only-binary=:all: -r mlops-models/src/mlops_models/models/usecase1/requirements.lock.txt"
+    - export PYTHONPATH="$PWD/mlops-models:$PWD/mlops-models/src"
+    - python tests/checks.py
+    - python -m unittest discover -s tests -v
