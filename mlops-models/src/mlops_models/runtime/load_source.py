@@ -8,6 +8,7 @@ Ordinary Training keeps SageMaker's output handling. HPO uses the image entrypoi
 """
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -60,7 +61,10 @@ def main():
     original_path = sys.path[:]
 
     try:
-        with tempfile.TemporaryDirectory(prefix="mlops-step-", dir="/tmp") as work:
+        # Train reads mounted source directly; only Processing needs loader scratch space.
+        workspace = (nullcontext() if selected.step == "train" else
+                     tempfile.TemporaryDirectory(prefix="mlops-step-", dir="/tmp"))
+        with workspace as work:
             checkpoint = None
             if selected.step in {"evaluate", "preprocess", "score", "postprocess"}:
                 archive_path = selected.model_dir or "/opt/ml/processing/model/model.tar.gz"
