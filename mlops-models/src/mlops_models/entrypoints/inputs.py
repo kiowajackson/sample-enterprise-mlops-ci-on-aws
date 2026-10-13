@@ -17,6 +17,7 @@ def snapshot_input(source, output_dir):
     # Diagnose every configured Processing output before the first real write can fail.
     read_paths = [] if isinstance(source, pd.DataFrame) or str(source).startswith("s3://") else [source]
     write_paths = [Path(output_dir).parent, output_dir, destination]
+    settings = None
     job_config = Path("/opt/ml/config/processingjobconfig.json")
     if job_config.is_file():
         try:
@@ -27,6 +28,8 @@ def snapshot_input(source, output_dir):
         except (OSError, ValueError) as error:
             print(json.dumps({"event": "path_check_config_error", "error": str(error)}), flush=True)
     print_path_checks(read_paths, [*write_paths, "/tmp", Path.home()])
+    if settings is not None:
+        print_s3_write_check(settings, destination)
     destination.mkdir(parents=True, exist_ok=True)
     # The container user must be able to write into the managed output directory.
     permissions = destination.stat()
@@ -135,6 +138,61 @@ def print_path_checks(read_paths=(), write_paths=()):
         except OSError as error:
             record.update(error=str(error), errno=error.errno)
         print(json.dumps(record), flush=True)
+
+
+
+def print_s3_write_check(settings, raw_directory):
+    """Probe direct S3 write/read from this job; retain one tiny JSON as evidence."""
+    outputs = settings.get("ProcessingOutputConfig", {})
+    target = next((item["S3Output"] for item in outputs.get("Outputs", [])
+                   if item.get("S3Output", {}).get("LocalPath") == str(raw_directory)), None)
+    result = {"event": "s3_write_probe", "revision": "s3-v1", "operation": "setup"}
+    if target is None or not isinstance(target.get("S3Uri"), str):
+        print(json.dumps({**result, "status": "skipped", "reason": "No resolved S3 output for the raw directory."}), flush=True)
+        return
+    try:
+        import tempfile
+        import uuid
+        import boto3
+        from botocore.config import Config
+
+        nonce = uuid.uuid4().hex
+        uri = target["S3Uri"].rstrip("/") + "/_diagnostics/s3-write-" + nonce + ".json"
+        location = urlparse(uri)
+        if location.scheme != "s3" or not location.netloc:
+            raise ValueError("The configured raw output must be an S3 URI.")
+        result.update(uri=uri, operation="scratch-file", status="started")
+        print(json.dumps(result), flush=True)
+        payload = (json.dumps({"probe": "manual-s3-output", "nonce": nonce, "uid": os.geteuid()}) + "\n").encode()
+        with tempfile.NamedTemporaryFile(prefix="mlops-s3-probe-", suffix=".json", dir="/tmp") as scratch:
+            scratch.write(payload)
+            scratch.flush()
+            scratch.seek(0)
+            client = boto3.client("s3", config=Config(connect_timeout=5, read_timeout=10,
+                                                     retries={"max_attempts": 0}))
+            encryption = {}
+            if outputs.get("KmsKeyId"):
+                encryption = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": outputs["KmsKeyId"]}
+            result.update(operation="PutObject", status="started", region=client.meta.region_name)
+            print(json.dumps(result), flush=True)
+            written = client.put_object(Bucket=location.netloc, Key=location.path.lstrip("/"),
+                                        Body=scratch, ContentType="application/json", **encryption)
+            result.update(status="succeeded", write_confirmed=True,
+                          encryption=written.get("ServerSideEncryption", "not returned"))
+            print(json.dumps(result), flush=True)
+            result.update(operation="GetObject", status="started")
+            print(json.dumps(result), flush=True)
+            request = {"Bucket": location.netloc, "Key": location.path.lstrip("/")}
+            with client.get_object(**request)["Body"] as stream:
+                if stream.read(len(payload) + 1) != payload:
+                    raise ValueError("S3 readback differs from the probe bytes.")
+            result.update(status="succeeded", read_confirmed=True, bytes_match=True)
+            print(json.dumps(result), flush=True)
+            print("S3_WRITE_READ_CONFIRMED", uri, flush=True)
+    except Exception as error:
+        # This diagnostic must not replace Prepare's normal result or hide its original write error.
+        result.update(status="failed", error_type=type(error).__name__, error=str(error))
+        print(json.dumps(result), flush=True)
 
 
 def download_csv_input(uri, destination):
