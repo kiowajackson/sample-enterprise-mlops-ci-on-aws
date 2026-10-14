@@ -1,10 +1,12 @@
 """GetData: read Feature Store or a supplied flat CSV and save the same raw snapshot."""
 
+import csv
 import io
 import json
 import os
 from pathlib import Path
 import re
+from shutil import copyfile
 import time
 from urllib.parse import urlparse
 
@@ -28,39 +30,39 @@ ORDER BY {keys}
 
 def execute(model_id, input_path, output_dir):
     """Read the selected model's inputs; both modes produce raw/data.csv."""
-    config_path = Path(__file__).parents[1] / "models" / model_id / "model-config.json"
-    config = json.loads(config_path.read_text())
     source = os.getenv("MLOPS_DATA_SOURCE", "feature_store")
     if source == "csv_direct":
-        df, provenance = get_csv_input(input_path, model_id, config)
+        return snapshot_csv_input(input_path, model_id, output_dir)
     elif source == "feature_store":
+        config_path = Path(__file__).parents[1] / "models" / model_id / "model-config.json"
+        config = json.loads(config_path.read_text())
         df, provenance = get_container_input(os.environ["MLOPS_FEATURE_STORE_CONFIG_URI"], model_id, config)
     else:
         raise ValueError("MLOPS_DATA_SOURCE must be feature_store or csv_direct.")
     return write_container_output(df, provenance, output_dir) / "data.csv"
 
 
-def get_csv_input(input_path, model_id, config):
-    """Read the flat CSV mounted by SageMaker, selecting the same model columns."""
+def snapshot_csv_input(input_path, model_id, output_dir):
+    """Copy the supplied flat CSV unchanged; FeatureSelection chooses its columns."""
     path = Path(input_path)
     if path.is_dir():
         files = sorted(path.glob("*.csv"))
         if len(files) != 1:
             raise ValueError(f"csv_direct expects one flat CSV in {path}; found {len(files)}.")
         path = files[0]
-    keys = [config["identifier"], config["timestamp"]]
-    features = [name for names in config["features"].values() for name in names]
-    columns = list(dict.fromkeys(keys + features + [config["label"]]))
-    string_columns = [*keys, *config["features"].get("categorical", [])]
-    df = pd.read_csv(path, usecols=columns, dtype={name: str for name in string_columns},
-                     keep_default_na=False, na_values=["", r"\N"])
-    df[keys[1]] = pd.to_datetime(df[keys[1]], utc=True).map(
-        lambda value: value.isoformat().replace("+00:00", "Z"))
-    df = df[columns].sort_values(keys).reset_index(drop=True)
-    return df, {"data_source": "csv_direct", "model_id": model_id,
-                "input_uri": os.getenv("MLOPS_CSV_INPUT_URI", str(path)),
-                "selected_features": features,
-                "pipeline_execution_id": os.getenv("PIPELINE_EXECUTION_ID")}
+    output = Path(output_dir) / "raw"
+    output.mkdir(parents=True, exist_ok=True)
+    copyfile(path, output / "data.csv")
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.reader(stream)
+        columns = next(reader)
+        records = sum(1 for row in reader if row)
+    provenance = {"data_source": "csv_direct", "model_id": model_id,
+                  "input_uri": os.getenv("MLOPS_CSV_INPUT_URI", str(path)),
+                  "columns": columns, "records": records,
+                  "pipeline_execution_id": os.getenv("PIPELINE_EXECUTION_ID")}
+    (output / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    return output / "data.csv"
 
 
 def get_container_input(store_config_uri, model_id, config):
