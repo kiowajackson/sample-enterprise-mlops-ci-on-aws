@@ -99,6 +99,9 @@ def main():
     original_directory, original_arguments = Path.cwd(), sys.argv[:]
     original_path = sys.path[:]
     managed_training = selected.step == "train" and bool(os.getenv("MLOPS_TRAINING_MODEL_URI"))
+    cached_preparation = bool(os.getenv("MLOPS_PREPARATION_REVISION"))
+    provenance_variables = ("PIPELINE_EXECUTION_ID", "SOURCE_COMMIT", "SOURCE_DIRTY")
+    original_provenance = {key: os.environ.get(key) for key in provenance_variables}
     training_variables = ("TMPDIR", "TMP", "TEMP", "SM_MODEL_DIR", "SM_OUTPUT_DATA_DIR", "SM_OUTPUT_DIR")
     original_environment = {key: os.environ.get(key) for key in training_variables}
     original_tempdir = tempfile.tempdir
@@ -125,9 +128,23 @@ def main():
             os.chdir(source)
             sys.path.insert(0, str(source))
             identity = source / "source.json"
+            source_metadata = json.loads(identity.read_text()) if identity.exists() else {}
+            processing_job = None
+            if cached_preparation:
+                # Output locations are not cache keys; their execution ID is still recorded at runtime.
+                processing_job = json.loads(Path("/opt/ml/config/processingjobconfig.json").read_text())
+                output_uri = processing_job["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
+                _, separator, suffix = output_uri.rpartition("/runs/")
+                if not separator or not suffix.split("/")[0]:
+                    raise ValueError("Cached preparation needs an execution-scoped /runs/<id>/ output.")
+                os.environ.update(
+                    PIPELINE_EXECUTION_ID=suffix.split("/")[0],
+                    SOURCE_COMMIT=source_metadata.get("commit", "uncommitted"),
+                    SOURCE_DIRTY=str(source_metadata.get("dirty", True)).lower(),
+                )
             print(json.dumps({"event": "source_loaded", "step": selected.step,
                               "source": str(source),
-                              "identity": json.loads(identity.read_text()) if identity.exists() else {}}),
+                              "identity": source_metadata}),
                   flush=True)
             if managed_training:
                 work = Path(work)
@@ -150,7 +167,7 @@ def main():
 
             output_config = None
             if os.getenv("MLOPS_PROCESSING_OUTPUT_UPLOAD") == "application" and selected.step != "train":
-                job = json.loads(Path("/opt/ml/config/processingjobconfig.json").read_text())
+                job = processing_job or json.loads(Path("/opt/ml/config/processingjobconfig.json").read_text())
                 output_config = job["ProcessingOutputConfig"]
                 from mlops_models.runtime.job_paths import job_paths
                 output_dir = Path(selected.output or job_paths(selected.step)[1])
@@ -169,6 +186,12 @@ def main():
         os.chdir(original_directory)
         sys.argv[:] = original_arguments
         sys.path[:] = original_path
+        if cached_preparation:
+            for key, value in original_provenance.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         if managed_training:
             tempfile.tempdir = original_tempdir
             for key, value in original_environment.items():

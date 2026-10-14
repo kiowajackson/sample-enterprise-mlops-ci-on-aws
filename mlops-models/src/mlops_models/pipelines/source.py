@@ -1,6 +1,7 @@
 """Publish shared training and approved-model inference pipelines from supplied source."""
 
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -64,6 +65,32 @@ def upload_source(session, s3_root, identity):
     return uri
 
 
+def preparation_fingerprint(session, csv_uri, local_csv=None):
+    """Identify CSV preparation inputs/code; ordinary Train edits do not invalidate preparation."""
+    digest = hashlib.sha256()
+    if local_csv is not None:
+        with Path(local_csv).open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    else:
+        bucket, key = s3_location(csv_uri)
+        info = session.client("s3").head_object(Bucket=bucket, Key=key)
+        digest.update(json.dumps({
+            "uri": csv_uri, "etag": info["ETag"], "version": info.get("VersionId"),
+        }, sort_keys=True).encode())
+    for path in sorted(PACKAGE.rglob("*")):
+        relative = path.relative_to(PACKAGE)
+        if (not path.is_file() or path.is_symlink()
+                or any(p.startswith(".") or p == "__pycache__" for p in relative.parts)
+                or path.suffix == ".pyc"):
+            continue
+        # Processing steps must not import Train; their shared dependencies stay in the hash.
+        if relative.name == "train.py" and relative.parent.name in {"training", "entrypoints"}:
+            continue
+        digest.update(b"\0" + relative.as_posix().encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()
+
+
 def upload_examples(session, s3_root, models):
     """Put each selected model's sample under inputs/<model>/ for the ModelId selector."""
     s3 = session.client("s3")
@@ -120,10 +147,12 @@ def flatten_joins(value):
 def build_definitions(namespace, job_role, image, s3_root, source_uri, identity, *,
                       region, models=None, infrastructure=None, batch_runtime="transform",
                       feature_store_config_uri="", universe_data_root="",
-                      data_source="feature_store", csv_input_uri=""):
+                      data_source="feature_store", csv_input_uri="", preparation_cache_revision=""):
     """Render both shared pipelines. No training result or existing package is needed."""
     if data_source not in {"feature_store", "csv_direct"}:
         raise ValueError("Choose feature_store or csv_direct for data_source.")
+    if preparation_cache_revision and data_source != "csv_direct":
+        raise ValueError("Preparation caching currently requires a fixed csv_direct input.")
     if data_source == "feature_store" and not feature_store_config_uri:
         raise ValueError("Supply feature_store_config_uri from notebook 04A.")
     if data_source == "csv_direct":
@@ -255,6 +284,9 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             for processing_output in args["ProcessingOutputConfig"]["Outputs"]:
                 processing_output["AppManaged"] = True
             args.setdefault("Environment", {})["MLOPS_PROCESSING_OUTPUT_UPLOAD"] = "application"
+        if kind == "training" and preparation_cache_revision:
+            from .training_files import configure_preparation_cache
+            configure_preparation_cache(body, preparation_cache_revision)
         definitions[kind] = flatten_joins(body)
     return definitions
 
