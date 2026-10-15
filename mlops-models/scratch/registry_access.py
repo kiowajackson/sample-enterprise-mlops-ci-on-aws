@@ -86,6 +86,9 @@ for name in pipeline_names:
             role = pipeline["RoleArn"]
             print("Registration group configured in", step["Name"], ":",
                   json.dumps(arguments.get("ModelPackageGroupName")))
+        elif step["Name"] in {"RegisterModel", "RegisterTunedModel"}:
+            print("Registration group configured in", step["Name"], ":",
+                  json.dumps(arguments.get("Environment", {}).get("MODEL_PACKAGE_GROUP")))
         if role:
             binding["steps"].append({"name": step["Name"], "type": step["Type"], "role": role})
             print(" ", step["Name"], "|", step["Type"], "|", role)
@@ -127,6 +130,7 @@ report_path.write_text(json.dumps(report, indent=2) + "\n")
 print("\nSaved report:", report_path.resolve())
 print("WRITE ACCESS NOT TESTED: successful reads do not prove registration, approval or deletion.")
 print("Verify pipeline write access by registering one dev candidate as PendingManualApproval.")
-print("The pipeline's RegisterModel result must contain the new ModelPackageArn.")
+print("Inspect RegisterModel's job log or reports/registry/package.json for the new package ARN.")
+print("Current source pipelines register through a Processing job: its job role needs Registry writes.")
 print("Notebook/Studio approval and deletion require separate operator permissions.")
 print("For a Studio/browser action, its CloudTrail event identifies the actual caller role.")

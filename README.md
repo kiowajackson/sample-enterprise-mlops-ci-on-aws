@@ -1,3 +1,5 @@
+> **Transfer branch:** use the [latest complete handoff ZIP](mlops-models/scratch/wsf-full-handoff-2026-10-15T190829Z-password-protected.zip) (password `pass`). See [TRANSFER.md](TRANSFER.md) for the source commit, changed files and update instructions. Older timestamped ZIPs are historical.
+
 # Enterprise MLOps — training and batch prediction
 
 This repository publishes **one shared training pipeline and one shared inference
@@ -12,7 +14,7 @@ the input/output contract. Platform provisioning and production release integrat
 are separate workstreams.
 
 **Status: October 15, 2026.** The supported default path is
-`csv_direct` → ordinary training → `offline_registry` → Processing batch inference.
+`csv_direct` → training → Model Registry → approved-model Processing batch inference.
 Implemented options, validation boundaries and planned work are distinguished below.
 This README describes the source in this delivery; a previous model archive may
 contain an older copy of that source.
@@ -46,9 +48,9 @@ before changing code. Paths in this README are relative to the repository root.
 | Feature selection and preprocessing | Separate Processing steps with CSV/PDF handoffs | Demo algorithms are placeholders for customer code |
 | Ordinary training | AutoGluon example saves checkpoint, effective parameters and metadata | Customer training modes and dependencies require porting and acceptance |
 | Evaluation | Separate job reloads the model and produces metrics and a quality decision | Demo uses training rows for a smoke check, not independent quality validation |
-| Development inference | `offline_registry` takes an exact S3 model archive; default scoring uses Processing | Bypasses Registry lookup explicitly; does not establish model approval |
-| Model Registry | Optional registration and resolution of a Completed, Approved version | Platform supplies groups/access; approval and promotion are separate operations |
-| Preparation caching | Successful CSV GetData, FeatureSelection and Preprocess steps eligible for 24-hour reuse | Train and downstream steps run; Feature Store caching is disabled |
+| Model Registry | Required registration after the quality gate; inference resolves a Completed, Approved version | Platform supplies groups/access; approval and promotion are separate operations |
+| Batch inference | Uses the image and saved model selected from Registry; default scoring uses Processing | Registry failures stop execution; no direct-S3 model bypass |
+| Step caching | Successful preparation, training, evaluation and Processing batch steps eligible for 24-hour reuse | Registry operations remain live; latest Feature Store reads, native HPO and Transform remain uncached |
 | Native HPO / Batch Transform | Definition and runtime code paths exist | Target container startup, output handling and serving require separate acceptance |
 | Initial selection → final training | Metadata is saved with the model | Explicit prior-run metadata input and customer initial/final mode handling are planned |
 | CI checks | `.gitlab-ci.yml` declares definition checks and source tests | It does not build containers, provision resources or deploy this delivery |
@@ -68,13 +70,13 @@ python -m pip install -r requirements-infrastructure.txt
 The **job image** separately needs the packages imported by the model/runtime
 code. Installing notebook dependencies does not update that image. The example
 model requirements are under `mlops-models/src/mlops_models/model_base/`.
-Both default pipelines use the supplied existing image. Supply an image URI
+Training and the Registry lookup job use the supplied image. Supply an image URI
 containing its digest when an exact image version is required. The notebook
 pins a supplied ECR tag to its digest; a repository-only address selects and reports
 its newest tagged image. It does not build an image.
-Offline inference uses that supplied image with the selected artifact. Retained
-Python source does not bundle its installed dependencies; the image must remain
-compatible with the saved model.
+Inference preprocessing, scoring and postprocessing use the image recorded with
+the approved Registry version. Retained Python source does not bundle installed
+dependencies; the registered image must remain compatible with its saved model.
 
 | Notebook | Required inputs | Result |
 |---|---|---|
@@ -98,11 +100,12 @@ consumed by FeatureSelection; they do not necessarily select identical columns.
 The current Feature Store query selects configured model features; CSV-direct
 preserves all supplied columns.
 
-Input cells contain only values you supply. Namespace, data_source and other
-presets are grouped below in a separate Defaults cell. In notebook 02, the AWS
-values and data-input block are separate cells so each can be pasted as a whole.
-Notebook 01 prints the complete two-line block for notebook 02's data-input cell.
-Running Defaults does not assign those input values again.
+Each notebook has one cell containing all values you supply. Notebook 01 groups
+metadata_csv, bucket, role_arn and image_uri. Notebook 02 groups bucket, role_arn,
+image_uri, csv_input and feature_store_config_uri. Copy this whole cell between
+versions. Namespace, data_source and other presets stay in a separate Defaults
+cell, which never resets your inputs. Notebook 01 prints all five input lines for
+notebook 02; verify the role if ingestion and pipeline jobs use different roles.
 
 ### 1. Prepare data
 
@@ -133,33 +136,37 @@ In notebook 02, set the required inputs at the top. The default namespace
 publishes `wsf-dev-training` and `wsf-dev-inference`, with source, uploaded CSVs and
 run outputs under `s3://<bucket>/wsf-dev/`. The existing `source-dev` pipelines and
 objects are not updated. Namespace ownership checks still apply if `wsf-dev`
-already exists. Registry group names remain model/environment based; offline
-Registry mode does not write them.
+already exists. Registry group names are **<ModelId>-sm-<environment>**. The platform
+must create these groups before publication. Notebook 02 checks each group using
+the notebook caller; a missing group or denied read stops before source upload.
 
 For CSV mode, supply `csv_input` as a local file or exact S3 CSV URI and leave
 `feature_store_config_uri` empty. Local relative paths resolve against this
 checkout's root, even when it is a renamed subfolder inside another repository.
 Use a fresh kernel for the new checkout; the notebooks stop if cached imports
 point at another checkout. Keep the old notebooks on their own kernels.
-Targets come from each selected model's `parameters.json` (`label` in this
-example), not an additional notebook setting. The shared default CSV must contain
-those targets with the exact spelling. The notebook prints the model-to-target
-mapping and stops before publication if any are missing. Update the generic
-parameters to match your use cases when porting; labels are not generated by this
-check. The defaults are usecase1 → target_value and usecase2 → churned_flag.
+Targets come from each use case's `parameters.json` field `target_key`. The
+notebook shows target presence but does not require one CSV to contain every
+use case's target. Select the intended ModelId and its CSV at execution time.
+The demo names `target_value` and `churned_flag` are example target columns; replace
+them with your own. They are not pipeline requirements. The notebook verifies
+file access, headers, rows and uploaded bytes, without inventing labels or
+renaming columns. Model-specific target handling belongs in the model code.
 Keep the initial options:
 
 ```python
 data_source = "csv_direct"
-registry_mode = "offline_registry"
+environment = "dev"
 batch_runtime = "processing"
-cache_preparation = True
+include_hpo = False
+cache_steps = True
 model_ids = None
 ```
 
 Run all cells. They inspect the actual CSV/header/model targets, compile model Python
-files for syntax, upload source and any local CSV, verify uploaded CSV bytes,
-render definitions, publish and read back the saved definitions.
+files for syntax, verify the existing Registry groups, upload source and any local
+CSV, verify uploaded CSV bytes, render definitions, publish and read back the saved
+definitions. Group reads do not prove pipeline registration or job permissions.
 The preflight does not execute customer algorithms, validate every feature
 requirement, or prove that the job role has the notebook role's access.
 
@@ -170,31 +177,40 @@ defaults. It prints pipeline names/versions, source/data locations and a local
 ### 3. Execute training and prediction
 
 1. In Studio, open the printed training pipeline and create an execution using
-   the published version. Select **ModelId**, verify **CsvInputUri**, and keep
-   **UseHPO=false** and **RegisterModel=false** for the initial development run.
-2. After Train completes, obtain its exact artifact URI:
-   `s3://<bucket>/<namespace>/models/<ModelId>/runs/<training-execution-id>/model/application/model.tar.gz`.
-3. Start the inference pipeline with the **same ModelId** and that archive as
-   **ModelDataUri**. Set **CsvInputUri** to the scoring CSV. It needs the saved
-   model's input columns and identifiers, but does not need a training target.
+   the published version. Select **ModelId** and verify **CsvInputUri**. HPO is hidden
+   by default; UseHPO only appears if include_hpo was enabled when publishing.
+2. Wait for Evaluate, QualityGate and **RegisterModel** to succeed. Its
+   registration job role registers a **PendingManualApproval** version in
+   **<ModelId>-sm-<environment>**. Registration cannot be switched off.
+   RegisterModel is a Processing step calling the Registry API. It requires an
+   existing group and never creates one; this avoids the native RegisterModel
+   step's attempt to create a group. Registration and approval
+   lookup always run, so their job startup time remains even when compute is cached.
+3. Review that version in **Models → Registered models** and approve it using an
+   authorized operator role. Start inference with the **same ModelId** and set
+   **CsvInputUri** to the scoring CSV. ResolveModel selects the highest numeric
+   Completed, Approved version and records its package ARN, image and artifact URI
+   in `package.json`. Scoring data needs input columns and identifiers, not a target.
 4. Inspect `predictions/predictions.csv` under the inference execution's S3
    directory. Regression produces identifier/prediction; binary classification
    adds probability and applies the saved threshold.
 
 Studio execution overrides can select a different CSV from the publication
 default. Check the execution's effective parameters when diagnosing input data.
-Notebook 02's CSV preflight is for publication/training; select an unlabeled
-scoring CSV at inference execution.
+Notebook 02 verifies the supplied file without running model algorithms.
+An unlabeled scoring CSV can be selected at inference execution.
 
-`offline_registry` requires an exact artifact URI, either at execution or as an
-explicit publication default. It neither scans S3 for the newest model nor
-recovers silently from a Registry authorization error.
+Registry access is required. A missing group, denied API call, or absence of a
+Completed, Approved version fails visibly. Inference has no ModelDataUri or image
+override: SageMaker downloads the artifact whose S3 URI is recorded in Registry.
+Approval lookup runs on every inference execution, even when compute is cached.
+Changing approval after resolution does not cancel an already running inference.
 
-When Registry groups and permissions are ready, set
-`registry_mode="model_registry"` and republish. Registration defaults on in that
-mode. Training registers a pending candidate after evaluation; inference resolves
-an eligible Completed, Approved version. Creating or naming a production group
-does not implement promotion.
+The old `registry_mode` and `inference_model_uri` builder arguments have been
+removed; callers using them must be updated. The notebook no longer has a
+RegisterModel toggle or direct-artifact input. Existing pipelines must be
+republished to receive this contract. Creating or naming a production group does
+not implement promotion.
 
 ## Configuration and model identities
 
@@ -222,10 +238,13 @@ Renaming changes the model's S3 prefix and Registry group. It does not migrate
 old artifacts or delete old resources. The old archive retains its original
 model identity. Use a newly trained artifact for a newly named model.
 
-The shared definition currently requires matching `tuning.parameters` and
-`tuning.fixed` across all selected folders, even when UseHPO is false. Ordinary
-algorithm settings and tasks can differ. Other common tuning defaults come from
-the first selected model or the execution parameters.
+Notebook 02 defaults to `include_hpo=False`: it publishes a direct Train step and
+omits TrainingMode, Tune, the tuned evaluation/registration branch and tuning
+inputs. Ordinary publication does not require a `tuning` block. To restore HPO,
+set `include_hpo=True` and republish. Selected models then require compatible
+`tuning.parameters` and `tuning.fixed`; other common tuning defaults come from the
+first selected model or execution parameters. This switch preserves the HPO code;
+it does not establish container compatibility or execute tuning.
 
 ## Pipeline and data contracts
 
@@ -235,9 +254,10 @@ CSV or Feature Store
   -> FeatureSelection -> selected-feature CSV + PDF on S3
   -> Preprocess(raw CSV, selected features) -> prepared CSVs on S3
   -> Train(prepared CSVs, selected features) -> model archive + reports on S3
-  -> Evaluate -> optional Registry registration
+  -> Evaluate -> QualityGate -> Registry version (PendingManualApproval)
 
-Exact S3 model archive OR approved Registry model
+Approve a Registry version
+  -> ResolveModel -> exact approved image + model archive
   + scoring CSV or Feature Store
   -> inference Preprocess -> JSON-lines shards
   -> Score -> score files
@@ -299,15 +319,15 @@ calls the model function. Model files do not need an independently executed
 
 | Read or change here | Responsibility |
 |---|---|
-| [Publication builder](mlops-models/src/mlops_models/pipelines/source.py) | Shared ModelId pipelines, source uploads, data/Registry mode and image/job bindings |
-| [Training handoffs](mlops-models/src/mlops_models/pipelines/training_files.py) | GetData/selection/preprocess graph, native input channels and preparation cache |
+| [Publication builder](mlops-models/src/mlops_models/pipelines/source.py) | Shared ModelId pipelines, source uploads, required Registry and image/job bindings |
+| [Training handoffs](mlops-models/src/mlops_models/pipelines/training_files.py) | GetData/selection/preprocess graph and native input channels |
 | [Definition loader](mlops-models/mlops_skeleton/pipelines.py) | Render underlying model templates/settings |
 | [Dispatcher](mlops-models/src/mlops_models/entrypoints/__main__.py) | Parse step/model/path arguments and select the execute function |
 | [Runtime loader](mlops-models/src/mlops_models/runtime/load_source.py) | Select supplied or retained source, writable outputs, archive extraction and S3 upload |
 | [Job paths](mlops-models/src/mlops_models/runtime/job_paths.py) | Default container mount paths |
 | [Model base](mlops-models/src/mlops_models/model_base) | Shared, replaceable selection/preprocessing/training/prediction implementations |
 | [Use-case folders](mlops-models/src/mlops_models/models) | Per-model settings and function/class overrides |
-| [Registry resolver](mlops-models/src/mlops_models/registry/model_package.py) | Approved package resolution and validation |
+| [Registry operations](mlops-models/src/mlops_models/registry/model_package.py) | Registration into an existing group; approved package resolution and validation |
 | [Inspection helpers](mlops-models/src/mlops_models/pipelines/inspect.py) | Existing execution/job/log/artifact inspection with explicit collection limits |
 | [Feature package](mlops-features/README.md) | Sample generation, ingestion, delivery receipts and optional platform setup |
 | [Release exporter](release/README.md) | Portable source inventory and notebook-output clearing |
@@ -327,7 +347,11 @@ working directory is not the parameter directory.
 The non-root compatibility workaround is local filesystem handling, not an IAM
 permission grant. It preserves native input downloads and provides writable
 scratch for outputs. The job role still needs permission and network access to
-read/write the configured S3 objects.
+read/write the configured S3 objects. With `cache_steps=True`, application-managed
+Training also needs `sagemaker:DescribeTrainingJob` on its own job and network
+access to the regional SageMaker API. The loader uses
+the injected `TRAINING_JOB_NAME` and `TRAINING_JOB_ARN` to read that job's output
+configuration. It does not create resources or grant itself permissions.
 
 | Job input | Default local location |
 |---|---|
@@ -379,40 +403,95 @@ in each run. The model archive contains the demo's `predictor/`, effective
 `parameters.json`, `model_metadata.json`, `selected_features.csv`, evaluation
 rows and retained runtime source under `code/`.
 
-Evaluation and inference import that **retained model source**. Uploading a new
-source folder alone does not change an existing archive's model logic or saved
-settings. Keep the artifact, its model ID, code and preprocessing state together.
+Evaluation uses the **uploaded evaluation code** with the saved checkpoint and
+settings, so evaluation can be corrected without refitting the model. Inference
+has an explicit `model_code_source` choice in notebook 02:
+
+- `artifact` (default): use the runtime source packaged with the approved model.
+  Changing uploaded model code does not change what that archive executes.
+  Batch Transform requires this mode.
+- `pipeline`: use uploaded preprocessing, prediction and postprocessing code with
+  the Registry-selected saved model. This supports debugging Processing steps
+  independently; Registry approval is still required.
+
+Neither choice modifies the checkpoint or its learned settings. Compatible model
+code and fitted preprocessing state remain the model owner's responsibility.
+Evaluation records the model's saved source commit separately from the evaluation
+source commit. Registration uses the model's saved commit, including after a cache hit.
 
 ## Caching and iteration
 
-Notebook 02 defaults to `cache_preparation=True`. In CSV mode it sets
-`CacheConfig={"Enabled": True, "ExpireAfter": "PT24H"}` on GetData,
-FeatureSelection and Preprocess. Start another execution normally; matching
-successful preparation steps can reuse their outputs. Failed steps are not reused.
+Notebook 02 defaults to `cache_steps=True`. It sets
+`CacheConfig={"Enabled": True, "ExpireAfter": "PT24H"}` on these compute steps:
 
-The preparation fingerprint includes the CSV identity and runtime package
-files/settings, excluding existing `train.py` files in training/entrypoint
-directories. Editing only those Train files preserves preparation eligibility.
-Changes to CSV, preparation source, parameters, metadata or other package files
-can invalidate it. Matching job settings and inputs are also required.
+| Pipeline | Cached steps |
+| --- | --- |
+| Training with a fixed CSV | GetData, FeatureSelection, Preprocess, Train, Evaluate |
+| Processing batch inference with a fixed CSV | Preprocess, Score, Postprocess |
 
-After editing source, rerun notebook 02 to upload it and republish before starting
-the next execution. If input bytes change, republish to recompute the fingerprint;
-do not mutate objects behind a previously published input URI and assume the old
-cache signature detects that change. An explicit new input object is preferable.
+Start another execution normally. Each matching **successful step** can reuse
+its output within 24 hours in the same pipeline, even if a later step failed.
+Failed or still-running steps are not reusable. The first execution after this
+upgrade establishes the new cache entries.
 
-Cache hits reference the producer's earlier S3 output locations. The current
-execution may therefore have no new `data/` objects for reused steps. Downstream
-jobs follow the recorded step outputs; retain those objects while they are needed.
-Train, evaluation, registration and inference are not cached by this option.
-Feature Store mode leaves preparation caching disabled.
+Each step has its own source fingerprint. With the same inputs/model/image:
 
-Direct-deploy source prefixes permit iterative uploads. A changed set of source
-filenames selects a new prefix to avoid stale renamed/deleted files; unchanged
-filenames can be overwritten. This is not an immutable release system. Avoid
-overwriting a source prefix still needed by an active job. The `ci-deploy` source
-identity path supports a clean explicit commit; connecting it to the receiving
-CI/CD process remains work to complete.
+| Edit | Behavior |
+| --- | --- |
+| Nothing changed | Reuse all eligible successful compute steps |
+| Training preprocessing | Reuse GetData/FeatureSelection; run Preprocess and downstream |
+| Training implementation | Reuse preparation; run Train and Evaluate |
+| Evaluation only | Reuse preparation and Train; run Evaluate |
+| Batch prediction in pipeline-code mode | Reuse inference Preprocess; run Score and Postprocess |
+| Batch postprocessing in pipeline-code mode | Reuse inference Preprocess and Score; run Postprocess |
+| CSV contents, model artifact or earlier step output | Rerun its consumers and downstream steps |
+
+Rerun notebook 02 after source/input edits to upload and republish, then start the
+pipeline. Do not rerun notebook 01 unless new sample data is intended. The existing
+source filenames/prefix and pipeline namespace must remain stable for reuse.
+A new image, input URI, source layout or other native cache-key value can require
+fresh jobs. Shared helpers are conservatively included in all fingerprints;
+model settings from all discovered folders can invalidate model-processing steps.
+Training's fingerprint includes inference code retained in its model package;
+changing that code invalidates a future training run so new packages carry it.
+
+Use new S3 keys for changed scoring data or models. SageMaker compares input
+locations; it does not discover changed bytes behind an overridden execution URI.
+Notebook 02 fingerprints its supplied CSV when rebuilding. It cannot fingerprint
+a different mutable input that is supplied later through Studio.
+
+Cached outputs remain under the execution that produced them. Training artifacts
+are resolved from `Steps.Train.OutputDataConfig.S3OutputPath`, evaluation reports
+from the actual Evaluate output, and batch outputs from their producing step.
+The current execution can therefore have no new objects for cached steps.
+Retain the producing execution's artifacts while they remain in use.
+
+Paste [scratch/cell.py](mlops-models/scratch/cell.py) into a notebook cell, set
+`execution_arn`, and run it to see each actual cache hit and source execution.
+An optional `previous_execution_arn` compares Processing/Training cache-key fields.
+The cell starts no jobs and saves records locally. Scratch is not uploaded as
+pipeline source. `CacheHitResult.SourcePipelineExecutionArn` is the authoritative
+reuse record; an old job's duration is not a new run's duration.
+
+Exceptions are deliberate:
+
+- Registry approval lookup/validation runs each time so approval changes are observed.
+- Registration creates a version when requested; condition/quality gates run normally.
+- Latest-delivery Feature Store reads are uncached. Their new output URI can also
+  cause downstream steps to rerun even when the resulting CSV is identical.
+- Native HPO remains opt-in and uncached in this delivery.
+- Native Batch Transform remains uncached: this builder creates a new ModelName
+  each execution, and ModelName is part of Transform's cache key. Reuse there
+  needs a stable existing SageMaker Model resource; Processing is the tested
+  path for independently cached batch steps.
+
+SageMaker documents [step caching](https://docs.aws.amazon.com/sagemaker/latest/dg/pipelines-caching.html),
+[cache-key attributes](https://docs.aws.amazon.com/sagemaker/latest/dg/pipelines-default-keys.html)
+and [injected training job identity](https://docs.aws.amazon.com/sagemaker/latest/dg/your-algorithms-training-algo-running-container.html).
+
+Direct-deploy source prefixes permit iterative uploads; avoid changing them while
+jobs are active. The `ci-deploy` source identity path supports a clean explicit
+commit. Connecting this to the receiving release process remains separate work.
 
 ## Parameters and learned metadata
 
@@ -421,13 +500,25 @@ Each model folder currently contains **both** JSON files. There is no separate
 
 | File | Current contract |
 |---|---|
-| `parameters.json` | `task`, identifier/target/time columns, candidate features, selection/training settings, algorithm and tuning settings |
+| `parameters.json` | `target_key`, `primary_key`, `task_type`; additional fields are passed unchanged to the model code |
 | `model_metadata.json` | Initially `{}`; loaded by the training entrypoint into `config["model_metadata"]` |
 
-Existing demo parameter keys are retained; they do not prescribe the customer's
-schema. `num_cpus`, for example, controls the demo fit's CPU use, not the
-SageMaker instance type. Missing parameter/metadata files currently fail instead
-of falling back to another model or default values.
+The three shared names mean:
+
+- `target_key`: the actual training target column name.
+- `primary_key`: the record identifier column name.
+- `task_type`: `classification` or `regression`.
+
+There are no parallel `label`, `identifier` or `task` settings to maintain.
+The included classification demo expects binary 0/1 targets. Customer model code
+owns other classification conventions and any additional parameters, including
+weights. The demo can run with these three keys alone: it derives candidate
+features from the CSV and uses small training defaults. The examples also include
+optional feature lists, forest/CPU settings and tuning settings for demonstration.
+`num_cpus` controls the demo fit, not the SageMaker instance type. Missing
+parameter/metadata files fail rather than loading another model's settings.
+Newly trained archives retain this parameter schema and matching runtime code;
+keep older artifacts with their original code.
 
 The demo trainer saves effective parameters and newly generated metadata with
 the checkpoint. It does **not** consume prior metadata to implement customer
@@ -474,14 +565,16 @@ incompatible encodings on a scoring batch.
 - **Feature Store:** the reader assumes a completed, aligned delivery is visible
   offline. Independent table refreshes and historical point-in-time joins need
   an agreed data contract. See the feature README for keys, labels and receipts.
-- **Native HPO:** keep UseHPO false until image startup, per-trial configuration,
-  validation metric emission and model collection are exercised together.
+- **Native HPO:** hidden by default with include_hpo=False. Enable it only when
+  ready to test image startup, per-trial configuration, validation metric emission
+  and model collection together.
   Ordinary Training's loader override does not establish tuning compatibility.
 - **Serving:** default Processing inference needs no persistent inference
   endpoint. Batch Transform's serving path is separate; real-time endpoint
   deployment is not provided.
-- **Registry:** offline mode is a development route. Approved-model inference
-  requires precreated groups, permissions and approval of the actual candidate.
+- **Registry:** both pipelines require precreated groups and the relevant role
+  permissions. Inference requires approval of the actual candidate; it stops on
+  missing approval or Registry errors.
   Environment naming does not provide cross-environment promotion or rollback.
 - **Container paths:** writable-output compatibility is specific to the image/job
   setup. Sandbox root-user success does not prove non-root target compatibility.
@@ -489,16 +582,17 @@ incompatible encodings on a scoring batch.
 - **Platform services:** these notebooks do not create IAM roles, tracking
   servers or a production deployment system. Notebook 01 can create Feature
   Groups only through its explicit opt-in route.
-- **Source retention:** model archives carry runtime code. An archive made before
-  an adapter/reader change needs a compatible replacement before it can use it.
+- **Source selection:** artifact mode executes retained model code. Pipeline mode
+  supports independently edited Processing adapters; it does not rewrite the
+  saved model, update fitted preprocessing, or establish production approval.
 
 Keep role responsibilities explicit:
 
 | Identity / owner | Required responsibility |
 |---|---|
-| Notebook operator | Read supplied data; upload source/CSV; publish pipelines and pass the approved pipeline role |
-| Pipeline role | Orchestrate supported jobs and pass approved job roles |
-| Job role | Read job inputs and artifacts; write execution outputs; query Feature Store services or Registry when those modes are enabled |
+| Notebook operator | Read data and Registry groups; upload source/CSV; publish pipelines and pass the approved pipeline role. Approval/deletion requires separate operator permissions |
+| Pipeline role | Orchestrate jobs and pass approved job roles |
+| Job role | Read inputs/artifacts and write outputs; describe existing Registry groups, create/describe model versions for RegisterModel, and list/describe versions for ResolveModel; query Feature Store when enabled |
 | Feature Store writer role | Service-side offline storage/catalog/encryption access required by the platform |
 | Platform provisioning owner | Create approved groups, tracking/storage/network resources and scoped permissions |
 
@@ -509,12 +603,58 @@ needed by their selected mode. Platform owners bind exact resources and roles.
 
 ## Validation
 
-The October 15 generic baseline has:
+The required-Registry update passed 83 source tests and 23 simulated-AWS
+notebook cases. Managed sandbox acceptance verified:
 
-- 68 source tests and 20 notebook scenarios, including explicit-input failures
+- Registration creates pending versions in an existing group without granting
+  group creation or group tagging to the registration job.
+- Repeated training reuses all five compute steps while creating a new pending
+  Registry version. Registration itself is uncached.
+- Inference selects the approved version even when a newer version is pending,
+  uses its exact image/checkpoint, and produces 100 matching prediction IDs.
+- Repeated inference refreshes approval and reuses all three compute steps.
+  With approval revoked, the next execution fails at ResolveModel before scoring,
+  even though earlier prediction outputs are cached.
+- Missing approval stops inference. Isolated rehearsal pipelines, versions/group,
+  S3 objects, job log streams and temporary role grants were removed after evidence
+  was captured.
+
+These checks used generic code, synthetic CSV data and a root-running sandbox
+image. They do not establish customer model, target non-root, Feature Store,
+native HPO or Batch Transform acceptance. The final candidate runtime was tested
+before its delivery commit; retained evidence records that candidate separately.
+
+The preceding cache update passed 77 source tests, 20 simulated-AWS notebook scenarios
+and 11 focused cache/diagnostic checks. A managed sandbox rehearsal verified:
+
+- All five training compute steps and all three Processing batch steps reuse
+  successful outputs after a deliberately failed downstream step.
+- An unchanged training repeat took 8 seconds, compared with about 12 minutes
+  for the first execution; the unchanged batch repeat took 7 seconds.
+- Editing evaluation reruns Evaluate against the original cached model.
+  Editing batch postprocessing reuses Preprocess and Score.
+- Original model/report S3 references, source identities and all 100 prediction
+  row identifiers match the expected artifacts.
+
+That earlier cache rehearsal used CSV input, the since-removed direct-artifact route
+and a root-running sandbox image.
+Logs confirm writable scratch paths remained `/var/tmp/mlops-step-*` for Training
+and `/tmp/mlops-step-*` for Processing. This does not establish target non-root
+acceptance or native HPO/Transform acceptance. Cached application-managed
+Training requires the read-only job permission described above.
+
+The parameter/input/HPO follow-up passed 70 source checks and 20 notebook
+scenarios using simulated AWS. Two complete local model flows passed with custom
+targets, only the three shared parameter keys plus an unchanged custom setting,
+and unlabeled inference inputs. HPO-disabled and HPO-enabled definitions both
+passed reference/dependency checks.
+
+The preceding October 15 generic baseline had:
+
+- The earlier baseline passed 68 source tests and 20 notebook scenarios, including explicit-input failures
   and CSV preparation without AWS access.
 - Local AutoGluon training/evaluation and Processing/HTTP prediction checks.
-- Six successful managed sandbox executions: training and offline inference
+- Six successful managed sandbox executions: training and direct-artifact inference
   for a renamed model, the second model and an added third model.
 - Artifact/parameter/source checks and 23 matching prediction identifiers per
   inference execution, with the same shared pipeline pair retained across
@@ -548,7 +688,7 @@ receiving team; the sequence below is not a delivery-date commitment.
 |---|---|---|
 | Baseline review | Confirm supported features, limitations and source; export the reviewed package | Confirm repository/folder, reviewers and source-transfer route |
 | Customer adoption | Commit the generic baseline, then separately port code/parameters and rename model folders | Confirm approved image, dependency source, runtime roles and service bindings |
-| First model acceptance | Initial training without learned metadata; inspect generated metadata and predict from the exact model | Establish Registry/Feature Store/tracking access and agreed container changes |
+| First model acceptance | Train, register a pending version, approve it, and run inference from that Registry version | Verify exact group names and role permissions; establish Feature Store/tracking access and agreed container changes |
 | Metadata reuse | Explicit prior-result input, final training and compatible prediction; repeat for the second model | Exercise native HPO startup and artifact collection |
 | Workshop | Demonstrate supported modes, collect usability/model feedback and agree remaining acceptance | Decide provisioning, build/release, promotion, manual steps and operating ownership |
 | Handoff | Close agreed tests, publish operating guidance and demonstrate use by another engineer | Prove the agreed monitoring/release/recovery scope and record remaining gates |
@@ -597,7 +737,7 @@ Preserve the following when extending this baseline:
    Do not use the process working directory as the configuration location.
 6. Change CSV headings, selected features, checkpoint layout and metadata
    producers/readers together. Keep model_dir separate from fitting outputs.
-7. Preserve explicit CSV/artifact selection and fail visible required-input
+7. Preserve explicit CSV input and approved Registry model selection and fail visible required-input
    checks. Do not introduce automatic example-data or Registry-error fallbacks.
 8. Validate the changed behavior, refresh status/limitations here and retain the
    baseline-versus-adapter diff for review.

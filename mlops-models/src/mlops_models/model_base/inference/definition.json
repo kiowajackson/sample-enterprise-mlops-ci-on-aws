@@ -1,0 +1,512 @@
+{
+  "Version": "2020-12-01",
+  "Metadata": {
+    "SourceCommit": "${source_commit}",
+    "SourceRepository": "${source_repository}",
+    "SourceDirty": "${source_dirty}"
+  },
+  "Parameters": [
+    {
+      "Name": "InputDataUri",
+      "Type": "String",
+      "DefaultValue": "${input_uri}"
+    },
+    {
+      "Name": "OutputDataUri",
+      "Type": "String",
+      "DefaultValue": "${output_uri}"
+    },
+    {
+      "Name": "ModelDataUri",
+      "Type": "String"
+    },
+    {
+      "Name": "InferenceImageUri",
+      "Type": "String",
+      "DefaultValue": "${image}"
+    },
+    {
+      "Name": "PreprocessInstanceType",
+      "Type": "String",
+      "DefaultValue": "ml.m5.large"
+    },
+    {
+      "Name": "TransformInstanceType",
+      "Type": "String",
+      "DefaultValue": "ml.m5.large"
+    },
+    {
+      "Name": "PostprocessInstanceType",
+      "Type": "String",
+      "DefaultValue": "ml.m5.large"
+    },
+    {
+      "Name": "TransformInstanceCount",
+      "Type": "Integer",
+      "DefaultValue": 1
+    },
+    {
+      "Name": "MaxConcurrentTransforms",
+      "Type": "Integer",
+      "DefaultValue": 1
+    },
+    {
+      "Name": "MaxPayloadInMB",
+      "Type": "Integer",
+      "DefaultValue": 1
+    },
+    {
+      "Name": "ModelServerWorkers",
+      "Type": "String",
+      "DefaultValue": "1"
+    },
+    {
+      "Name": "BatchChunkRows",
+      "Type": "String",
+      "DefaultValue": "10000"
+    },
+    {
+      "Name": "ModelPackageArn",
+      "Type": "String"
+    }
+  ],
+  "Steps": [
+    {
+      "Name": "ValidatePackage",
+      "Type": "Processing",
+      "Arguments": {
+        "ProcessingJobName": "${job_prefix}-auth",
+        "ProcessingResources": {
+          "ClusterConfig": {
+            "InstanceType": {
+              "Get": "Parameters.PreprocessInstanceType"
+            },
+            "InstanceCount": 1,
+            "VolumeSizeInGB": 30
+          }
+        },
+        "AppSpecification": {
+          "ImageUri": "${image}",
+          "ContainerArguments": [
+            "--model-package",
+            {
+              "Get": "Parameters.ModelPackageArn"
+            },
+            "--image-uri",
+            {
+              "Get": "Parameters.InferenceImageUri"
+            },
+            "--checkpoint-uri",
+            {
+              "Get": "Parameters.ModelDataUri"
+            },
+            "--output",
+            "/opt/ml/processing/output"
+          ],
+          "ContainerEntrypoint": [
+            "python",
+            "-m",
+            "mlops_models.entrypoints",
+            "validate-package"
+          ]
+        },
+        "RoleArn": "${role}",
+        "ProcessingInputs": [],
+        "ProcessingOutputConfig": {
+          "Outputs": [
+            {
+              "OutputName": "authorization",
+              "AppManaged": false,
+              "S3Output": {
+                "S3Uri": {
+                  "Std:Join": {
+                    "On": "/",
+                    "Values": [
+                      {
+                        "Get": "Parameters.OutputDataUri"
+                      },
+                      {
+                        "Get": "Execution.PipelineExecutionId"
+                      },
+                      "reports/authorization"
+                    ]
+                  }
+                },
+                "LocalPath": "/opt/ml/processing/output",
+                "S3UploadMode": "EndOfJob"
+              }
+            }
+          ]
+        },
+        "Environment": {
+          "MODEL_ID": "${model_id}",
+          "MODEL_PACKAGE_GROUP": "${model_package_group}",
+          "PYTHONUNBUFFERED": "1"
+        },
+        "StoppingCondition": {
+          "MaxRuntimeInSeconds": 900
+        },
+        "Tags": [
+          {
+            "Key": "Deployment",
+            "Value": "${namespace}"
+          }
+        ]
+      }
+    },
+    {
+      "Name": "Preprocess",
+      "Type": "Processing",
+      "Arguments": {
+        "ProcessingJobName": "${job_prefix}-prep",
+        "ProcessingResources": {
+          "ClusterConfig": {
+            "InstanceType": {
+              "Get": "Parameters.PreprocessInstanceType"
+            },
+            "InstanceCount": 1,
+            "VolumeSizeInGB": 30
+          }
+        },
+        "AppSpecification": {
+          "ImageUri": {
+            "Get": "Parameters.InferenceImageUri"
+          },
+          "ContainerArguments": [
+            "--input",
+            "/opt/ml/processing/input",
+            "--output",
+            "/opt/ml/processing/output",
+            "--model-dir",
+            "/opt/ml/processing/model/model.tar.gz",
+            "--chunk-rows",
+            {
+              "Get": "Parameters.BatchChunkRows"
+            }
+          ],
+          "ContainerEntrypoint": [
+            "python",
+            "-m",
+            "mlops_models.entrypoints",
+            "preprocess"
+          ]
+        },
+        "RoleArn": "${role}",
+        "ProcessingInputs": [
+          {
+            "InputName": "input-1",
+            "AppManaged": false,
+            "S3Input": {
+              "S3Uri": {
+                "Get": "Parameters.InputDataUri"
+              },
+              "LocalPath": "/opt/ml/processing/input",
+              "S3DataType": "S3Prefix",
+              "S3InputMode": "File",
+              "S3DataDistributionType": "FullyReplicated",
+              "S3CompressionType": "None"
+            }
+          },
+          {
+            "InputName": "checkpoint",
+            "AppManaged": false,
+            "S3Input": {
+              "S3Uri": {
+                "Get": "Parameters.ModelDataUri"
+              },
+              "LocalPath": "/opt/ml/processing/model",
+              "S3DataType": "S3Prefix",
+              "S3InputMode": "File",
+              "S3DataDistributionType": "FullyReplicated",
+              "S3CompressionType": "None"
+            }
+          }
+        ],
+        "ProcessingOutputConfig": {
+          "Outputs": [
+            {
+              "OutputName": "raw",
+              "AppManaged": false,
+              "S3Output": {
+                "S3Uri": {
+                  "Std:Join": {
+                    "On": "/",
+                    "Values": [
+                      {
+                        "Get": "Parameters.OutputDataUri"
+                      },
+                      {
+                        "Get": "Execution.PipelineExecutionId"
+                      },
+                      "data/raw"
+                    ]
+                  }
+                },
+                "LocalPath": "/opt/ml/processing/output/raw",
+                "S3UploadMode": "EndOfJob"
+              }
+            },
+            {
+              "OutputName": "prepared",
+              "AppManaged": false,
+              "S3Output": {
+                "S3Uri": {
+                  "Std:Join": {
+                    "On": "/",
+                    "Values": [
+                      {
+                        "Get": "Parameters.OutputDataUri"
+                      },
+                      {
+                        "Get": "Execution.PipelineExecutionId"
+                      },
+                      "data/modeling"
+                    ]
+                  }
+                },
+                "LocalPath": "/opt/ml/processing/output/shards",
+                "S3UploadMode": "EndOfJob"
+              }
+            }
+          ]
+        },
+        "Environment": {
+          "MODEL_ID": "${model_id}",
+          "PYTHONUNBUFFERED": "1",
+          "PIPELINE_EXECUTION_ID": {
+            "Get": "Execution.PipelineExecutionId"
+          },
+          "IMAGE_URI": {
+            "Get": "Parameters.InferenceImageUri"
+          }
+        },
+        "StoppingCondition": {
+          "MaxRuntimeInSeconds": 900
+        },
+        "Tags": [
+          {
+            "Key": "Deployment",
+            "Value": "${namespace}"
+          }
+        ]
+      },
+      "DependsOn": [
+        "ValidatePackage"
+      ]
+    },
+    {
+      "Name": "CreateModel",
+      "Type": "Model",
+      "Arguments": {
+        "ModelName": "${job_prefix}-mdl",
+        "ExecutionRoleArn": "${role}",
+        "PrimaryContainer": {
+          "Image": {
+            "Get": "Parameters.InferenceImageUri"
+          },
+          "Environment": {
+            "MODEL_ID": "${model_id}",
+            "PYTHONUNBUFFERED": "1",
+            "PIPELINE_EXECUTION_ID": {
+              "Get": "Execution.PipelineExecutionId"
+            },
+            "IMAGE_URI": {
+              "Get": "Parameters.InferenceImageUri"
+            },
+            "MODEL_SERVER_WORKERS": {
+              "Get": "Parameters.ModelServerWorkers"
+            }
+          },
+          "ModelDataUrl": {
+            "Get": "Parameters.ModelDataUri"
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Deployment",
+            "Value": "${namespace}"
+          }
+        ]
+      },
+      "DependsOn": [
+        "Preprocess"
+      ]
+    },
+    {
+      "Name": "Transform",
+      "Type": "Transform",
+      "Arguments": {
+        "TransformJobName": "${job_prefix}-score",
+        "ModelName": {
+          "Get": "Steps.CreateModel.ModelName"
+        },
+        "TransformInput": {
+          "DataSource": {
+            "S3DataSource": {
+              "S3DataType": "S3Prefix",
+              "S3Uri": {
+                "Get": "Steps.Preprocess.ProcessingOutputConfig.Outputs['prepared'].S3Output.S3Uri"
+              }
+            }
+          },
+          "ContentType": "application/jsonlines",
+          "SplitType": "Line"
+        },
+        "TransformOutput": {
+          "S3OutputPath": {
+            "Std:Join": {
+              "On": "/",
+              "Values": [
+                {
+                  "Get": "Parameters.OutputDataUri"
+                },
+                {
+                  "Get": "Execution.PipelineExecutionId"
+                },
+                "predictions/raw"
+              ]
+            }
+          },
+          "AssembleWith": "Line",
+          "Accept": "application/jsonlines"
+        },
+        "TransformResources": {
+          "InstanceCount": {
+            "Get": "Parameters.TransformInstanceCount"
+          },
+          "InstanceType": {
+            "Get": "Parameters.TransformInstanceType"
+          }
+        },
+        "BatchStrategy": "MultiRecord",
+        "MaxConcurrentTransforms": {
+          "Get": "Parameters.MaxConcurrentTransforms"
+        },
+        "MaxPayloadInMB": {
+          "Get": "Parameters.MaxPayloadInMB"
+        },
+        "Tags": [
+          {
+            "Key": "Deployment",
+            "Value": "${namespace}"
+          }
+        ]
+      }
+    },
+    {
+      "Name": "Postprocess",
+      "Type": "Processing",
+      "Arguments": {
+        "ProcessingJobName": "${job_prefix}-post",
+        "ProcessingResources": {
+          "ClusterConfig": {
+            "InstanceType": {
+              "Get": "Parameters.PostprocessInstanceType"
+            },
+            "InstanceCount": 1,
+            "VolumeSizeInGB": 30
+          }
+        },
+        "AppSpecification": {
+          "ImageUri": {
+            "Get": "Parameters.InferenceImageUri"
+          },
+          "ContainerArguments": [
+            "--input",
+            "/opt/ml/processing/input",
+            "--output",
+            "/opt/ml/processing/output",
+            "--model-dir",
+            "/opt/ml/processing/model/model.tar.gz",
+            "--chunk-rows",
+            {
+              "Get": "Parameters.BatchChunkRows"
+            }
+          ],
+          "ContainerEntrypoint": [
+            "python",
+            "-m",
+            "mlops_models.entrypoints",
+            "postprocess"
+          ]
+        },
+        "RoleArn": "${role}",
+        "ProcessingInputs": [
+          {
+            "InputName": "input-1",
+            "AppManaged": false,
+            "S3Input": {
+              "S3Uri": {
+                "Get": "Steps.Transform.TransformOutput.S3OutputPath"
+              },
+              "LocalPath": "/opt/ml/processing/input",
+              "S3DataType": "S3Prefix",
+              "S3InputMode": "File",
+              "S3DataDistributionType": "FullyReplicated",
+              "S3CompressionType": "None"
+            }
+          },
+          {
+            "InputName": "checkpoint",
+            "AppManaged": false,
+            "S3Input": {
+              "S3Uri": {
+                "Get": "Parameters.ModelDataUri"
+              },
+              "LocalPath": "/opt/ml/processing/model",
+              "S3DataType": "S3Prefix",
+              "S3InputMode": "File",
+              "S3DataDistributionType": "FullyReplicated",
+              "S3CompressionType": "None"
+            }
+          }
+        ],
+        "ProcessingOutputConfig": {
+          "Outputs": [
+            {
+              "OutputName": "predictions",
+              "AppManaged": false,
+              "S3Output": {
+                "S3Uri": {
+                  "Std:Join": {
+                    "On": "/",
+                    "Values": [
+                      {
+                        "Get": "Parameters.OutputDataUri"
+                      },
+                      {
+                        "Get": "Execution.PipelineExecutionId"
+                      },
+                      "predictions"
+                    ]
+                  }
+                },
+                "LocalPath": "/opt/ml/processing/output",
+                "S3UploadMode": "EndOfJob"
+              }
+            }
+          ]
+        },
+        "Environment": {
+          "MODEL_ID": "${model_id}",
+          "PYTHONUNBUFFERED": "1",
+          "PIPELINE_EXECUTION_ID": {
+            "Get": "Execution.PipelineExecutionId"
+          },
+          "IMAGE_URI": {
+            "Get": "Parameters.InferenceImageUri"
+          }
+        },
+        "StoppingCondition": {
+          "MaxRuntimeInSeconds": 900
+        },
+        "Tags": [
+          {
+            "Key": "Deployment",
+            "Value": "${namespace}"
+          }
+        ]
+      }
+    }
+  ]
+}
