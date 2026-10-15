@@ -23,7 +23,6 @@ from pathlib import Path
 for debug_name, debug_value in {
     "model_dir": model_dir,
     "package_dir": package_dir,
-    "checkpoint": checkpoint,
     "output_directory": output_directory,
 }.items():
     debug_path = Path(debug_value)
