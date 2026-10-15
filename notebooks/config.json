@@ -3,37 +3,7 @@
   "bucket": "",
   "role_arn": "",
   "image_uri": "",
-  "feature_store_role_arn": "",
-  "job_role_arn": "",
-  "csv_input": "",
-  "feature_store_config_uri": "",
-  "data_source": "csv_direct",
-  "namespace": "wsf-dev",
-  "environment": "dev",
   "registry_group_prefix": "",
-  "deploy_name": "my-review",
-  "model_ids": null,
-  "include_hpo": false,
-  "cache_steps": true,
-  "model_code_source": "artifact",
-  "batch_runtime": "processing",
-  "universe_data_root": "",
-  "sample_rows": 100,
-  "record_id": "customer_id",
-  "event_time": "feature_asof_dt",
-  "sample_asof": "2026-01-01T00:00:00Z",
-  "type_overrides": {},
-  "athena_workgroup": "primary",
-  "kms_key": "",
-  "create_missing_groups": false,
-  "verify_offline_readback": false,
-  "infrastructure": {
-    "network": {
-      "isolation": false,
-      "subnet_ids": [],
-      "security_group_ids": []
-    },
-    "output_kms_key_arn": "",
-    "volume_kms_key_arn": ""
-  }
+  "csv_input": "",
+  "feature_store_config_uri": ""
 }
