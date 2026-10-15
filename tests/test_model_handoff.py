@@ -100,6 +100,39 @@ class ModelHandoff(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.definitions(models=[])
 
+    def test_registry_prefix_is_exact_and_shared_by_registration_and_lookup(self):
+        def resolve(value, model):
+            if isinstance(value, str):
+                return value
+            if value == {"Get": "Parameters.ModelId"}:
+                return model
+            join = value["Std:Join"]
+            return join["On"].join(resolve(item, model) for item in join["Values"])
+
+        prefix = "platform-finance-mlops-team-"
+        for environment in ("dev", "prod"):
+            bodies = self.definitions(environment=environment, registry_group_prefix=prefix,
+                                      include_hpo=True)
+            training = {s["Name"]: s for s in walk_steps(bodies["training"]["Steps"])}
+            lookup = bodies["inference"]["Steps"][0]["Arguments"]["Environment"]["MODEL_PACKAGE_GROUP"]
+            for model in (FIRST, SECOND):
+                expected = f"{prefix}{model}-sm-{environment}"
+                self.assertEqual(resolve(lookup, model), expected)
+                for name in ("RegisterModel", "RegisterTunedModel"):
+                    registration = training[name]["Arguments"]["Environment"]["MODEL_PACKAGE_GROUP"]
+                    self.assertEqual(resolve(registration, model), expected)
+        with self.assertRaisesRegex(ValueError, "either an exact"):
+            self.definitions(models=[FIRST], model_package_group="exact-group",
+                             registry_group_prefix=prefix)
+
+    def test_registry_prefix_changes_do_not_change_training_compute(self):
+        before = self.definitions()
+        after = self.definitions(registry_group_prefix="another-environment-")
+        for name in ("GetData", "FeatureSelection", "Preprocess", "Train", "Evaluate"):
+            left = next(s for s in before["training"]["Steps"] if s["Name"] == name)
+            right = next(s for s in after["training"]["Steps"] if s["Name"] == name)
+            self.assertEqual(left, right, name)
+
     def test_hpo_is_hidden_by_default_and_can_be_restored(self):
         from checks import find_references
         for include_hpo in (False, True):

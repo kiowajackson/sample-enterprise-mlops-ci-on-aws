@@ -1,0 +1,20 @@
+.venv/
+.venv-*/
+.runs/
+.build/
+build/
+dist/
+cdk.out/
+__pycache__/
+*.egg-info/
+*.pyc
+deployment-config.json
+/notebooks/config.json
+definition.rendered.json
+definition.deployed.json
+
+.DS_Store
+
+# Keep local working notes and execution evidence out of source distributions.
+/AGENTS.md
+/docs/

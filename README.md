@@ -1,4 +1,4 @@
-> **Transfer branch:** use the [latest complete handoff ZIP](mlops-models/scratch/wsf-full-handoff-2026-10-15T190829Z-password-protected.zip) (password `pass`). See [TRANSFER.md](TRANSFER.md) for the source commit, changed files and update instructions. Older timestamped ZIPs are historical.
+> **Transfer branch:** use the [latest complete handoff ZIP](mlops-models/scratch/wsf-full-handoff-2026-10-15T195327Z-password-protected.zip) (password `pass`). See [TRANSFER.md](TRANSFER.md) for the source commit, changed files and update instructions. Older timestamped ZIPs are historical.
 
 # Enterprise MLOps — training and batch prediction
 
@@ -92,27 +92,50 @@ feature mapping. Notebook 02 does not consume the original metadata file.
 | Mode | Notebook 01 | Notebook 02 input | Pipeline GetData |
 |---|---|---|---|
 | csv_direct | Generate local sample.csv and mappings | csv_input = generated sample.csv; Feature Store URI empty | Notebook 02 uploads the sample, SageMaker mounts it, and GetData copies it unchanged to raw/data.csv |
-| feature_store | Generate sample and mappings, then ingest into the store | feature_store_config_uri = printed binding URI; csv_input empty | Query the existing store and write raw/data.csv |
+| feature_store | Generate sample and mappings, then ingest into the store | feature_store_config_uri = saved binding URI; csv_input empty | Query the existing store and write raw/data.csv |
 
-Select the route explicitly through data_source. CSV mode does not need a Feature
+Select the route explicitly through data_source in config.json. CSV mode does not need a Feature
 Store mapping or ingestion permissions. Both routes produce the flat-file handoff
 consumed by FeatureSelection; they do not necessarily select identical columns.
 The current Feature Store query selects configured model features; CSV-direct
 preserves all supplied columns.
 
-Each notebook has one cell containing all values you supply. Notebook 01 groups
-metadata_csv, bucket, role_arn and image_uri. Notebook 02 groups bucket, role_arn,
-image_uri, csv_input and feature_store_config_uri. Copy this whole cell between
-versions. Namespace, data_source and other presets stay in a separate Defaults
-cell, which never resets your inputs. Notebook 01 prints all five input lines for
-notebook 02; verify the role if ingestion and pipeline jobs use different roles.
+Both notebooks read **notebooks/config.json**. Copy
+[config.example.json](notebooks/config.example.json) to that name and fill in
+`metadata_csv`, `bucket`, `role_arn` and `image_uri` once. If config.json is missing,
+the first notebook cell creates it from the template and stops with its full path.
+Then **Run All in notebook 01, followed by Run All in notebook 02**. No cell edits
+or copying values between notebooks are needed.
+
+`role_arn` is the pipeline role. Set `feature_store_role_arn` for a different
+Feature Store offline writer, and `job_role_arn` for a different job role; each
+otherwise uses role_arn. CSV generation alone needs only metadata_csv. Relative metadata_csv and csv_input
+paths resolve from the checkout root.
+
+After successful preparation, notebook 01 updates only `csv_input` and
+`feature_store_config_uri`, clearing the unused one. It saves the generated CSV
+path relative to the checkout root, or the exact published Feature Store URI.
+Other settings and additional keys are preserved. Failed preparation leaves the
+previous saved handoff unchanged. Notebook 02 reads the file again when started.
+
+Mode, namespace, Registry naming, caching, sample and job options are also in this
+file. Saved settings override template defaults; newly added optional settings
+can use their defaults without replacing your config. A malformed config fails
+instead of being overwritten. Targets and model settings remain in each use case's
+parameters.json.
+
+The populated **config.json is Git-ignored and excluded from ZIP exports**.
+Deliveries contain only config.example.json, so unpacking an update does not
+replace existing connection values. When moving to a fresh checkout, copy your
+config.json separately; copy any referenced local files too, or rerun notebook 01.
+Do not populate the distributable example file with your environment values.
 
 ### 1. Prepare data
 
 For `data_source="csv_direct"`, run notebook 01 with the intended metadata CSV.
-All CSV-mode cells can run without AWS access. Copy its printed `sample.csv` path
-into notebook 02. An existing flat CSV can also be supplied directly to notebook
-02; generating another sample is unnecessary.
+All CSV-mode cells can run without AWS access. The generated sample.csv path is
+saved in config.json for notebook 02. To use an existing flat CSV instead, set
+csv_input in config.json and run notebook 02 directly; another sample is unnecessary.
 
 Metadata fields are `column_name`, `column_map`, `table_nm` and `ref_val1` through
 `ref_val5`. `column_name` supplies CSV headers; `column_map` preserves the source
@@ -125,20 +148,26 @@ To deliberately use the supplied example, set
 substitutes it.
 
 For `data_source="feature_store"`, notebook 01 additionally ingests into existing
-groups and prints `feature_store_config_uri`. Missing-group creation is opt-in
+groups and saves `feature_store_config_uri` in config.json. Missing-group creation is opt-in
 and requires the corresponding permissions. It creates no roles, bucket, Athena
 workgroup or tracking server. See [Feature Store details](mlops-features/README.md).
 
 ### 2. Publish the shared pipelines
 
-In notebook 02, set the required inputs at the top. The default namespace
+Notebook 02 reads the required inputs from config.json. The default namespace
 `wsf-dev` names this deployment **Wealth ML SageMaker Foundation (WSF)**. It
 publishes `wsf-dev-training` and `wsf-dev-inference`, with source, uploaded CSVs and
 run outputs under `s3://<bucket>/wsf-dev/`. The existing `source-dev` pipelines and
 objects are not updated. Namespace ownership checks still apply if `wsf-dev`
-already exists. Registry group names are **<ModelId>-sm-<environment>**. The platform
+already exists. Registry group names are **`<prefix><ModelId>-sm-<environment>`**. The platform
 must create these groups before publication. Notebook 02 checks each group using
 the notebook caller; a missing group or denied read stops before source upload.
+Set `registry_group_prefix` in config.json to the exact prefix, including any
+trailing hyphen. It is not shortened, lowercased or given an extra separator.
+The model folder name and environment supply the rest: a prefix of `team-` gives
+`team-usecase1-sm-dev`. The same name is used by preflight, training registration
+and inference lookup. Change prefix/environment in config.json and republish to
+use another environment's existing groups. Empty prefix keeps `usecase1-sm-dev`.
 
 For CSV mode, supply `csv_input` as a local file or exact S3 CSV URI and leave
 `feature_store_config_uri` empty. Local relative paths resolve against this
@@ -152,15 +181,18 @@ The demo names `target_value` and `churned_flag` are example target columns; rep
 them with your own. They are not pipeline requirements. The notebook verifies
 file access, headers, rows and uploaded bytes, without inventing labels or
 renaming columns. Model-specific target handling belongs in the model code.
-Keep the initial options:
+Keep these initial options in config.json:
 
-```python
-data_source = "csv_direct"
-environment = "dev"
-batch_runtime = "processing"
-include_hpo = False
-cache_steps = True
-model_ids = None
+```json
+{
+  "data_source": "csv_direct",
+  "environment": "dev",
+  "registry_group_prefix": "",
+  "batch_runtime": "processing",
+  "include_hpo": false,
+  "cache_steps": true,
+  "model_ids": null
+}
 ```
 
 Run all cells. They inspect the actual CSV/header/model targets, compile model Python
@@ -181,7 +213,7 @@ defaults. It prints pipeline names/versions, source/data locations and a local
    by default; UseHPO only appears if include_hpo was enabled when publishing.
 2. Wait for Evaluate, QualityGate and **RegisterModel** to succeed. Its
    registration job role registers a **PendingManualApproval** version in
-   **<ModelId>-sm-<environment>**. Registration cannot be switched off.
+   **`<prefix><ModelId>-sm-<environment>`**. Registration cannot be switched off.
    RegisterModel is a Processing step calling the Registry API. It requires an
    existing group and never creates one; this avoids the native RegisterModel
    step's attempt to create a group. Registration and approval
@@ -225,7 +257,7 @@ not implement promotion.
 | Notebook infrastructure settings | Network, encryption and related job configuration |
 | Execution parameters | ModelId, input locations, instance choices and supported runtime switches |
 
-Registry group names default to **`<ModelId>-sm-<environment>`**, for example
+Registry group names default to **`<prefix><ModelId>-sm-<environment>`**, for example
 `usecase1-sm-dev`. Platform provisioning owns their creation.
 
 To add or rename a use case, copy or rename a complete directory under
@@ -405,7 +437,7 @@ rows and retained runtime source under `code/`.
 
 Evaluation uses the **uploaded evaluation code** with the saved checkpoint and
 settings, so evaluation can be corrected without refitting the model. Inference
-has an explicit `model_code_source` choice in notebook 02:
+has an explicit `model_code_source` choice in config.json:
 
 - `artifact` (default): use the runtime source packaged with the approved model.
   Changing uploaded model code does not change what that archive executes.
@@ -602,6 +634,14 @@ networking are different choices; jobs still require the service connectivity
 needed by their selected mode. Platform owners bind exact resources and roles.
 
 ## Validation
+
+The shared-config update passed 92 source tests and 25 simulated-AWS notebook
+cases. Both notebooks executed in sequence from config.json with no copied values;
+CSV and Feature Store handoffs preserved other settings, and populated config.json
+was excluded from export. Prefix/environment bindings matched across Registry
+preflight, ordinary/HPO registration and inference lookup. Changing the prefix
+left training compute definitions unchanged. These are local/configuration checks;
+this increment did not launch new managed jobs.
 
 The required-Registry update passed 83 source tests and 23 simulated-AWS
 notebook cases. Managed sandbox acceptance verified:

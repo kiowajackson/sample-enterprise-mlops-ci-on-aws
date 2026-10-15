@@ -258,7 +258,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                       region, models=None, infrastructure=None, batch_runtime="transform",
                       feature_store_config_uri="", universe_data_root="",
                       data_source="feature_store", csv_input_uri="", preparation_cache_revision="",
-                      model_package_group="", environment="dev",
+                      model_package_group="", environment="dev", registry_group_prefix="",
                       include_hpo=False, step_cache_revisions=None, model_code_source="artifact"):
     """Render training registration and inference from an approved Registry version."""
     if data_source not in {"feature_store", "csv_direct"}:
@@ -295,6 +295,10 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
         raise ValueError("Choose transform or processing for batch_runtime.")
     if model_package_group and len(models) != 1:
         raise ValueError("An explicit registry group requires one selected model.")
+    if model_package_group and registry_group_prefix:
+        raise ValueError("Use either an exact model_package_group or registry_group_prefix, not both.")
+    if not isinstance(registry_group_prefix, str):
+        raise ValueError("registry_group_prefix must be a string, including any separator.")
     configs = [json.loads((PACKAGE / "models" / name / "parameters.json").read_text()) for name in models]
     if include_hpo:
         if not all(config.get("tuning") for config in configs):
@@ -307,6 +311,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
     model = {"Get": "Parameters.ModelId"}
     output = join({"Get": "Parameters.OutputDataRoot"}, model, "runs")
     group = model_package_group or join(model, "sm", environment, on="-")
+    if registry_group_prefix:
+        group = join(registry_group_prefix, group, on="")
     template_model = models[0] if len(models) == 1 else "shared"
     definitions = {}
     for kind in ("training", "inference"):
