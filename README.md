@@ -445,12 +445,20 @@ the container. The model functions read those local inputs.
 |---|---|---|
 | GetData shared entrypoint | Explicit CSV or Feature Store binding | `raw/data.csv`, `raw/provenance.json` |
 | `run_feature_selection` | Raw CSV directory and settings | `selection/selected_features.csv`, `selection/random_forest_plots.pdf` |
-| `process_train` | Raw directory, selected-feature file and settings | `prepared/` containing one or more CSVs; demo writes `data.csv` |
+| `process_train` | Raw directory, selected-feature file, output directory, metadata dictionary and parameter-file path | `prepared/` containing one or more CSVs; demo writes `data.csv` |
 | `train_model` | Prepared directory, selected-feature file, package/work paths and settings | Saved model directory with metadata, evaluation.json and runtime code |
 | Evaluation hook | Saved artifact containing evaluation.json and model_metadata.json; current quality thresholds | Published evaluation.json and an exact copy of model_metadata.json |
 | `process_inference` | Raw CSV directory and saved parameters/metadata | `prepared/data.csv`, `selection/selected_features.csv`; optional Transform shards under `prepared/shards/` |
 | `predict_with_model` | Prepared directory, extracted checkpoint and writable output | `predictions.csv`, `messaging.csv`, `messaging_final.csv` |
 | `postprocess_predictions` | Raw directory, selected-feature file, prediction directory and saved settings | `prediction_analysis.csv`, `summary.json`, effective `parameters.json` |
+
+Training preprocessing receives five arguments in that order. Its entrypoint
+loads `models/<ModelId>/model_metadata.json` as `config` and passes
+`models/<ModelId>/parameters.json` separately as `parameter_path`. It does not
+merge the two documents. The example preprocessing reads settings from that path;
+customer code can use both inputs. The use-case wrappers already re-export the
+base function and need no change. This correction applies to training only;
+inference currently retains its separate three-argument adapter.
 
 Training's demo selection CSV has a **`feature`** column. Inference reconstructs
 its selection from saved feature_mapping and writes **`features,description`**.

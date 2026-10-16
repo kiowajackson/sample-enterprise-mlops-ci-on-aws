@@ -1,7 +1,7 @@
 Current inference copy-over set — 2026-10-16
-Source checkpoint: 96e7a82158b7c508b7f96b8048b3759e9c407171
+Source checkpoint: 2822d59304c5502910b68fc24d3704a5a451070f
 
-18 update files: 15 runtime files, 2 notebooks and README.md.
+19 update files: 16 runtime files, 2 notebooks and README.md.
 This CHANGED_FILES.txt index is additional. Three existing scratch diagnostics
 are retained separately below. Dev is a copy-over set, not a complete checkout.
 Tests remain in the development repository and are checked before sharing.
@@ -12,7 +12,18 @@ replace the entrypoints/framework files and align the thin use-case wrappers.
 After all runtime updates are in place, run notebook 02 and execute inference
 for the already approved ModelId. Notebook 01 only needs rerunning for new data.
 
+LATEST CORRECTION — TRAINING PREPROCESSING ONLY
+Copy mlops-models/src/mlops_models/entrypoints/preprocess_training.py.
+It loads the selected model's model_metadata.json into config and passes the
+separate parameters.json Path as the fifth argument to process_train, after
+(data_directory, selection_file, output_directory, config).
+Keep the customer preprocessing implementation that already accepts those five
+arguments. The example base adapter and tests were updated in development only.
+No inference files, notebook code or wrappers changed in this correction.
+README.md and this index were updated too. 140 source tests passed.
+
 REPLACE THESE FRAMEWORK FILES TOGETHER
+mlops-models/src/mlops_models/entrypoints/preprocess_training.py
 mlops-models/src/mlops_models/entrypoints/__main__.py
 mlops-models/src/mlops_models/entrypoints/evaluate.py
 mlops-models/src/mlops_models/entrypoints/get_data.py
@@ -51,7 +62,7 @@ mlops-models/scratch/job_log_cell.py
 mlops-models/scratch/trace_evaluation_inputs.py
 mlops-models/scratch/trace_training_inputs.py
 
-No tests, old training updates, config copies or ZIPs remain in this dev tree.
-Runtime source is unchanged from the tested inference update: 138 source tests,
+No tests, obsolete training updates, config copies or ZIPs are included.
+The inference update passed 138 source tests,
 26 simulated notebook scenarios, definition checks and four real local prediction
 flows passed. AWS calls were simulated; BMO inference acceptance is still next.
