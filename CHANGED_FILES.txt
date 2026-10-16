@@ -1,8 +1,7 @@
 Inference adapter + ready-to-run notebook 02
 
 Source: f5e3c5074544b360528ef7cb7e77dafe8e6a4bf0
-Full archive: wsf-full-handoff-2026-10-15T235943Z-password-protected.zip
-Password: pass
+Delivery: individual changed files on dev
 
 FILES TO COPY / PORT INTO YOUR ADAPTED CHECKOUT
 - notebooks/02_deploy_pipelines.ipynb
@@ -40,10 +39,10 @@ tests/test_metadata_features.py
 tests/test_review_hardening.py
 tests/test_step_io.py
 
-All files above are individually available on dev and in the full ZIP.
-CHANGED_FILES.txt and the latest ZIP/checksum are also updated/added. Existing dev
-files, blank config files and the older published ZIP are preserved. The ZIP is a
-clean generic baseline; extract separately to retain adapted customer code.
+All files above are individually available on dev. CHANGED_FILES.txt is updated.
+The new ZIP/checksum are excluded from the current dev tree at the user's request.
+Existing files, blank config files and older artifacts are preserved.
+Keep adapted customer code when applying this update.
 
 VERIFICATION
 The inference runtime passed 132 source tests and four real local prediction flows
