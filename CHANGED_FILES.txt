@@ -1,30 +1,16 @@
-Inference stages update — 2026-10-16
+Current inference copy-over set — 2026-10-16
 Source checkpoint: 96e7a82158b7c508b7f96b8048b3759e9c407171
-Compared with: f5e3c5074544b360528ef7cb7e77dafe8e6a4bf0
 
-30 source/test/documentation files changed; this index is additional.
-All paths below are relative to the repository root, with the same paths on dev.
-No ZIP, populated config, captured notebook output or customer data is included.
+18 update files: 15 runtime files, 2 notebooks and README.md.
+This CHANGED_FILES.txt index is additional. Three existing scratch diagnostics
+are retained separately below. Dev is a copy-over set, not a complete checkout.
+Tests remain in the development repository and are checked before sharing.
 
-What this changes
-- ResolveModel -> GetData -> Preprocess -> Score -> Postprocess.
-- Preprocess applies the saved feature mapping and writes prepared/data.csv plus
-  selection/selected_features.csv. No training target is required for inference.
-- Score writes predictions.csv, messaging.csv and messaging_final.csv.
-- Postprocess gets the original raw snapshot, saved selection, all three prediction
-  files and saved config. It writes prediction_analysis.csv and summary.json.
-- Training and inference data sources can differ. Defaults remain csv_direct for
-  both; later set data_source=feature_store for training and leave
-  inference_data_source=csv_direct in notebook 02.
-- New Registry versions expose ModelMetadataUri and ModelMetadataSha256 for the
-  exact metadata JSON published by Evaluate. The archive retains identical bytes.
-- Existing compatible approved models can run updated Processing inference with
-  model_code_source=pipeline. No training rerun is needed for that test. To expose
-  metadata separately on a new Registry version, run updated Evaluate/RegisterModel.
-- All four inference compute steps are cache eligible with a fixed CSV; resolution
-  stays live. Downstream inputs refer to actual producing jobs, including cache hits.
-- Training and inference modules remain separate. Consolidation is later refactoring.
-- MLflow logging is not implemented; final analysis is currently available in S3.
+Keep your existing model_base/training files, model parameters and config.json.
+Customer algorithms belong in the three model_base/inference Python files;
+replace the entrypoints/framework files and align the thin use-case wrappers.
+After all runtime updates are in place, run notebook 02 and execute inference
+for the already approved ModelId. Notebook 01 only needs rerunning for new data.
 
 REPLACE THESE FRAMEWORK FILES TOGETHER
 mlops-models/src/mlops_models/entrypoints/__main__.py
@@ -60,25 +46,12 @@ notebooks/01_prepare_data.ipynb
 notebooks/02_deploy_pipelines.ipynb
 README.md
 
-TEST FILES (NOT REQUIRED TO EXECUTE NOTEBOOK 02)
-tests/test_feature_store_pipeline.py
-tests/test_inference_metadata.py
-tests/test_inference_stages.py
-tests/test_metadata_features.py
-tests/test_model_handoff.py
-tests/test_notebook_config.py
-tests/test_pipeline_cache.py
-tests/test_review_hardening.py
-tests/test_saved_training_metrics.py
-tests/test_source_deployment.py
-tests/test_step_io.py
-tests/test_training_files.py
+OPTIONAL SCRATCH DIAGNOSTICS — RETAINED, UNCHANGED
+mlops-models/scratch/job_log_cell.py
+mlops-models/scratch/trace_evaluation_inputs.py
+mlops-models/scratch/trace_training_inputs.py
 
-Validation: 138 source tests; 26 simulated-AWS notebook scenarios; definition
-checks; four real local AutoGluon prediction flows (regression/classification,
-both archive layouts). 37 IDs/scores checked per flow, three prediction files and
-final analysis produced, model files unchanged. S3/Registry calls were simulated.
-Customer model code, target IAM and the receiving container still need acceptance.
-Native Transform uses a separate HTTP adapter; this handoff tests Processing first.
-
-The training implementation, model parameters and config.example.json did not change.
+No tests, old training updates, config copies or ZIPs remain in this dev tree.
+Runtime source is unchanged from the tested inference update: 138 source tests,
+26 simulated notebook scenarios, definition checks and four real local prediction
+flows passed. AWS calls were simulated; BMO inference acceptance is still next.
