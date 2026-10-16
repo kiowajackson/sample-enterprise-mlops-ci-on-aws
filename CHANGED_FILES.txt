@@ -1,35 +1,41 @@
-Current dev copy-over set — model wrapper fix
+Current dev copy-over set — wrapper fix and inference input trace
 
-This branch contains ONLY the eight files below. Apply them as an overlay to
-your existing application. The complete earlier copy set remains available in
-Git history at 84461084019fa7f6f983904deea199213b2797a6.
-Runtime code is unchanged from that commit.
+This is a nine-file overlay for an existing application, not a full checkout.
+The six runtime files are unchanged from dev 0252c40.
 
-UPDATE THESE FOUR WRAPPERS IN YOUR EXISTING MODEL FOLDERS
-Use the corresponding iclv/atrd folders; preserve your names and parameters.
+NEW IN THIS UPDATE
+mlops-models/scratch/trace_inference_inputs.py
+README.md
+CHANGED_FILES.txt
+
+Paste the entire diagnostic into one notebook cell. Set SCORE_JOB_NAME and
+PREPROCESS_JOB_NAME to the failed Processing Score and its producing Preprocess
+job. For cached input, use the original producer. It checks the recorded source
+parameters and original/raw/prepared CSV headers and saves deployed model scripts
+locally. It reads AWS only; it does not rerun jobs. Pipeline source mode only.
+Native Transform and artifact code require inspecting the registered archive.
+
+TRAINING PORT — ALREADY IMPLEMENTED IN THE INCLUDED BASE EXAMPLE
+In model_base/training/train.py, accept trainer_cls after * in train_model.
+Replace the ModelTraining(...) constructor call with trainer_cls(...), keeping
+your constructor arguments. The use-case wrapper already supplies the class.
+Keep your customer training body and existing metadata/evaluation outputs.
+
+EXISTING WRAPPERS — KEEP THESE ALIGNED IN YOUR MODEL FOLDERS
 mlops-models/src/mlops_models/models/usecase1/training/train.py
 mlops-models/src/mlops_models/models/usecase1/inference/predict.py
 mlops-models/src/mlops_models/models/usecase2/training/train.py
 mlops-models/src/mlops_models/models/usecase2/inference/predict.py
 
-BASE EXAMPLES — MERGE ONLY THE RELEVANT CHANGE
+BASE EXAMPLES — MERGE RELEVANT INTERFACE CHANGES INTO CUSTOMER CODE
 mlops-models/src/mlops_models/model_base/training/train.py
 mlops-models/src/mlops_models/model_base/inference/predict.py
 
-Training's class is ModelTraining and each wrapper uses UseCaseModelTraining.
-If you already renamed the customer class, that part is done.
-Prediction wrappers import only predict_with_model. The base example removes
-the unused predict_model helper. Keep your customer prediction implementation.
-base_predict_with_model is an import alias for the same base function.
+Training uses ModelTraining/UseCaseModelTraining. Prediction wrappers import
+only predict_with_model; keep your customer prediction implementation.
+Rebuild with your existing notebook 02 after changing executable code.
+No rebuild is needed to run the diagnostic against existing job inputs.
 
-DOCUMENTATION
-README.md
-CHANGED_FILES.txt
-
-Rerun your existing notebook 02 to publish the corrected source. Processing can
-use the updated source with a compatible approved model; native Transform still
-needs the corrected archived code and compatible container startup.
-
-No notebooks, scratch files, tests, config copies, ZIPs or other runtime files
-are included in this incremental copy set. Your full application stays intact.
-The source correction passed 163 checks across the model/notebook environments.
+The earlier complete copy set remains in Git history at 8446108.
+No ZIPs, notebooks, tests, populated configs or captured outputs are included.
+This update passed 15 focused local checks with simulated AWS.

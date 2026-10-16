@@ -214,6 +214,14 @@ to the agreed data-access and size policy.
 Keep your adapted training implementation. Align its arguments and output writer
 with the entrypoint; the generic trainer remains an integration example.
 
+The use-case wrapper supplies `trainer_cls=UseCaseModelTraining`. Your base
+`train_model` must accept `trainer_cls` after `*`, then use `trainer_cls(...)`
+where it currently constructs `ModelTraining(...)`. Keep your constructor's
+existing arguments. Accepting the keyword alone does not enable the override:
+the constructor call must use it too. `ModelTraining` remains defined in the
+base file; the base file does not import the use-case module. This is a class
+argument, not an instance or a circular import.
+
 1. In your `ModelTraining.evaluate_model`, keep the existing validation-probability
    return and also return the `performance` dictionary from `AML.evaluate(...)`.
    Unpack both at the call site; plotting still receives the probabilities.
@@ -670,6 +678,18 @@ Entry points load parameters from the selected model folder; the process
 working directory is not the parameter directory.
 
 ## Local paths and S3 artifacts
+
+For a Processing Score error about a missing primary key, paste the entire
+`mlops-models/scratch/trace_inference_inputs.py` file into a notebook cell and set
+the failed Score and producing Preprocess job names. It verifies the producer
+link, compares both jobs' primary-key settings and traces original/raw/prepared
+CSV headers. It saves the deployed preprocessing/prediction files for inspection.
+Use the original producer when preprocessing was cached. This read-only
+diagnostic supports pipeline source mode; it does not inspect archived code.
+If the prepared CSV contains the key, inspect the actual file/key used inside
+the customer predictor and any column selection, casing or index conversion
+before scoring. Keep IDs separately while selecting model inputs; they are
+needed when building prediction outputs, even when they are not model features.
 
 The non-root compatibility workaround is local filesystem handling, not an IAM
 permission grant. It preserves native input downloads and provides writable
