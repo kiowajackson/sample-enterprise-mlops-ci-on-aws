@@ -20,7 +20,7 @@ from model_fixtures import REGRESSION_MODEL as FIRST, CLASSIFICATION_MODEL as SE
 from mlops_skeleton.names import discover_models, job_prefix, validate_model_id, validate_namespace
 from mlops_models.entrypoints.evaluate import check_quality_thresholds
 from mlops_models.model_base.inference.preprocess import process_inference
-from mlops_models.model_base.inference.postprocess import get_container_input as read_batch_scores
+from mlops_models.model_base.inference.postprocess import read_predictions as read_batch_scores
 from mlops_models.registry.model_package import validate_approved_model_package as validate_package
 from mlops_models.pipelines.inspect import inspect_run
 
@@ -72,8 +72,10 @@ class ReviewHardening(unittest.TestCase):
         frame = self.frame.assign(unused_customer_text="not needed")
         with TemporaryDirectory() as directory:
             frame.to_csv(Path(directory) / "data.csv", index=False)
-            output, rows = process_inference(directory, directory, self.config, shard_rows=31)
-            files = list(output.glob("*.jsonl"))
+            config = {**self.config, "model_metadata": {"feature_mapping": {"value": "value"}}}
+            config["model_metadata"]["feature_mapping"] = {c: c for c in frame.columns if c != config["primary_key"]}
+            output, rows = process_inference(directory, directory, config, shard_rows=31)
+            files = list((output / "shards").glob("*.jsonl"))
             self.assertEqual(rows, 160)
             self.assertEqual(len(files), 6)
             records = [json.loads(line) for path in files for line in path.read_text().splitlines()]

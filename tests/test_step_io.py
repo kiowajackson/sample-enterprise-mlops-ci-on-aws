@@ -23,18 +23,18 @@ class StepIO(unittest.TestCase):
                 calls.append(checkpoint)
             def predict_file(self, user_data_path):
                 df = pd.read_csv(user_data_path, dtype={"id": str})
-                return pd.DataFrame({"id": df["id"], "score": 42.0})
+                result = pd.DataFrame({"id": df["id"], "score": 42.0})
+                return result, df[["id"]], result.copy()
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
             inputs = root / "input"
             inputs.mkdir()
-            for i in (1, 2):
-                (inputs / f"{i}.jsonl").write_text(json.dumps({"id": f"000{i}", "value": i}) + "\n")
+            (inputs / "data.csv").write_text("id,value\n0001,1\n0002,2\n")
             other_class = two.UseCaseModelPredictor
             with patch.object(one, "UseCaseModelPredictor", CustomerPredictor):
                 scores = predict.execute(FIRST, inputs, root / "checkpoint", root / "scores")
-            records = [json.loads(path.read_text()) for path in sorted(scores.glob("*.out"))]
+            records = pd.read_csv(scores / "predictions.csv", dtype={"id": str}).to_dict("records")
             self.assertEqual(records, [{"id": "0001", "score": 42.0}, {"id": "0002", "score": 42.0}])
             self.assertEqual(calls, [root / "checkpoint"])
             self.assertIs(two.UseCaseModelPredictor, other_class)
@@ -51,18 +51,31 @@ class StepIO(unittest.TestCase):
             model.mkdir()
             config = {"primary_key": "id", "task_type": "regression", "customer_setting": "saved"}
             (model / "parameters.json").write_text(json.dumps(config))
-            (inputs / "part.out").write_text('{"id":"0001","score":42}\n{"id":"0002","score":43}\n')
+            (model / "model_metadata.json").write_text('{"feature_mapping":{"value":"value"}}')
+            raw = root / "raw"
+            raw.mkdir()
+            (raw / "data.csv").write_text("id,value\n0001,4\n0002,5\n")
+            selection = root / "selected_features.csv"
+            selection.write_text("features,description\nvalue,value\n")
+            for name in ("predictions.csv", "messaging.csv", "messaging_final.csv"):
+                (inputs / name).write_text("id,score,var1,var1_value\n0001,42,value,4\n0002,43,value,5\n")
             chunks = []
-            def customer_format(result, settings):
+            def customer_format(data_path, selected, predictions, settings):
+                self.assertEqual(data_path.read_bytes(), (raw / "data.csv").read_bytes())
+                self.assertEqual(selected["features"].tolist(), ["value"])
+                self.assertEqual(settings["model_metadata"]["feature_mapping"], {"value": "value"})
+                result = predictions["messaging_final.csv"]
                 self.assertEqual(settings["customer_setting"], "saved")
                 chunks.append(len(result))
                 return result.rename(columns={"score": "prediction"}).assign(prediction=result["score"] * 2)
             with patch.object(one, "use_case_postprocess", customer_format):
-                output = postprocess.execute(FIRST, inputs, root / "output", model_dir=model, chunk_rows=1)
+                output = postprocess.execute(FIRST, inputs, root / "output", model_dir=model, data_directory=raw, selection_file=selection, chunk_rows=1)
             df = pd.read_csv(output, dtype={"id": str})
             self.assertEqual(df["id"].tolist(), ["0001", "0002"])
             self.assertEqual(df["prediction"].tolist(), [84, 86])
-            self.assertEqual(chunks, [1, 1])
+            self.assertEqual(chunks, [2])
+            self.assertEqual(df["var1_value"].tolist(), [4, 5])
+            self.assertEqual(output.name, "prediction_analysis.csv")
             self.assertEqual(json.loads((output.parent / "summary.json").read_text())["rows"], 2)
 
     def test_local_csv_readers_preserve_identifiers_and_missing_values(self):

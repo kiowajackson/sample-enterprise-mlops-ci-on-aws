@@ -121,11 +121,7 @@ class MetadataFeatures(unittest.TestCase):
             self.assertEqual(selected.id.tolist(), ["002"])
             self.assertEqual(selected.target.tolist(), [1])
             s3.get_object.return_value = {"Body": io.BytesIO(b"id,asof\n001,2026-01-01\n")}
-            with patch.object(preprocess_inference.boto3, "Session", return_value=session.return_value), \
-                 patch.object(preprocess_inference, "read_json", return_value=(settings, {})), \
-                 patch.object(preprocess_inference, "resolve_delivery", return_value=({}, {})), \
-                 patch.object(preprocess_inference, "read_group", return_value=(df, {})):
-                selected, _ = preprocess_inference.get_container_input("s3://data/config.json", "usecase1", config)
+            selected, _ = get_data.get_container_input("s3://data/config.json", "usecase1", config, inference=True)
             self.assertEqual(selected.id.tolist(), ["001"])
             self.assertNotIn("target", selected)
 

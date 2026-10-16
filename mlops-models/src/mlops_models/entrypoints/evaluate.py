@@ -1,6 +1,7 @@
 """Publish saved training metrics and check thresholds before model registration."""
 
 from importlib import import_module
+import hashlib
 import json
 from pathlib import Path
 import tarfile
@@ -70,6 +71,11 @@ def evaluate_saved_model(model_id, model_dir, test_file, output):
     report["model_source_dirty"] = str(model_source.get("dirty", True)).lower()
     report["evaluation_source_commit"] = os.getenv("SOURCE_COMMIT", "unknown")
     report["quality"] = check_quality_thresholds(report, config.get("quality_gate", {}))
+    # Keep a directly readable copy associated with this exact evaluated model.
+    metadata = (model_dir / "model_metadata.json").read_bytes()
+    json.loads(metadata)
+    (Path(output) / "model_metadata.json").write_bytes(metadata)
+    report["model_metadata_sha256"] = hashlib.sha256(metadata).hexdigest()
     (Path(output) / "evaluation.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     return report
 

@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from mlops_models.entrypoints import predict, preprocess_inference, postprocess
+from mlops_models.entrypoints import get_data, predict, preprocess_inference, postprocess
 from mlops_models.model_base.inference import predict as base
 from model_fixtures import REGRESSION_MODEL
 
@@ -41,18 +41,20 @@ class InferenceMetadata(unittest.TestCase):
             model = self.artifact(root)
             raw = root / "input.csv"
             raw.write_text("id,raw_value,extra\n0001,3,keep\n0002,4,NA\n0003,5,text\n")
+            raw = get_data.execute(REGRESSION_MODEL, raw, root / "acquired", model_dir=model)
             shards = preprocess_inference.execute(
-                REGRESSION_MODEL, raw, root / "prepared", model_dir=model, shard_rows=2,
+                REGRESSION_MODEL, raw.parent, root / "prepared", model_dir=model, shard_rows=2,
             )
-            rows = [json.loads(line) for path in sorted(shards.glob("*.jsonl"))
+            rows = [json.loads(line) for path in sorted((shards / "shards").glob("*.jsonl"))
                     for line in path.read_text().splitlines()]
             self.assertEqual(len(rows), 3)
-            self.assertEqual(rows[1]["extra"], "NA")
+            self.assertNotIn("extra", rows[1])
+            self.assertEqual(pd.read_csv(shards / "data.csv").columns.tolist(), ["id", "raw_value"])
             fitted = self.predictor()
             with patch.object(base.TabularPredictor, "load", return_value=fitted) as load:
                 scores = predict.execute(REGRESSION_MODEL, shards, model, root / "scores")
             load.assert_called_once_with(str(model.resolve()))
-            final = postprocess.execute(REGRESSION_MODEL, scores, root / "final", model_dir=model)
+            final = postprocess.execute(REGRESSION_MODEL, scores, root / "final", model_dir=model, data_directory=raw.parent, selection_file=root / "prepared/selection/selected_features.csv")
             df = pd.read_csv(final, dtype={"id": str})
             self.assertEqual(df.to_dict("list"),
                              {"id": ["0001", "0002", "0003"], "prediction": [6, 8, 10]})
@@ -115,7 +117,7 @@ class InferenceMetadata(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "multiclass"):
                 predictor.predict_with_best_model(pd.DataFrame({"id": ["0001"], "raw_value": [3]}))
 
-    def test_file_hook_receives_existing_csv_and_temporary_input_is_removed(self):
+    def test_file_hook_receives_prepared_csv_and_publishes_three_outputs(self):
         received = []
         class FilePredictor:
             def __init__(self, checkpoint):
@@ -123,17 +125,22 @@ class InferenceMetadata(unittest.TestCase):
             def predict_file(self, user_data_path):
                 received.append(user_data_path)
                 df = pd.read_csv(user_data_path, dtype={"id": str})
-                return df.assign(score=df["value"] * 2)[["id", "score"]]
+                predictions = df.assign(score=df["value"] * 2)[["id", "score"]]
+                return predictions, df[["id"]], predictions.copy()
         with TemporaryDirectory() as directory:
             root = Path(directory)
             inputs = root / "inputs"
             inputs.mkdir()
-            (inputs / "part.jsonl").write_text('{"id":"0001","value":3}\n')
+            (inputs / "data.csv").write_text("id,value\n0001,3\n")
             output = base.predict_with_model(inputs, root / "model", root / "scores",
                                              predictor_cls=FilePredictor)
-            self.assertEqual(json.loads((output / "part.jsonl.out").read_text()),
-                             {"id": "0001", "score": 6})
-            self.assertFalse(received[0].exists())
+            self.assertEqual(pd.read_csv(output / "predictions.csv", dtype={"id": str}).to_dict("records"),
+                             [{"id": "0001", "score": 6}])
+            self.assertEqual({p.name for p in output.iterdir()},
+                             {"predictions.csv", "messaging.csv", "messaging_final.csv"})
+            self.assertEqual(received, [inputs / "data.csv"])
+            self.assertTrue(received[0].exists())
+
 
 
 if __name__ == "__main__":

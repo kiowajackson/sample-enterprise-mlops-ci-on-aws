@@ -1,4 +1,4 @@
-"""Shard scoring rows; model-specific transformations belong in the predictor."""
+"""Read scoring data, apply the saved feature list, and write prepared shards."""
 
 from pathlib import Path
 
@@ -6,9 +6,15 @@ import pandas as pd
 
 
 def process_inference(data_directory, output_directory, config, *, shard_rows=10000):
-    """Preserve input columns and write bounded scoring shards without fitting transforms."""
+    """Replace the projection with the model's process_inference; never fit a selector."""
     dfs = get_container_input(data_directory, config, shard_rows)
-    return write_container_output(dfs, output_directory)
+    mapping = config["model_metadata"]["feature_mapping"]
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("model_metadata.json needs a nonempty feature_mapping.")
+    columns = list(dict.fromkeys([config["primary_key"], *mapping]))
+    # Customer column normalization belongs here, before selecting columns.
+    prepared = (df[columns] for df in dfs)
+    return write_container_output(prepared, output_directory, mapping)
 
 
 def get_container_input(data_directory, config, shard_rows):
@@ -19,22 +25,28 @@ def get_container_input(data_directory, config, shard_rows):
                      keep_default_na=False, na_values=["", r"\N"],
                      chunksize=shard_rows) as reader:
         for df in reader:
-            if config["primary_key"] not in df:
-                raise ValueError(f"Scoring CSV is missing primary_key {config['primary_key']!r}.")
             yield df
 
 
-def write_container_output(dfs, output_directory):
-    """Save local shards; the loader uploads them for the next pipeline step."""
-    output = Path(output_directory) / "shards"
+def write_container_output(dfs, output_directory, feature_mapping):
+    """Save prepared shards and the exact feature list for downstream analysis."""
+    output = Path(output_directory) / "prepared"
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise ValueError("Use an empty batch shard output directory.")
+    shards = output / "shards"
+    shards.mkdir()
     rows = 0
     for number, df in enumerate(dfs):
-        df.to_json(output / f"part-{number:06d}.jsonl",
+        df.to_csv(output / "data.csv", mode="a", header=rows == 0, index=False)
+        df.to_json(shards / f"part-{number:06d}.jsonl",
                    orient="records", lines=True, double_precision=15)
         rows += len(df)
     if rows == 0:
         raise ValueError("Batch input contains no rows.")
+    selection = Path(output_directory) / "selection"
+    selection.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"features": list(feature_mapping),
+                  "description": list(feature_mapping.values())}).to_csv(
+                      selection / "selected_features.csv", index=False)
     return output, rows

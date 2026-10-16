@@ -1,52 +1,84 @@
-Inference adapter + ready-to-run notebook 02
+Inference stages update — 2026-10-16
+Source checkpoint: 96e7a82158b7c508b7f96b8048b3759e9c407171
+Compared with: f5e3c5074544b360528ef7cb7e77dafe8e6a4bf0
 
-Source: f5e3c5074544b360528ef7cb7e77dafe8e6a4bf0
-Delivery: individual changed files on dev
+30 source/test/documentation files changed; this index is additional.
+All paths below are relative to the repository root, with the same paths on dev.
+No ZIP, populated config, captured notebook output or customer data is included.
 
-FILES TO COPY / PORT INTO YOUR ADAPTED CHECKOUT
-- notebooks/02_deploy_pipelines.ipynb
-- mlops-models/src/mlops_models/entrypoints/preprocess_inference.py
-- mlops-models/src/mlops_models/model_base/inference/preprocess.py
-- mlops-models/src/mlops_models/model_base/inference/predict.py
+What this changes
+- ResolveModel -> GetData -> Preprocess -> Score -> Postprocess.
+- Preprocess applies the saved feature mapping and writes prepared/data.csv plus
+  selection/selected_features.csv. No training target is required for inference.
+- Score writes predictions.csv, messaging.csv and messaging_final.csv.
+- Postprocess gets the original raw snapshot, saved selection, all three prediction
+  files and saved config. It writes prediction_analysis.csv and summary.json.
+- Training and inference data sources can differ. Defaults remain csv_direct for
+  both; later set data_source=feature_store for training and leave
+  inference_data_source=csv_direct in notebook 02.
+- New Registry versions expose ModelMetadataUri and ModelMetadataSha256 for the
+  exact metadata JSON published by Evaluate. The archive retains identical bytes.
+- Existing compatible approved models can run updated Processing inference with
+  model_code_source=pipeline. No training rerun is needed for that test. To expose
+  metadata separately on a new Registry version, run updated Evaluate/RegisterModel.
+- All four inference compute steps are cache eligible with a fixed CSV; resolution
+  stays live. Downstream inputs refer to actual producing jobs, including cache hits.
+- Training and inference modules remain separate. Consolidation is later refactoring.
+- MLflow logging is not implemented; final analysis is currently available in S3.
 
-Notebook 02 defaults to model_code_source="pipeline", batch_runtime="processing",
-cache_steps=True. Keep your notebooks/config.json, restart the notebook kernel,
-and Run All. It publishes the pipelines; then execute inference for the approved
-ModelId with the intended scoring CsvInputUri. It does not start jobs automatically.
-No training rerun is needed for a compatible existing model with saved metadata.
-
-KEEP YOUR WORKING CUSTOM TRAINER. The generic model_base/training/train.py change
-only adds feature_mapping and predictor_path="predictor" to its demo metadata.
-An adapted trainer that saves its feature_mapping and root AML.path checkpoint
-can remain as it is. Metadata already travels inside registered model.tar.gz.
-
-The prediction file hook gets a local CSV, the saved mapping, primary key and
-registered checkpoint. Port the model-specific transformations/loading into the
-ModelPredictor class. Return primary key + numeric score, one row per input.
-Mapping is input-column -> model-column, exact case. Messaging/multiclass output
-needs a model-specific adapter. See README for the full contract.
-
-ALL SOURCE FILES CHANGED SINCE PREVIOUS DEV (11)
-README.md
+REPLACE THESE FRAMEWORK FILES TOGETHER
+mlops-models/src/mlops_models/entrypoints/__main__.py
+mlops-models/src/mlops_models/entrypoints/evaluate.py
+mlops-models/src/mlops_models/entrypoints/get_data.py
+mlops-models/src/mlops_models/entrypoints/postprocess.py
 mlops-models/src/mlops_models/entrypoints/preprocess_inference.py
-mlops-models/src/mlops_models/model_base/inference/predict.py
+mlops-models/src/mlops_models/model_base/inference/definition.json
+mlops-models/src/mlops_models/pipelines/source.py
+mlops-models/src/mlops_models/registry/model_package.py
+mlops-models/src/mlops_models/runtime/job_paths.py
+mlops-models/src/mlops_models/runtime/load_source.py
+
+PORT YOUR MODEL LOGIC INTO THESE INFERENCE ADAPTERS
+Keep the get_container_input -> model code -> write_container_output contract.
+Do not replace working customer algorithms with the example algorithms.
+Update all three together; the output names and signatures have changed.
 mlops-models/src/mlops_models/model_base/inference/preprocess.py
-mlops-models/src/mlops_models/model_base/training/train.py
+mlops-models/src/mlops_models/model_base/inference/predict.py
+mlops-models/src/mlops_models/model_base/inference/postprocess.py
+
+UPDATE EACH MODEL'S SMALL POSTPROCESS WRAPPER
+Copy the same signature/call into your renamed model folders. These examples
+contain no hard-coded model names. Other use-case wrappers did not change.
+mlops-models/src/mlops_models/models/usecase1/inference/postprocess.py
+mlops-models/src/mlops_models/models/usecase2/inference/postprocess.py
+
+NOTEBOOKS AND DOCUMENTATION
+Keep your existing notebooks/config.json; it is unchanged and not included here.
+Run All in notebook 02 after porting. Notebook 01 only needs rerunning for a new
+sample or ingestion; its update retains the CSV path in Feature Store mode too.
+notebooks/01_prepare_data.ipynb
 notebooks/02_deploy_pipelines.ipynb
+README.md
+
+TEST FILES (NOT REQUIRED TO EXECUTE NOTEBOOK 02)
 tests/test_feature_store_pipeline.py
 tests/test_inference_metadata.py
+tests/test_inference_stages.py
 tests/test_metadata_features.py
+tests/test_model_handoff.py
+tests/test_notebook_config.py
+tests/test_pipeline_cache.py
 tests/test_review_hardening.py
+tests/test_saved_training_metrics.py
+tests/test_source_deployment.py
 tests/test_step_io.py
+tests/test_training_files.py
 
-All files above are individually available on dev. CHANGED_FILES.txt is updated.
-The new ZIP/checksum are excluded from the current dev tree at the user's request.
-Existing files, blank config files and older artifacts are preserved.
-Keep adapted customer code when applying this update.
+Validation: 138 source tests; 26 simulated-AWS notebook scenarios; definition
+checks; four real local AutoGluon prediction flows (regression/classification,
+both archive layouts). 37 IDs/scores checked per flow, three prediction files and
+final analysis produced, model files unchanged. S3/Registry calls were simulated.
+Customer model code, target IAM and the receiving container still need acceptance.
+Native Transform uses a separate HTTP adapter; this handoff tests Processing first.
 
-VERIFICATION
-The inference runtime passed 132 source tests and four real local prediction flows
-(regression/classification, nested/root checkpoints; 37 rows per flow). Scores/IDs
-matched direct prediction. This notebook passed 25 simulated-AWS scenarios,
-including full Run All and verified published definitions with pipeline-code mode
-and all three inference compute caches. No new managed AWS jobs ran.
+The training implementation, model parameters and config.example.json did not change.

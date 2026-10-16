@@ -11,7 +11,7 @@ an existing container. Customer algorithms replace the model code while keeping
 the input/output contract. Platform provisioning and production release integration
 are separate workstreams.
 
-**Status: October 15, 2026.** The supported default path is
+**Status: October 16, 2026.** The supported default path is
 `csv_direct` → training → Model Registry → approved-model Processing batch inference.
 Implemented options, validation boundaries and planned work are distinguished below.
 This README describes the source in this delivery; a previous model archive may
@@ -19,47 +19,54 @@ contain an older copy of that source.
 
 ## Running prediction from a registered model
 
-The model archive already contains `model_metadata.json`. Registry records the
-archive's S3 URI; ResolveModel selects a Completed, Approved version, and the
-loader extracts that exact archive for Preprocess, Score and Postprocess. There
-is no separate metadata upload or lookup. Keep `parameters.json` for settings
-such as primary key and task, and `model_metadata.json` for learned information.
+Inference now runs **ResolveModel → GetData → Preprocess → Score → Postprocess**.
+Each step receives local paths to the exact upstream artifacts, including cached
+artifacts. Entry points load the saved configuration and call model code; column
+normalization, fitted transformations and prediction analysis belong in that code.
 
 For a model whose training already works:
 
-1. Replace `mlops-models/src/mlops_models/entrypoints/preprocess_inference.py` and
-   `mlops-models/src/mlops_models/model_base/inference/preprocess.py`. The default
-   CSV preprocessing preserves all columns and identifiers, and writes bounded
-   JSON-lines shards. It requires no target or demo `features` setting. It does
-   not fit encoders/scalers. Feature Store mode queries the saved feature mapping.
-2. Adapt `mlops-models/src/mlops_models/model_base/inference/predict.py`. Its
-   `predict_with_model` function reads each shard, provides a temporary local CSV
-   to `ModelPredictor.predict_file(user_data_path)`, then saves the returned
-   dataframe through `write_container_output`. The CSV exists for the duration
-   of that synchronous call and is removed afterwards.
-3. Put the model's prediction code inside `ModelPredictor`. The file hook has
-   `user_data_path`, `self.feature_mapping`, `self.primary_key` and
-   `self.checkpoint_path` available. Replace initialization and prediction together
-   if your model loads differently. Use the extracted registered checkpoint;
-   do not search local timestamp folders for a newer model.
-4. Return one row per input with the original primary-key column and numeric
-   `score`. For regression this is the prediction in the intended output scale;
-   for binary classification it is the positive-class probability. The existing
-   Postprocess writes `predictions.csv` and the row-count summary. Additional
-   outputs such as messaging.csv require a model-specific output/postprocess
-   adapter; the generic formatter does not create them.
-5. Notebook 02 now defaults to `model_code_source="pipeline"`,
-   `batch_runtime="processing"` and `cache_steps=True`. Run All to publish
-   the updated source, then start **inference only** for the approved ModelId and
-   intended `CsvInputUri`. This permits new prediction code with an existing
-   compatible model archive. The optional `artifact` mode uses code saved when
-   that model was trained, so an uploaded code edit alone does not replace it.
-6. Check ResolveModel's version/artifact, then Score and the final prediction
-   file. Check row count, identifiers, score meaning and a small comparison with
-   the model owner's original prediction. A successful model lookup or
-   preprocessing job alone does not establish prediction compatibility.
+1. Keep the adapted trainer and model parameters. Update the pipeline definition,
+   builder, dispatcher, runtime paths and inference entrypoints together. Run All
+   in notebook 02 to publish the new graph and source.
+2. Adapt `model_base/inference/preprocess.py`. `process_inference` receives the
+   raw directory, output directory and saved configuration. The example reads
+   `raw/data.csv`, keeps the primary key and columns in the saved feature mapping,
+   and writes `prepared/data.csv` plus `selection/selected_features.csv`. It does
+   not require a target or rerun feature selection. Apply the same column naming
+   and fitted transformations as training wherever the customer code requires them.
+3. Adapt `model_base/inference/predict.py`. Its file hook
+   `ModelPredictor.predict_file(user_data_path)` receives the prepared CSV path;
+   `self.feature_mapping`, `self.primary_key` and `self.checkpoint_path` are loaded
+   from the registered model. Return three dataframes: predictions, messaging and
+   their merged result. The writer preserves their columns as `predictions.csv`,
+   `messaging.csv` and `messaging_final.csv`. The demo supplies scores and IDs only;
+   customer prediction code supplies the actual explanatory variables and values.
+4. Adapt `model_base/inference/postprocess.py` and update the small postprocess
+   adapter in each model folder. The analysis receives the original raw CSV path,
+   the saved selected-feature dataframe, all three prediction dataframes and saved
+   configuration. Return the final analysis/leads dataframe. Its writer saves
+   `prediction_analysis.csv` and `summary.json`. Additional customer columns remain
+   intact; the generic formatter normalizes a `score` column when needed.
+5. Notebook 02 defaults to `model_code_source="pipeline"`,
+   `batch_runtime="processing"` and `cache_steps=True`. With an existing compatible
+   Approved model, start **inference only**, selecting ModelId and the scoring
+   CsvInputUri. No retraining is required to test these inference code changes.
+   Check the resolved model version, final row identifiers and scores against the
+   model owner's original prediction before calling the port accepted.
 
-The supplied AutoGluon implementation expects this learned metadata:
+The archive already holds `parameters.json` and `model_metadata.json`; inference
+reads the files from that exact approved archive. For new registrations, Evaluate
+also publishes an identical `model_metadata.json` beside `evaluation.json`.
+RegisterModel verifies its checksum and records **ModelMetadataUri** and
+**ModelMetadataSha256** in the version's custom metadata. That URI lets an operator
+open the JSON directly in S3 without unpacking the model. Older approved versions
+remain usable from their archive; run the updated Evaluate/RegisterModel path to
+create a new version with the separate metadata reference. Registry stores the
+reference, not the JSON document itself.
+
+The example metadata contains an input-to-model mapping and a relative predictor
+path:
 
 ```json
 {
@@ -68,29 +75,35 @@ The supplied AutoGluon implementation expects this learned metadata:
 }
 ```
 
-The mapping preserves input-to-model column correspondence; identity mappings
-are valid. Names must match exactly, including case. Any normalization, encoding,
-scaling or target reversal must match training and belongs in the model's
-predictor. The adapter checks the mapped names against the loaded predictor.
-It does not guess a mapping from every input column or from demo settings.
-The default model location is the archive root, as when the writer copies
-`AML.path`. The generic trainer explicitly writes `predictor_path="predictor"`
-because its model is in that subdirectory. Paths outside the archive are rejected.
+Names must match exactly, including case. The model location defaults to the
+archive root, as when the writer copies `AML.path`; the generic trainer records
+`predictor_path="predictor"` for its subdirectory. Source-folder metadata never
+substitutes for learned metadata from the approved version. The mapping names
+columns; it does not calculate business features or recreate missing fitted state.
 
-This delivery adds those two metadata fields to the **demo trainer only**.
-Keep an already adapted trainer that saves its own feature_mapping and root
-checkpoint. No training rerun is needed for that compatible archive. Older demo
-archives lacking feature_mapping need one new training run. Source-folder
-metadata is not substituted for metadata belonging to the approved version.
+Keep training and inference modules separate for this delivery. It is acceptable
+to copy an existing combined module while porting its two functions independently.
+After both paths pass, a later refactor can share a preprocessing implementation
+or a model-selection module behind the existing entrypoints. Training retains the
+target; inference uses saved selected features without requiring a target, so
+identical behavior must be verified before consolidating.
 
-Processing uses the file hook. The optional Batch Transform HTTP adapter uses
-`predict_with_best_model(df)`; replacing only the file hook does not implement
-that HTTP prediction path. This handoff targets Processing first.
+Processing uses a whole-file model hook and loads prediction outputs into memory
+for analysis. Size the job for that workload or implement bounded processing in
+customer code. Optional Batch Transform uses JSON-lines shards and the HTTP
+`predict_with_best_model(df)` adapter; replacing the Processing file hook does not
+implement that HTTP path or its messaging output. Container acceptance for native
+Transform remains separate.
+
+The final analysis file is currently published to S3. **MLflow artifact/run
+logging is planned, not implemented**. Future tracking should retain the model
+version, input snapshot and final output URI, with direct artifact upload subject
+to the agreed data-access and size policy.
 
 ## Updating a trainer that already contains your model code
 
 This version changes the training/evaluation handoff. Keep your adapted training
-implementation; do not replace it with the demo trainer from the ZIP.
+implementation; do not replace it with the demo trainer from a source update.
 
 1. In your `ModelTrainer.evaluate_model`, keep the existing validation-probability
    return and also return the `performance` dictionary from `AML.evaluate(...)`.
@@ -210,7 +223,8 @@ feature mapping. Notebook 02 does not consume the original metadata file.
 | csv_direct | Generate local sample.csv and mappings | csv_input = generated sample.csv; Feature Store URI empty | Notebook 02 uploads the sample, SageMaker mounts it, and GetData copies it unchanged to raw/data.csv |
 | feature_store | Generate sample and mappings, then ingest into the store | feature_store_config_uri = saved binding URI; csv_input empty | Query the existing store and write raw/data.csv |
 
-Select the route explicitly through data_source in each notebook's Defaults cell.
+Notebook 01 uses data_source for preparation. Notebook 02 uses data_source for
+training and inference_data_source for inference, independently.
 CSV mode does not need a Feature Store mapping or ingestion permissions. Both routes produce the flat-file handoff
 consumed by FeatureSelection; they do not necessarily select identical columns.
 The current Feature Store query selects configured model features; CSV-direct
@@ -231,15 +245,17 @@ role_arn. CSV generation alone needs only metadata_csv. Relative metadata_csv an
 csv_input paths resolve from the checkout root.
 
 After successful preparation, notebook 01 updates only `csv_input` and
-`feature_store_config_uri`, clearing the unused one. It saves the generated CSV
-path relative to the checkout root, or the exact published Feature Store URI.
+`feature_store_config_uri`. It always retains the generated CSV path relative to
+the checkout root. Feature Store mode also saves the published configuration URI;
+CSV mode clears that URI. This supports training from the store and inference
+from the generated CSV, without changing the shared config between notebooks.
 Other settings and additional keys are preserved. Failed preparation leaves the
 previous saved handoff unchanged. Notebook 02 reads the file again when started.
 
 The config contains only those five supplied values plus the two automatic data
 handoff fields. Mode, namespace, environment, caching, HPO, sample and job options
-are declared in each notebook's **Defaults** cell. Keep data_source and namespace
-consistent across the two notebooks. If updating an older expanded config, move
+are declared in each notebook's **Defaults** cell. Keep namespace consistent;
+select each pipeline's data source independently in notebook 02. If updating an older expanded config, move
 any non-default optional values into those cells; old optional config keys are
 not read. A malformed config fails instead of being overwritten. Targets and
 model settings remain in each use case's parameters.json.
@@ -290,8 +306,9 @@ and inference lookup. Change the prefix in config.json and environment in notebo
 02's Defaults cell; republish to use another environment's existing groups.
 Empty prefix keeps `usecase1-sm-dev`.
 
-For CSV mode, supply `csv_input` as a local file or exact S3 CSV URI and leave
-`feature_store_config_uri` empty. Local relative paths resolve against this
+For either pipeline using CSV mode, supply `csv_input` as a local file or exact
+S3 CSV URI. Also retain `feature_store_config_uri` when the other pipeline uses
+Feature Store. Local relative paths resolve against this
 checkout's root, even when it is a renamed subfolder inside another repository.
 Use a fresh kernel for the new checkout; the notebooks stop if cached imports
 point at another checkout. Keep the old notebooks on their own kernels.
@@ -305,7 +322,8 @@ renaming columns. Model-specific target handling belongs in the model code.
 These options are declared in notebook 02's **Defaults** cell:
 
 ```python
-data_source = "csv_direct"
+data_source = "csv_direct"             # Training; later switch to feature_store
+inference_data_source = "csv_direct"   # Scoring snapshot
 environment = "dev"
 batch_runtime = "processing"
 model_code_source = "pipeline"
@@ -342,9 +360,10 @@ defaults. It prints pipeline names/versions, source/data locations and a local
    **CsvInputUri** to the scoring CSV. ResolveModel selects the highest numeric
    Completed, Approved version and records its package ARN, image and artifact URI
    in `package.json`. Scoring data needs input columns and identifiers, not a target.
-4. Inspect `predictions/predictions.csv` under the inference execution's S3
-   directory. Regression produces identifier/prediction; binary classification
-   adds probability and applies the saved threshold.
+4. Inspect the actual Postprocess output URI for `prediction_analysis.csv` and
+   `summary.json`. Score publishes all three intermediate prediction CSVs. The
+   demo final analysis has identifier/prediction; binary classification also has
+   probability. Customer analysis can add the final lead fields.
 
 Studio execution overrides can select a different CSV from the publication
 default. Check the execution's effective parameters when diagnosing input data.
@@ -410,9 +429,11 @@ CSV or Feature Store
 Approve a Registry version
   -> ResolveModel -> exact approved image + model archive
   + scoring CSV or Feature Store
-  -> inference Preprocess -> JSON-lines shards
-  -> Score -> score files
-  -> Postprocess -> predictions.csv + summary.json
+  -> inference GetData -> raw CSV
+  -> Preprocess(raw CSV, saved metadata) -> prepared CSV + saved feature list
+  -> Score -> predictions.csv + messaging.csv + messaging_final.csv
+  -> Postprocess(raw CSV, saved features, prediction files)
+     -> prediction_analysis.csv + summary.json
 ```
 
 Each step consumes a completed artifact from the previous producer. Feature
@@ -426,13 +447,14 @@ the container. The model functions read those local inputs.
 | `run_feature_selection` | Raw CSV directory and settings | `selection/selected_features.csv`, `selection/random_forest_plots.pdf` |
 | `process_train` | Raw directory, selected-feature file and settings | `prepared/` containing one or more CSVs; demo writes `data.csv` |
 | `train_model` | Prepared directory, selected-feature file, package/work paths and settings | Saved model directory with metadata, evaluation.json and runtime code |
-| Evaluation hook | Saved artifact containing evaluation.json; current use-case quality thresholds | Published evaluation.json with metrics, provenance and quality decision |
-| `process_inference` | Scoring snapshot and saved model settings | All input columns in `shards/part-*.jsonl` |
-| `predict_with_model` | Shards, extracted checkpoint and writable output | Identified score records in `*.out` files |
-| `postprocess_predictions` | Score records and saved settings | `predictions.csv`, `summary.json`, effective `parameters.json` |
+| Evaluation hook | Saved artifact containing evaluation.json and model_metadata.json; current quality thresholds | Published evaluation.json and an exact copy of model_metadata.json |
+| `process_inference` | Raw CSV directory and saved parameters/metadata | `prepared/data.csv`, `selection/selected_features.csv`; optional Transform shards under `prepared/shards/` |
+| `predict_with_model` | Prepared directory, extracted checkpoint and writable output | `predictions.csv`, `messaging.csv`, `messaging_final.csv` |
+| `postprocess_predictions` | Raw directory, selected-feature file, prediction directory and saved settings | `prediction_analysis.csv`, `summary.json`, effective `parameters.json` |
 
-The demo selection CSV has a **`feature`** column. If customer code exports
-`features` or another heading, update both its producer and all consumers.
+Training's demo selection CSV has a **`feature`** column. Inference reconstructs
+its selection from saved feature_mapping and writes **`features,description`**.
+If customer code changes either schema, update its producer and consumers together.
 Identifiers are read as strings to preserve leading zeroes. Feature names,
 case, target, timestamp and expected types must match the model implementation.
 
@@ -440,7 +462,11 @@ CSV GetData copies every column and the input bytes unchanged; selection belongs
 to the next step. The current Feature Store reader instead requests the fields
 listed in the model's `features` settings, joins groups by identifier/event time,
 and writes the resulting flat snapshot. Configure the complete candidate feature
-set before expecting feature selection to consider it.
+set before expecting feature selection to consider it. Inference Feature Store
+reads use the approved model's feature mapping and do not request the target.
+The normal scoring route is CSV: upstream data preparation computes business
+features before delivering the scoring file. Passing through Feature Store is
+optional for that file; it is not an extra feature-computation stage.
 
 Feature Store reads use this application's configuration and completed-delivery
 receipt contract, not just a group name. Empty **FeatureStoreDeliveryId** selects
@@ -506,9 +532,10 @@ configuration. It does not create resources or grant itself permissions.
 
 | Job input | Default local location |
 |---|---|
-| CSV input for GetData / inference preprocessing | `/opt/ml/processing/input/` |
-| Raw input for selection / training preprocessing | `/opt/ml/processing/raw/data.csv` |
-| Selected features for training preprocessing | `/opt/ml/processing/selection/selected_features.csv` |
+| CSV input for training or inference GetData | `/opt/ml/processing/input/` |
+| Raw input for selection / preprocessing / inference analysis | `/opt/ml/processing/raw/data.csv` |
+| Selected features for training preprocessing / inference analysis | `/opt/ml/processing/selection/selected_features.csv` |
+| Prepared inference CSV | `/opt/ml/processing/prepared/data.csv` |
 | Prepared training files | `/opt/ml/input/data/prepared/` |
 | Selected features for Train | `/opt/ml/input/data/selection/selected_features.csv` |
 | Source for Processing / Train | `/opt/ml/processing/source/` / `/opt/ml/input/data/source/` |
@@ -546,10 +573,14 @@ s3://<bucket>/<namespace>/models/<ModelId>/runs/<execution-id>/
   model/application/model.tar.gz
   reports/training/output.tar.gz
   reports/evaluation/evaluation.json
+  reports/evaluation/model_metadata.json
 ```
 
-Inference uses its own execution directory, including its raw snapshot, shards,
-scores and `predictions/predictions.csv`. Only the relevant step artifacts appear
+Inference uses its own execution directory: raw snapshot under `data/raw/`,
+prepared CSV and optional shards under `data/modeling/`, saved feature list under
+`data/selection/`, the three scoring CSVs under `predictions/raw/`, and final analysis under
+`predictions/prediction_analysis.csv`. Cache hits retain the original producer
+locations rather than copying artifacts to the current run. Only the relevant step artifacts appear
 in each run. The model archive contains the demo's `predictor/`, effective
 `parameters.json`, `model_metadata.json`, `selected_features.csv`, `evaluation.json`
 and retained runtime source under `code/`. Evaluation rows are not packaged.
@@ -570,7 +601,8 @@ for task and quality thresholds. The inherited base evaluator reads exactly
 `model/evaluation.json`, verifies model/task identity and publishes those saved
 scores. It does not load a predictor, read a dataset or require parameters inside
 the archive. The entrypoint adds checkpoint/source provenance and the quality
-decision. Registration attaches the uploaded report to the same model artifact.
+decision, publishes the archive's exact metadata JSON and records its checksum.
+Registration attaches the report and the metadata reference to the same model version.
 
 Model parameters and learned metadata are still retained for inference; they
 are not substitutes for the evaluation report. Metrics must describe the exact
@@ -623,6 +655,8 @@ has an explicit `model_code_source` choice in notebook 02's Defaults cell:
   the Registry-selected saved model. This supports debugging Processing steps
   independently; Registry approval is still required.
 
+Artifact mode requires bundled source compatible with the published stage
+interfaces; retrain to refresh that source when changing those interfaces.
 Neither choice modifies the checkpoint or its learned settings. Compatible model
 code and fitted preprocessing state remain the model owner's responsibility.
 Evaluation records the model's saved source commit separately from the evaluation
@@ -636,7 +670,7 @@ Notebook 02 defaults to `cache_steps=True`. It sets
 | Pipeline | Cached steps |
 | --- | --- |
 | Training with a fixed CSV | GetData, FeatureSelection, Preprocess, Train, Evaluate |
-| Processing batch inference with a fixed CSV | Preprocess, Score, Postprocess |
+| Processing batch inference with a fixed CSV | GetData, Preprocess, Score, Postprocess |
 
 Start another execution normally. Each matching **successful step** can reuse
 its output within 24 hours in the same pipeline, even if a later step failed.
@@ -651,8 +685,8 @@ Each step has its own source fingerprint. With the same inputs/model/image:
 | Training preprocessing | Reuse GetData/FeatureSelection; run Preprocess and downstream |
 | Training implementation | Reuse preparation; run Train and Evaluate |
 | Evaluation only | Reuse preparation and Train; run Evaluate |
-| Batch prediction in pipeline-code mode | Reuse inference Preprocess; run Score and Postprocess |
-| Batch postprocessing in pipeline-code mode | Reuse inference Preprocess and Score; run Postprocess |
+| Batch prediction in pipeline-code mode | Reuse inference GetData/Preprocess; run Score and Postprocess |
+| Batch postprocessing in pipeline-code mode | Reuse inference GetData/Preprocess/Score; run Postprocess |
 | CSV contents, model artifact or earlier step output | Rerun its consumers and downstream steps |
 
 Rerun notebook 02 after source/input edits to upload and republish, then start the
@@ -813,7 +847,18 @@ needed by their selected mode. Platform owners bind exact resources and roles.
 
 ## Validation
 
-The inference metadata/file-handoff update passed **132 source tests** and real
+The explicit inference-stage update passed **138 source tests**, **26 simulated-AWS
+notebook scenarios**, and definition checks. Coverage includes the
+separate data-source settings, cached producer references, all three prediction
+outputs, rich customer columns, and metadata checksum verification before Registry
+registration. Real local AutoGluon regression and binary classification each
+completed GetData → Preprocess → Score → Postprocess using both archive layouts.
+All 37 row identifiers matched and scores matched direct prediction within CSV
+floating-point precision; the registered model files were unchanged. AWS uploads
+and Registry calls were simulated. This does not establish customer container or
+customer analysis acceptance.
+
+The earlier inference metadata/file-handoff update passed **132 source tests** and real
 local AutoGluon regression and binary-classification checks. Each task was scored
 from both a nested demo checkpoint and an archive-root checkpoint with no demo
 features setting. All 37 scoring rows retained their identifiers and matched
@@ -931,7 +976,7 @@ receiving team; the sequence below is not a delivery-date commitment.
 | Workshop | Demonstrate supported modes, collect usability/model feedback and agree remaining acceptance | Decide provisioning, build/release, promotion, manual steps and operating ownership |
 | Handoff | Close agreed tests, publish operating guidance and demonstrate use by another engineer | Prove the agreed monitoring/release/recovery scope and record remaining gates |
 
-The first functional extension is the metadata handoff. Likely edits are
+A remaining functional extension is prior-run metadata input for final training. Likely edits are
 `pipelines/source.py` and `training_files.py` for execution inputs,
 `entrypoints/train.py` for thin dispatch, and the model training adapter for
 initial/final behavior. Notebook settings, tests and this README must follow the

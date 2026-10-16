@@ -2,42 +2,35 @@
 
 import json
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import pandas as pd
 from autogluon.tabular import TabularPredictor
 
 
 def predict_with_model(input_directory, checkpoint_path, output_directory, *, predictor_cls):
-    """Read each mounted shard, score it with one loaded model, and write its scores."""
-    paths = sorted(Path(input_directory).rglob("*.jsonl"))
-    if not paths:
-        raise FileNotFoundError(f"No scoring shards in {input_directory}.")
+    """Pass the prepared CSV to the model and publish its three prediction files."""
+    user_data_path = get_container_input(input_directory)
     predictor = predictor_cls(checkpoint_path)
-    with TemporaryDirectory(prefix="prediction-input-") as temporary:
-        user_data_path = Path(temporary) / "data.csv"
-        for path in paths:
-            df = get_container_input(path)
-            df.to_csv(user_data_path, index=False)
-            result = predictor.predict_file(user_data_path)
-            if len(result) != len(df):
-                raise ValueError(f"Prediction returned {len(result)} rows for {len(df)} input rows.")
-            write_container_output(result, Path(output_directory) / (path.name + ".out"))
-    return Path(output_directory)
+    predictions, messaging, messaging_final = predictor.predict_file(user_data_path)
+    return write_container_output(predictions, messaging, messaging_final, output_directory)
 
 
-def get_container_input(path):
-    """Read one JSON-lines shard that SageMaker downloaded into the container."""
-    with Path(path).open() as stream:
-        return pd.DataFrame([json.loads(line) for line in stream if line.strip()])
-
-
-def write_container_output(result, path):
-    """Save raw scores locally; load_source.py uploads the output directory to S3."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    result.to_json(path, orient="records", lines=True, double_precision=15)
+def get_container_input(input_directory):
+    """Return the one prepared CSV path supplied by Preprocess."""
+    path = Path(input_directory) / "data.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"Score needs Preprocess's prepared CSV: {path}")
     return path
+
+
+def write_container_output(predictions, messaging, messaging_final, output_directory):
+    """Preserve customer dataframe columns in three files for Postprocess."""
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    for name, frame in (("predictions.csv", predictions), ("messaging.csv", messaging),
+                        ("messaging_final.csv", messaging_final)):
+        frame.to_csv(output / name, index=False)
+    return output
 
 
 class ModelPredictor:
@@ -70,16 +63,19 @@ class ModelPredictor:
                           "features": len(self.feature_mapping), "primary_key": self.primary_key,
                           "task": self.config["task_type"]}), flush=True)
 
-    def predict_file(self, user_data_path) -> pd.DataFrame:
+    def predict_file(self, user_data_path):
         """File-based integration point for a Processing prediction job.
 
         Replace this body with the model's code using user_data_path,
         self.feature_mapping, self.primary_key and self.checkpoint_path.
-        Return a dataframe with the original primary key and a numeric score.
+        Return predictions, messaging and their merged result as three dataframes.
+        The demo has no explanation algorithm; its messaging contains identifiers only.
         """
         df = pd.read_csv(user_data_path, dtype={self.primary_key: str},
                          keep_default_na=False, na_values=["", r"\N"])
-        return self.predict_with_best_model(df)
+        predictions = self.predict_with_best_model(df)
+        messaging = df[[self.primary_key]].copy()
+        return predictions, messaging, predictions.copy()
 
     def predict_with_best_model(self, df, *, output_dir=None) -> pd.DataFrame:
         """Return one dataframe containing the original identifiers and model scores."""

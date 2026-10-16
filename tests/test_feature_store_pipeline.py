@@ -108,7 +108,7 @@ class FeatureStorePipeline(unittest.TestCase):
                     self.assertEqual(list(df), ["record_key", "AsOf", *selected, "Target"])
                     self.assertEqual(len(df), 30)
 
-    def test_csv_direct_inference_preserves_columns_without_config_features_or_label(self):
+    def test_inference_get_data_preserves_raw_then_preprocess_applies_saved_features(self):
         with TemporaryDirectory() as directory, patch.dict(os.environ, {
             "MLOPS_DATA_SOURCE": "csv_direct",
             "MLOPS_FEATURE_STORE_CONFIG_URI": "s3://ignored/stale-config.json",
@@ -121,10 +121,11 @@ class FeatureStorePipeline(unittest.TestCase):
             (model / "parameters.json").write_text(json.dumps({
                 "primary_key": "id"}))
             (model / "model_metadata.json").write_text(json.dumps({"feature_mapping": {"value": "value"}}))
-            shards = preprocess_inference.execute(FIRST, inputs, root / "output", model_dir=model)
-            self.assertEqual(json.loads((shards / "part-000000.jsonl").read_text()), {"id": "0001", "value": 2, "unused": "ignored"})
-            self.assertEqual((root / "output/raw/data.csv").read_bytes(), (inputs / "sample.csv").read_bytes())
-            self.assertEqual(json.loads((root / "output/raw/provenance.json").read_text())["data_source"], "csv_direct")
+            raw = get_data.execute(FIRST, inputs, root / "get-data", model_dir=model)
+            shards = preprocess_inference.execute(FIRST, raw.parent, root / "output", model_dir=model)
+            self.assertEqual(json.loads((shards / "shards/part-000000.jsonl").read_text()), {"id": "0001", "value": 2})
+            self.assertEqual((root / "get-data/raw/data.csv").read_bytes(), (inputs / "sample.csv").read_bytes())
+            self.assertEqual(json.loads((root / "get-data/raw/provenance.json").read_text())["data_source"], "csv_direct")
 
     def test_csv_direct_changes_only_the_data_readers_and_preserves_all_handoffs(self):
         args = ("review", "arn:aws:iam::123456789012:role/jobs", "image:tag",
@@ -135,7 +136,7 @@ class FeatureStorePipeline(unittest.TestCase):
         direct = build_definitions(*args, region="us-east-1", batch_runtime="processing",
                                    data_source="csv_direct", csv_input_uri="s3://data/sample.csv")
         for kind, body in direct.items():
-            reader = "GetData" if kind == "training" else "Preprocess"
+            reader = "GetData"
             expected_steps = {step["Name"]: step for step in store[kind]["Steps"]}
             parameters = {p["Name"]: p for p in body["Parameters"]}
             self.assertEqual(parameters["CsvInputUri"]["DefaultValue"], "s3://data/sample.csv")
@@ -161,7 +162,7 @@ class FeatureStorePipeline(unittest.TestCase):
                               csv_input_uri="s3://data/sample.csv", universe_data_root="s3://data/universe")
 
     def test_runtime_reads_each_group_once_without_ingestion_readiness_polling(self):
-        for module in (get_data, preprocess_inference):
+        for module in (get_data,):
             with self.subTest(module=module.__name__):
                 session = Mock()
                 session.client.return_value.get_object.return_value = {
@@ -212,7 +213,7 @@ class FeatureStorePipeline(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "delivery ID"):
             resolve_delivery(s3, settings, "../other")
 
-    def test_only_get_data_and_inference_preprocess_query_feature_store(self):
+    def test_only_get_data_in_each_pipeline_queries_feature_store(self):
         for runtime in ("processing", "transform"):
             with self.subTest(runtime=runtime):
                 definitions = build_definitions(
@@ -237,7 +238,7 @@ class FeatureStorePipeline(unittest.TestCase):
                             self.assertIn("/opt/ml/processing/source", paths)
                             raw = next(o for o in args["ProcessingOutputConfig"]["Outputs"] if o["OutputName"] == "raw")
                             self.assertEqual(args["Environment"]["MLOPS_FEATURE_STORE_SNAPSHOT_URI"], raw["S3Output"]["S3Uri"])
-                    self.assertEqual(readers, ["GetData"] if kind == "training" else ["Preprocess"])
+                    self.assertEqual(readers, ["GetData"])
 
 
 if __name__ == "__main__":
