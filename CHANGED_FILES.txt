@@ -1,9 +1,19 @@
-Current dev copy-over set — wrapper fix and inference input trace
+Current dev copy-over set — SHAP diagnostic, wrappers and inference input trace
 
-This is a nine-file overlay for an existing application, not a full checkout.
+This is a ten-file overlay for an existing application, not a full checkout.
 The six runtime files are unchanged from dev 0252c40.
 
-NEW IN THIS UPDATE
+LATEST UPDATE — ONLY THESE TWO FILES CHANGED
+mlops-models/scratch/shap_xgboost_check.py
+CHANGED_FILES.txt
+
+Paste the SHAP diagnostic immediately before your existing
+shap.TreeExplainer(trained_model, ...) call. It uses the Booster already held in
+trained_model and prints versions plus selected model configuration fields.
+It is not a standalone cell without that variable. It does not modify the model
+or dependencies. Rerun the failing prediction code to capture these diagnostics.
+
+PREVIOUS UPDATE — STILL INCLUDED
 mlops-models/scratch/trace_inference_inputs.py
 README.md
 CHANGED_FILES.txt
@@ -38,4 +48,5 @@ No rebuild is needed to run the diagnostic against existing job inputs.
 
 The earlier complete copy set remains in Git history at 8446108.
 No ZIPs, notebooks, tests, populated configs or captured outputs are included.
-This update passed 15 focused local checks with simulated AWS.
+The previous input-trace update passed 15 focused checks with simulated AWS.
+The new SHAP diagnostic was syntax-checked; the target environment is not yet verified.
