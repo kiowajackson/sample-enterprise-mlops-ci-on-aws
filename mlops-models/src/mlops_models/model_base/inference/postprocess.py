@@ -17,17 +17,24 @@ def postprocess_predictions(data_directory, selection_file, prediction_directory
 
 
 def get_container_input(data_directory, selection_file, prediction_directory, config, *, prediction_format="csv"):
-    """Return the raw CSV path, selected-feature dataframe and named prediction dataframes."""
+    """Read every prediction CSV, keyed by its path relative to the prediction root."""
     data_path = Path(data_directory) / "data.csv"
     if not data_path.is_file():
         raise FileNotFoundError(f"Postprocess needs the original GetData snapshot: {data_path}")
     selected = pd.read_csv(selection_file, keep_default_na=False)
     source = Path(prediction_directory)
     if prediction_format == "csv":
-        predictions = {
-            name: pd.read_csv(source / name, dtype={config["primary_key"]: str},
-                              keep_default_na=False, na_values=["", r"\N"])
-            for name in ("predictions.csv", "messaging.csv", "messaging_final.csv")}
+        files = sorted(path for path in source.rglob("*")
+                       if path.is_file() and path.suffix.lower() == ".csv")
+        if not files:
+            raise FileNotFoundError(f"Postprocess found no prediction CSV files under: {source}")
+        predictions = {}
+        for path in files:
+            name = path.relative_to(source).as_posix()
+            print(json.dumps({"event": "prediction_input_csv", "path": str(path),
+                              "relative_path": name}), flush=True)
+            predictions[name] = pd.read_csv(path, dtype={config["primary_key"]: str},
+                                           keep_default_na=False, na_values=["", r"\N"])
     elif prediction_format == "jsonlines":
         # Native Transform returns line outputs, not the Processing model's three CSVs.
         frames = list(read_predictions(source, 10000))
@@ -67,7 +74,13 @@ def write_container_output(result, output, config):
 
 def postprocess(data_path, selected_features, predictions, config) -> pd.DataFrame:
     """Replace with customer analysis using the raw CSV, selection and prediction files."""
-    df = predictions["messaging_final.csv"].copy()
+    # Only this example analysis chooses a particular input; the reader accepts all CSVs.
+    matches = [name for name in predictions if Path(name).name.lower() == "messaging_final.csv"]
+    if len(matches) != 1:
+        raise ValueError("Example analysis needs exactly one messaging_final.csv at any depth; "
+                         f"found {len(matches)}. Available CSVs: {list(predictions)}. "
+                         "Adapt postprocess() to select the files required by your analysis.")
+    df = predictions[matches[0]].copy()
     if "prediction" not in df:
         if config["task_type"] == "classification":
             df["probability"] = df["score"]

@@ -262,6 +262,25 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                       model_package_group="", environment="dev", registry_group_prefix="",
                       include_hpo=False, step_cache_revisions=None, model_code_source="artifact"):
     """Render training registration and inference from an approved Registry version."""
+    if batch_runtime == "both":
+        settings = dict(
+            region=region, models=models, infrastructure=infrastructure,
+            feature_store_config_uri=feature_store_config_uri, universe_data_root=universe_data_root,
+            data_source=data_source, inference_data_source=inference_data_source,
+            csv_input_uri=csv_input_uri, preparation_cache_revision=preparation_cache_revision,
+            model_package_group=model_package_group, environment=environment,
+            registry_group_prefix=registry_group_prefix, include_hpo=include_hpo,
+            step_cache_revisions=step_cache_revisions,
+        )
+        definitions = build_definitions(
+            namespace, job_role, image, s3_root, source_uri, identity,
+            batch_runtime="processing", model_code_source=model_code_source, **settings)
+        native = build_definitions(
+            namespace, job_role, image, s3_root, source_uri, identity,
+            batch_runtime="transform", model_code_source="artifact", **settings)
+        definitions["inference"] = combine_inference_runtimes(
+            definitions["inference"], native["inference"])
+        return definitions
     data_sources = {"training": data_source, "inference": inference_data_source or data_source}
     if any(value not in {"feature_store", "csv_direct"} for value in data_sources.values()):
         raise ValueError("Choose feature_store or csv_direct for each pipeline data source.")
@@ -294,7 +313,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
     if not models or any(model not in available for model in models):
         raise ValueError("Select model folders containing parameters.json.")
     if batch_runtime not in {"transform", "processing"}:
-        raise ValueError("Choose transform or processing for batch_runtime.")
+        raise ValueError("Choose transform, processing or both for batch_runtime.")
     if model_package_group and len(models) != 1:
         raise ValueError("An explicit registry group requires one selected model.")
     if model_package_group and registry_group_prefix:
@@ -442,6 +461,51 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
     return definitions
 
 
+def combine_inference_runtimes(processing, transform):
+    """Keep one inference pipeline with two exclusive execution-time branches."""
+    body = deepcopy(processing)
+    shared = {"ResolveModel", "GetData"}
+    processing_shared = [s for s in processing["Steps"] if s["Name"] in shared]
+    transform_shared = [s for s in transform["Steps"] if s["Name"] in shared]
+    if processing_shared != transform_shared:
+        raise ValueError("Inference runtimes must share the same Registry resolver and data input.")
+
+    names = {"Preprocess": "PreprocessTransform", "Postprocess": "PostprocessTransform"}
+
+    def rename(value):
+        if isinstance(value, dict):
+            return {key: rename(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [rename(item) for item in value]
+        if isinstance(value, str):
+            if value in names:
+                return names[value]
+            for before, after in names.items():
+                if value.startswith(f"Steps.{before}."):
+                    return f"Steps.{after}." + value[len(f"Steps.{before}."):]
+        return value
+
+    body["Steps"] = deepcopy(processing_shared) + [{
+        "Name": "InferenceMode", "Type": "Condition", "DependsOn": ["GetData"],
+        "Arguments": {
+            "Conditions": [{"Type": "Equals", "LeftValue": {"Get": "Parameters.InferenceRuntime"},
+                            "RightValue": "transform"}],
+            "IfSteps": rename([s for s in transform["Steps"] if s["Name"] not in shared]),
+            "ElseSteps": deepcopy([s for s in processing["Steps"] if s["Name"] not in shared]),
+        },
+    }]
+    existing = {parameter["Name"]: parameter for parameter in body["Parameters"]}
+    for parameter in transform["Parameters"]:
+        if parameter["Name"] not in existing:
+            body["Parameters"].append(deepcopy(parameter))
+        elif parameter != existing[parameter["Name"]]:
+            raise ValueError(f"Inference runtimes disagree on parameter {parameter['Name']}.")
+    body["Parameters"].append({"Name": "InferenceRuntime", "Type": "String",
+                               "DefaultValue": "processing", "EnumValues": ["processing", "transform"]})
+    body["Metadata"].update(BatchRuntime="both", TransformModelCodeSource="artifact")
+    return body
+
+
 def configure_registration(body, source_uri, region):
     """Register through the API without granting native RegisterModel group-creation rights."""
     steps = {step["Name"]: step for step in walk_steps(body["Steps"])}
@@ -561,6 +625,11 @@ def configure_approved_inference(body, group, source_uri, batch_runtime, region)
             args["AppSpecification"]["ImageUri"] = selected("image")
     steps["CreateModel"]["Arguments"]["PrimaryContainer"]["Environment"].update(
         PYTHONPATH="/opt/ml/model/code", PYTHONSAFEPATH="1")
+    if batch_runtime == "transform":
+        body["Parameters"].append({"Name": "TransformOutputFile", "Type": "String",
+                                   "DefaultValue": "messaging_final.csv"})
+        steps["CreateModel"]["Arguments"]["PrimaryContainer"]["Environment"][
+            "MLOPS_TRANSFORM_OUTPUT_FILE"] = {"Get": "Parameters.TransformOutputFile"}
     if batch_runtime == "processing":
         steps["Preprocess"]["Arguments"]["Environment"].pop("MLOPS_PREPARE_TRANSFORM_INPUT", None)
         steps["Postprocess"]["Arguments"]["Environment"]["MLOPS_PREDICTION_FORMAT"] = "csv"

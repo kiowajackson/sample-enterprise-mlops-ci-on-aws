@@ -20,6 +20,7 @@ https://docs.aws.amazon.com/sagemaker/latest/dg/model-train-storage-env-var-summ
 
 import argparse
 from contextlib import nullcontext
+import csv
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,25 @@ import sys
 import tarfile
 import tempfile
 from urllib.parse import urlparse
+
+
+def prepare_inference_inputs(model_dir, output_dir, model_id):
+    """Prepare the saved selection before calling the preprocessing entrypoint."""
+    model_dir = Path(model_dir)
+    parameters = json.loads((model_dir / "parameters.json").read_text())
+    if parameters.get("model_id", model_id) != model_id:
+        raise ValueError(f"Artifact belongs to {parameters['model_id']}, not selected model {model_id}.")
+    metadata = json.loads((model_dir / "model_metadata.json").read_text())
+    mapping = metadata["feature_mapping"]
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("model_metadata.json needs a nonempty feature_mapping.")
+    selection_file = Path(output_dir) / "selection" / "selected_features.csv"
+    selection_file.parent.mkdir(parents=True, exist_ok=True)
+    with selection_file.open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["features", "description"])
+        writer.writerows(mapping.items())
+    return selection_file
 
 
 def upload_processing_outputs(config, output_dir, scratch):
@@ -94,6 +114,7 @@ def main():
     """Load source, dispatch one step, then publish its application-managed outputs."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("step")
+    parser.add_argument("--model", default=os.getenv("MODEL_ID"))
     parser.add_argument("--model-dir")
     parser.add_argument("--output")
     selected, _ = parser.parse_known_args()
@@ -207,6 +228,12 @@ def main():
                 sys.argv.extend(["--output", str(scratch)])
                 print(json.dumps({"event": "processing_output_directory", "step": selected.step,
                                   "configured": str(output_dir), "writable": str(scratch)}), flush=True)
+            if selected.step == "preprocess":
+                from mlops_models.runtime.job_paths import job_paths
+                preparation_output = scratch if output_config is not None else Path(
+                    selected.output or job_paths(selected.step)[1])
+                selection_file = prepare_inference_inputs(checkpoint, preparation_output, selected.model)
+                sys.argv.extend(["--selection", str(selection_file)])
             dispatch_command()
             if managed_training:
                 upload_training_outputs(work)

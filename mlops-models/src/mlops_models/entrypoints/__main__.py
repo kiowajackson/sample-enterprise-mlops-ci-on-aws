@@ -94,7 +94,7 @@ def dispatch_pipeline_step(args):
     # Run the prediction-pipeline operations.
     if args.step == "preprocess":
         from . import preprocess_inference
-        result = preprocess_inference.execute(args.model, args.input, args.output,
+        result = preprocess_inference.execute(args.model, args.input, args.selection, args.output,
                                              model_dir=args.model_dir)
         if os.getenv("MLOPS_PREPARE_TRANSFORM_INPUT") == "1":
             from ..runtime.transform_input import prepare_transform_input

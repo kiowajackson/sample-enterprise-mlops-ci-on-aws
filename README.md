@@ -17,9 +17,27 @@ Implemented options, validation boundaries and planned work are distinguished be
 This README describes the source in this delivery; a previous model archive may
 contain an older copy of that source.
 
+The preprocessing, training and prediction entrypoints follow the same pattern:
+resolve input paths, load metadata as `config`, pass the separate `parameter_path`,
+then call the model code. The main configuration difference is its source:
+
+| Entry point | `config` comes from | Parameters |
+|---|---|---|
+| Training preprocessing and Train | `models/<ModelId>/model_metadata.json` in the supplied source; initially `{}` | Separate `models/<ModelId>/parameters.json` path |
+| Inference preprocessing and Predict | `model_metadata.json` in the extracted Registry-selected model | Separate `models/<ModelId>/parameters.json` path |
+
+ResolveModel selects the approved version; the loader extracts its archive before
+calling an inference entrypoint. The entrypoint reads that local metadata file.
+Neither Train nor Predict nests the metadata inside the parameters dictionary.
+Their model operations differ, but their input/output boundaries stay consistent.
+
 ## Running prediction from a registered model
 
-Inference now runs **ResolveModel → GetData → Preprocess → Score → Postprocess**.
+Notebook 02 publishes one inference pipeline with an **InferenceRuntime** choice.
+The default Processing branch runs **ResolveModel → GetData → Preprocess → Score → Postprocess**.
+The Transform branch runs **ResolveModel → GetData → PreprocessTransform → CreateModel → Transform → PostprocessTransform**.
+ResolveModel and GetData precede the InferenceMode condition; each execution runs
+only its chosen branch.
 Each step receives local paths to the exact upstream artifacts, including cached
 artifacts. Entry points load the saved configuration and call model code; column
 normalization, fitted transformations and prediction analysis belong in that code.
@@ -33,29 +51,41 @@ For a model whose training already works:
    raw directory, selected-feature file, output directory, metadata dictionary
    and parameter-file path, in the same order as `process_train`. The example reads
    `raw/data.csv`, keeps the primary key and columns in the saved feature mapping,
-   and writes `prepared/data.csv`. The entrypoint creates
-   `selection/selected_features.csv` from the registered metadata before calling it.
+    and writes `prepared/data.csv`. The loader creates
+    `selection/selected_features.csv` from the registered metadata before calling
+    the entrypoint. The entrypoint only loads config and passes paths.
    `get_container_input` returns the raw dataframe and selected-feature dataframe.
    The function calls `write_container_output` without returning anything; the
    loader uploads its written files. It does
    not require a target or rerun feature selection. Apply the same column naming
    and fitted transformations as training wherever the customer code requires them.
-3. Adapt `model_base/inference/predict.py`. Its file hook
-   `ModelPredictor.predict_file(user_data_path)` receives the prepared CSV path;
-   `self.feature_mapping`, `self.primary_key` and `self.checkpoint_path` are loaded
-   from the registered model. Return three dataframes: predictions, messaging and
-   their merged result. The writer preserves their columns as `predictions.csv`,
-   `messaging.csv` and `messaging_final.csv`. The demo supplies scores and IDs only;
-   customer prediction code supplies the actual explanatory variables and values.
+3. Adapt `model_base/inference/predict.py`. Its file hook receives
+    `user_test_data_path`, `feature_mapping`, `primary_key`, and the keyword
+    `output_directory`. The mapping comes from registered metadata; the primary key
+    comes from the separate parameters file. `self.checkpoint_path` points to the
+    extracted approved model. Set the model code's output root to
+    `Path(output_directory)` and retain its existing writes, including subfolders.
+    The hook need not return anything. `write_container_output` recursively finds
+    every `.csv` file (case-insensitive), prints each path, and returns the output
+    directory. It fails if no CSV was written and requires no particular filenames.
+    The loader uploads the existing files with their relative paths and bytes
+    intact, including any other artifacts under the declared output directory.
+    The demo supplies scores and IDs only; customer code supplies explanations.
+    The entrypoint, use-case wrapper and base `predict_with_model` all take the
+    same five arguments; Processing prediction does not take `predictor_cls`.
 4. Adapt `model_base/inference/postprocess.py` and update the small postprocess
    adapter in each model folder. The analysis receives the original raw CSV path,
    the saved selected-feature dataframe, all three prediction dataframes and saved
    configuration. Return the final analysis/leads dataframe. Its writer saves
-   `prediction_analysis.csv` and `summary.json`. Additional customer columns remain
-   intact; the generic formatter normalizes a `score` column when needed.
+    `prediction_analysis.csv` and `summary.json`. Additional customer columns remain
+    intact; the generic formatter normalizes a `score` column when needed.
+    The reader discovers all CSVs recursively and keys the dataframes by relative
+    path, preserving subfolders and duplicate basenames. The example analysis uses
+    one `messaging_final.csv` at any depth and reports missing or ambiguous matches.
+    Replace that example's file choice with the inputs required by customer analysis.
 5. Notebook 02 defaults to `model_code_source="pipeline"`,
-   `batch_runtime="processing"` and `cache_steps=True`. With an existing compatible
-   Approved model, start **inference only**, selecting ModelId and the scoring
+   `batch_runtime="both"` and `cache_steps=True`. With an existing compatible
+   Approved model, start **inference only** with InferenceRuntime=processing, selecting ModelId and the scoring
    CsvInputUri. No retraining is required to test these inference code changes.
    Check the resolved model version, final row identifiers and scores against the
    model owner's original prediction before calling the port accepted.
@@ -63,6 +93,7 @@ For a model whose training already works:
 The archive already holds `parameters.json` and `model_metadata.json`; model loading
 uses that exact approved archive. Preprocessing reads its metadata there and receives
 the selected source folder's `parameters.json` path separately, matching training.
+Prediction follows the same metadata/parameter separation.
 With `model_code_source="pipeline"`, keep those source parameters compatible with the
 registered model; with `"artifact"`, they come from the archived source. For new registrations, Evaluate
 also publishes an identical `model_metadata.json` beside `evaluation.json`.
@@ -89,6 +120,30 @@ archive root, as when the writer copies `AML.path`; the generic trainer records
 substitutes for learned metadata from the approved version. The mapping names
 columns; it does not calculate business features or recreate missing fitted state.
 
+In customer `predict_with_model`, replace the local `final_model/` search with the
+supplied checkpoint path. ResolveModel already selected the approved Registry
+version; selecting the newest local folder would introduce another model choice.
+When the training writer receives `AML.path`, it copies that directory's contents
+to the package root. In that layout, `checkpoint_path` itself is loadable.
+If the predictor is nested, save its exact relative path as `predictor_path`.
+
+Inside `predict_with_model`, the replacement for the directory search is:
+
+```python
+from pathlib import Path
+from autogluon.tabular import TabularPredictor
+
+model_root = Path(checkpoint_path).resolve()
+latest_model_directory = (model_root / config.get("predictor_path", ".")).resolve()
+if not latest_model_directory.is_relative_to(model_root):
+    raise ValueError("predictor_path must stay inside the registered model archive.")
+best_model = TabularPredictor.load(str(latest_model_directory))
+```
+
+The saved metadata and predictor directory come from the same registered artifact.
+`predictor_cls` was a Python class extension point; it did not select a Registry
+version or represent the saved model.
+
 Keep training and inference modules separate for this delivery. The generic
 preprocessing modules now have identical bodies except for the function name.
 They retain a target and timestamp when those columns exist; scoring data need
@@ -98,10 +153,56 @@ paths pass. Training itself still requires its configured target.
 
 Processing uses a whole-file model hook and loads prediction outputs into memory
 for analysis. Size the job for that workload or implement bounded processing in
-customer code. Optional Batch Transform uses a separate CSV-to-JSON-lines adapter and the HTTP
-`predict_with_best_model(df)` adapter; replacing the Processing file hook does not
-implement that HTTP path or its messaging output. Container acceptance for native
-Transform remains separate.
+customer code. Transform now calls the same selected use case's five-argument
+`predict_with_model(input_directory, checkpoint_path, output_directory, config, parameter_path)`.
+It does not construct a separate ModelPredictor. For each HTTP request it writes
+`input/data.csv` in a unique writable temporary directory, calls the model function,
+and reads the result from that request's output directory. The function can keep
+its existing CSV writes and return nothing. Set its model-loading path to the
+supplied checkpoint and its write root to the supplied output directory in both modes.
+
+**TransformOutputFile** selects the CSV returned to SageMaker; its default is
+`messaging_final.csv`, found recursively. Supply an exact relative path when a
+different file is wanted or several folders contain the same basename. Missing or
+ambiguous results fail explicitly; there is no substitution with another CSV.
+The response preserves the selected file's columns, requires one result for each
+input record, and restores input ID order if the model sorted unique IDs by score.
+Other per-request files are temporary and are deleted after the response; Processing
+retains the entire output directory in S3. Native Postprocess reads Transform's
+JSON-lines outputs and passes the combined result to the analysis hook.
+
+To test both routes at the same time, start two executions of the same inference
+pipeline with the same ModelId and CsvInputUri, one with InferenceRuntime=processing
+and one with InferenceRuntime=transform. Check both ResolveModel package ARNs:
+each execution independently selects the highest Completed, Approved version.
+Keep approvals unchanged while launching a comparison. Jobs and S3 output paths
+remain separate by execution. Choosing one branch does not execute the other.
+
+Processing uses the notebook's `model_code_source` setting. **Native Transform
+uses the code in the approved model archive.** An existing compatible model can
+test new Processing code immediately; the new serving adapter must be included
+in a training package and approved before that archive can exercise it through
+Transform. Updating notebook source does not update an older registered archive.
+
+The image must dispatch its `serve` command to
+`python -m mlops_models.entrypoints serve` with `PYTHONPATH=/opt/ml/model/code`.
+The existing dispatcher starts Gunicorn on port 8080; the image must include
+Flask, Gunicorn and the model dependencies. The model and source remain read-only;
+per-request files use `TemporaryDirectory`, respecting the image's writable TMPDIR.
+Look for `server_ready` with `adapter=file_prediction_v1` in the Transform logs.
+The health check establishes that configuration/imports are ready; model loading
+and prediction are exercised by the first invocation. Processing's entrypoint
+override does not establish support for the image's native serve startup.
+
+The first file-based adapter may load the model again for each request. Keep the
+default single worker and concurrent request while validating correctness.
+Prediction functions must avoid global working-directory changes or shared output
+filenames outside the supplied request directory. Reusing loaded models and tuning
+GPU batching are later optimizations. The existing Transform input formatter
+writes one JSON-lines file; multiple-instance distribution needs multiple files.
+Some preprocessing/formatting still reads whole dataframes into memory.
+Reuse saved fitted transformations in both routes; fitting encoders or scalers
+again on individual requests can change predictions relative to the whole-file run.
 
 The final analysis file is currently published to S3. **MLflow artifact/run
 logging is planned, not implemented**. Future tracking should retain the model
@@ -110,28 +211,31 @@ to the agreed data-access and size policy.
 
 ## Updating a trainer that already contains your model code
 
-This version changes the training/evaluation handoff. Keep your adapted training
-implementation; do not replace it with the demo trainer from a source update.
+Keep your adapted training implementation. Align its arguments and output writer
+with the entrypoint; the generic trainer remains an integration example.
 
 1. In your `ModelTrainer.evaluate_model`, keep the existing validation-probability
    return and also return the `performance` dictionary from `AML.evaluate(...)`.
    Unpack both at the call site; plotting still receives the probabilities.
-2. In `mlops-models/src/mlops_models/model_base/training/train.py`, copy the updated
-   `write_container_output` and `evaluation_report` functions and their required
-   imports into your adapted file. The added import is
-   `from autogluon.core.metrics import get_metric`. Existing checkpoint, metadata,
-   package directory and output directory arguments keep their meanings.
-3. Add these keyword arguments to your existing output-writer call:
-   `config=config`, `performance=performance`, `data_usage="validation"`.
-   Use that usage label only for validation rows. Keep the raw AutoGluon scores;
-   the writer performs loss conversion. The normal entrypoint supplies model_id
-   and task_type in config. No extra parameters are needed on the entrypoint or
-   use-case training wrapper.
-4. Replace `mlops-models/src/mlops_models/entrypoints/evaluate.py` and
-   `mlops-models/src/mlops_models/model_base/training/evaluate.py`. Replace the
-   small `training/evaluate.py` adapter in each of your model folders with the
-   inherited adapter supplied under `models/usecase1` and `models/usecase2`.
-   The adapter has no hard-coded model name, so renamed folders use the same code.
+2. In `train_model`, accept `parameter_path` immediately after `config`, matching
+    the entrypoint and use-case wrapper. Load parameters from that file; keep
+    `config` as the decoded model metadata. The example trainer receives both
+    dictionaries separately. Read `primary_key`, `target_key` and `task_type`
+    from parameters, and learned settings from config.
+3. In `mlops-models/src/mlops_models/model_base/training/train.py`, port the
+    `write_container_output` and `evaluation_report` functions with their imports.
+    Call the writer with `parameters=parameters`, `performance=performance` and
+    `data_usage="validation"` alongside the existing checkpoint, learned metadata,
+    package directory and output directory. Set `parameters["model_id"]` from
+    the selected model folder as in the example. Use the validation label only
+    for validation rows. The report adapts real AutoGluon scores for Evaluate;
+    the writer performs loss conversion.
+4. Keep the working Evaluate and Registry adapters. The writer retains native
+    checkpoint files, writes learned `model_metadata.json` and `evaluation.json`,
+    and preserves effective `parameters.json` from the checkpoint or supplies it
+    separately when absent. Native reports written under `output_directory`
+    remain there for the loader to upload. Keep the working checkpoint separate
+    from the empty package destination.
 5. Rebuild through notebook 02 and start a new execution. The training-source
    change runs Train once to save the report; unchanged upstream steps remain
    eligible for cache reuse. Evaluate should then publish the scores and Registry
@@ -188,7 +292,7 @@ before changing code. Paths in this README are relative to the repository root.
 | Model Registry | Required registration after the quality gate; inference resolves a Completed, Approved version | Platform supplies groups/access; approval and promotion are separate operations |
 | Batch inference | Uses the image and saved model selected from Registry; default scoring uses Processing | Registry failures stop execution; no direct-S3 model bypass |
 | Step caching | Successful preparation, training, evaluation and Processing batch steps eligible for 24-hour reuse | Registry operations remain live; latest Feature Store reads, native HPO and Transform remain uncached |
-| Native HPO / Batch Transform | Definition and runtime code paths exist | Target container startup, output handling and serving require separate acceptance |
+| Native HPO / Batch Transform | HPO remains optional; Transform and Processing can be selected per inference execution and share the file prediction function | Target container startup, model code, HTTP output and permissions require separate acceptance |
 | Initial selection → final training | Metadata is saved with the model | Explicit prior-run metadata input and customer initial/final mode handling are planned |
 | CI checks | `.gitlab-ci.yml` declares definition checks and source tests | It does not build containers, provision resources or deploy this delivery |
 | Tracking, monitoring and production integration | Requirements and integration boundaries identified | Not implemented by the two notebooks |
@@ -333,7 +437,7 @@ These options are declared in notebook 02's **Defaults** cell:
 data_source = "csv_direct"             # Training; later switch to feature_store
 inference_data_source = "csv_direct"   # Scoring snapshot
 environment = "dev"
-batch_runtime = "processing"
+batch_runtime = "both"  # InferenceRuntime defaults to processing at execution time.
 model_code_source = "pipeline"
 include_hpo = False
 cache_steps = True
@@ -454,10 +558,10 @@ the container. The model functions read those local inputs.
 | GetData shared entrypoint | Explicit CSV or Feature Store binding | `raw/data.csv`, `raw/provenance.json` |
 | `run_feature_selection` | Raw CSV directory and settings | `selection/selected_features.csv`, `selection/random_forest_plots.pdf` |
 | `process_train` | Raw directory, selected-feature file, output directory, metadata dictionary and parameter-file path | `prepared/` containing one or more CSVs; demo writes `data.csv` |
-| `train_model` | Prepared directory, selected-feature file, package/work paths and settings | Saved model directory with metadata, evaluation.json and runtime code |
+| `train_model` | Prepared directory, selected-feature file, package/work paths, metadata dictionary and parameter-file path | Saved model directory with separate parameters/metadata, evaluation.json and runtime code |
 | Evaluation hook | Saved artifact containing evaluation.json and model_metadata.json; current quality thresholds | Published evaluation.json and an exact copy of model_metadata.json |
-| `process_inference` | Raw directory, selected-feature file, output directory, registered metadata dictionary and parameter-file path | `prepared/data.csv`; entrypoint also writes `selection/selected_features.csv` |
-| `predict_with_model` | Prepared directory, extracted checkpoint and writable output | `predictions.csv`, `messaging.csv`, `messaging_final.csv` |
+| `process_inference` | Raw directory, selected-feature file, output directory, registered metadata dictionary and parameter-file path | `prepared/data.csv`; loader also writes `selection/selected_features.csv` |
+| `predict_with_model` | Prepared directory, extracted checkpoint, writable output, registered metadata dictionary and parameter-file path | All CSV files under the output directory, including subfolders; existing files are retained |
 | `postprocess_predictions` | Raw directory, selected-feature file, prediction directory and saved settings | `prediction_analysis.csv`, `summary.json`, effective `parameters.json` |
 
 Both preprocessing functions receive
@@ -473,6 +577,22 @@ and the selected-feature table. They process those dataframes and call
 output directory according to the pipeline's output definitions. The entrypoints
 do not unpack an output path or row count. Keep writes under the supplied directory.
 There is no batching, generator or `shard_rows` setting in preprocessing.
+
+Prediction follows the same pattern. The wrapper reads the prepared CSV path,
+feature mapping and primary key, supplies a writable output directory to the model
+code, then finds and prints all CSV files recursively under the output directory.
+Set the model's output root to that supplied directory. Code that appends `output/`
+or other subfolders can retain them: the collector and loader preserve relative
+paths. The downstream analysis reader now discovers and prints every CSV
+recursively, with relative paths as dictionary keys such as
+`output/messaging_final.csv`. No flattening or CSV rewriting happens during
+publication; the model's analysis chooses which input files it consumes.
+
+Processing `predict_with_model` constructs the base example predictor directly;
+customer code can replace that section after the three inputs are resolved.
+A use-case-specific Processing implementation overrides `predict_with_model`.
+The separate `UseCaseModelPredictor` class remains the extension point for native
+Transform and the local dataframe-scoring helper.
 
 Native Batch Transform's existing HTTP server expects JSON lines. Only that
 optional route invokes `runtime/transform_input.py` after preprocessing has
@@ -678,7 +798,7 @@ has an explicit `model_code_source` choice in notebook 02's Defaults cell:
 
 - `artifact`: use the runtime source packaged with the approved model.
   Changing uploaded model code does not change what that archive executes.
-  Batch Transform requires this mode.
+  Batch Transform always uses this mode, including its branch when batch_runtime="both".
 - `pipeline` (notebook default): use uploaded preprocessing, prediction and postprocessing code with
   the Registry-selected saved model. This supports debugging Processing steps
   independently; Registry approval is still required.
@@ -772,7 +892,7 @@ Each model folder currently contains **both** JSON files. There is no separate
 | File | Current contract |
 |---|---|
 | `parameters.json` | `target_key`, `primary_key`, `task_type`; additional fields are passed unchanged to the model code |
-| `model_metadata.json` | Initially `{}`; loaded by the training entrypoint into `config["model_metadata"]` |
+| `model_metadata.json` | Initially `{}`; decoded directly as `config` for training; learned metadata comes from the Registry-selected artifact for inference |
 
 The three shared names mean:
 
@@ -841,8 +961,10 @@ incompatible encodings on a scoring batch.
   ready to test image startup, per-trial configuration, validation metric emission
   and model collection together.
   Ordinary Training's loader override does not establish tuning compatibility.
-- **Serving:** default Processing inference needs no persistent inference
-  endpoint. Batch Transform's serving path is separate; real-time endpoint
+- **Serving:** Processing and Transform share the file prediction function.
+  Transform requires the updated adapter inside the approved archive and a
+  compatible image serve startup. Per-request model loading remains an overhead;
+  only the explicitly selected result CSV is returned by HTTP. Real-time endpoint
   deployment is not provided.
 - **Registry:** both pipelines require precreated groups and the relevant role
   permissions. Inference requires approval of the actual candidate; it stops on
@@ -875,7 +997,54 @@ needed by their selected mode. Platform owners bind exact resources and roles.
 
 ## Validation
 
-The preprocessing-interface correction passed **144 source tests**. A customer
+The shared file-based serving adapter passed **161 source tests** and notebook
+build/publication checks for Processing, Transform and the combined runtime
+dropdown with simulated AWS clients. Four underlying model definitions also pass
+the repository's definition checks. Branch checks verify one shared pipeline pair,
+valid references within each branch, a fresh Registry lookup, and preserved
+Processing compute caching.
+
+Real local Gunicorn tests used existing fitted AutoGluon regression and binary
+classification models with the updated code copied into their local archives.
+Each task scored 37 rows through four HTTP requests with two workers, matched
+direct file prediction IDs/scores, and completed native-format Postprocess.
+Model directories were read-only and unchanged; the test ran without root.
+Additional tests exercise customer-style file functions returning None, nested
+results, explicit output-file selection, input-order restoration, concurrent
+request isolation, invalid inputs and temporary-directory cleanup.
+No managed jobs were launched. These checks do not establish the receiving
+image's serve startup, model code's batch independence, GPU performance or
+managed Transform permissions. The local test reused fitted weights; it did not
+change or re-register any remote model.
+
+The recursive postprocessing reader passed **152 source tests**. The prediction
+and analysis path was exercised for regression and classification with outputs
+under `native/output/`. A custom analysis consumed an arbitrarily named nested
+CSV without any of the three example prediction filenames. Tests preserve string
+IDs and duplicate basenames, allow the example analysis to use its combined result
+without the other two files, and reject missing or ambiguous analysis inputs.
+AWS calls were simulated; no new managed jobs ran.
+
+The recursive prediction-output update passed **150 source tests**. Checks cover
+CSV files at several directory levels, uppercase extensions, identical basenames
+in different subfolders, printed paths, unchanged bytes through simulated S3
+uploads, and failure when no CSV exists. Calls through the selected use case
+require no predictor-class argument. The default prediction/analysis flow remains
+covered; custom analysis must be adapted to its own output layout.
+
+The earlier metadata/parameter separation and file-output update passed **148 source
+tests**. Two real local AutoGluon fits, one regression and one binary
+classification, completed training and produced separate parameters and metadata.
+Each then completed loader → preprocessing → prediction → postprocessing using
+both pipeline and archived source. All 37 scoring identifiers and direct scores
+matched after the same CSV serialization; model archives were unchanged by
+inference. The checks also verify that a prediction hook can return nothing and
+that its CSV formatting and additional files remain intact. The example predictor
+allows mapped inputs discarded during fitting while requiring all features used
+by the fitted model. AWS calls were simulated; these checks do not establish
+receiving-container or customer-algorithm acceptance.
+
+The earlier preprocessing-interface correction passed **144 source tests**. A customer
 function with the same five arguments as training returned nothing, wrote its
 prepared CSV, and the loader collected that file plus the saved selection.
 Checks also cover separate metadata/parameters, model identity, missing registered
