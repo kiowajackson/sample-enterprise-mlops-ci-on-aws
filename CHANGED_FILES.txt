@@ -1,7 +1,7 @@
 Current inference copy-over set — 2026-10-16
-Source checkpoint: 2822d59304c5502910b68fc24d3704a5a451070f
+Source checkpoint: fd3666d96551b03172262b78a631d76178e8fd6a
 
-19 update files: 16 runtime files, 2 notebooks and README.md.
+20 update files: 17 runtime files, 2 notebooks and README.md.
 This CHANGED_FILES.txt index is additional. Three existing scratch diagnostics
 are retained separately below. Dev is a copy-over set, not a complete checkout.
 Tests remain in the development repository and are checked before sharing.
@@ -12,15 +12,38 @@ replace the entrypoints/framework files and align the thin use-case wrappers.
 After all runtime updates are in place, run notebook 02 and execute inference
 for the already approved ModelId. Notebook 01 only needs rerunning for new data.
 
-LATEST CORRECTION — TRAINING PREPROCESSING ONLY
-Copy mlops-models/src/mlops_models/entrypoints/preprocess_training.py.
-It loads the selected model's model_metadata.json into config and passes the
-separate parameters.json Path as the fifth argument to process_train, after
-(data_directory, selection_file, output_directory, config).
-Keep the customer preprocessing implementation that already accepts those five
-arguments. The example base adapter and tests were updated in development only.
-No inference files, notebook code or wrappers changed in this correction.
-README.md and this index were updated too. 140 source tests passed.
+LATEST CORRECTION — INFERENCE PREPROCESSING CONTRACT
+Changed on dev in this update:
+mlops-models/src/mlops_models/entrypoints/preprocess_inference.py
+mlops-models/src/mlops_models/entrypoints/__main__.py
+mlops-models/src/mlops_models/model_base/inference/preprocess.py
+mlops-models/src/mlops_models/model_base/inference/definition.json
+mlops-models/src/mlops_models/pipelines/source.py
+mlops-models/src/mlops_models/runtime/transform_input.py
+README.md
+CHANGED_FILES.txt
+
+Replace the two entrypoint files and the framework definition/source/format adapter. Keep your customer preprocessing body if it
+already accepts (data_directory, selection_file, output_directory, config,
+parameter_path) and writes prepared/data.csv under the supplied output directory.
+The base file is the matching generic example, not a replacement for customer logic.
+No return value is required. The loader uploads the files the function writes.
+Config is the approved model's model_metadata.json dictionary; parameter_path is
+the selected source folder's parameters.json Path. They are never merged.
+The inference entrypoint creates selection/selected_features.csv from the saved
+feature_mapping first and passes that file as the second argument. Its headings
+are features,description. Customer preprocessing receives no shard_rows argument.
+Both generic preprocessing modules now read two dataframes and write one CSV,
+without returning a value. They differ only by the process function name.
+There is no batching, generator or shard_rows setting in preprocessing.
+Native Transform formatting is separate and runs only when that backend is chosen;
+Processing reads the prepared CSV directly. Existing customer training is preserved:
+the aligned generic training example and tests stay in development.
+144 source tests passed; no notebook, config, ZIP or AWS job changes.
+
+FULL CURRENT COPY-OVER SET
+The lists below also include earlier updates already applied by the user.
+Do not recopy those solely because they are listed here.
 
 REPLACE THESE FRAMEWORK FILES TOGETHER
 mlops-models/src/mlops_models/entrypoints/preprocess_training.py
@@ -34,6 +57,7 @@ mlops-models/src/mlops_models/pipelines/source.py
 mlops-models/src/mlops_models/registry/model_package.py
 mlops-models/src/mlops_models/runtime/job_paths.py
 mlops-models/src/mlops_models/runtime/load_source.py
+mlops-models/src/mlops_models/runtime/transform_input.py
 
 PORT YOUR MODEL LOGIC INTO THESE INFERENCE ADAPTERS
 Keep the get_container_input -> model code -> write_container_output contract.
@@ -63,6 +87,8 @@ mlops-models/scratch/trace_evaluation_inputs.py
 mlops-models/scratch/trace_training_inputs.py
 
 No tests, obsolete training updates, config copies or ZIPs are included.
-The inference update passed 138 source tests,
-26 simulated notebook scenarios, definition checks and four real local prediction
-flows passed. AWS calls were simulated; BMO inference acceptance is still next.
+The preceding inference-stage update passed 138 source tests, 26 simulated
+notebook scenarios, definition checks and four real local prediction flows.
+The current interface correction passed 144 source tests, including no-return
+file upload, separate metadata/parameters and unchanged model artifacts.
+AWS calls were simulated; BMO inference acceptance is still next.

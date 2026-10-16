@@ -292,11 +292,7 @@
             "--output",
             "/opt/ml/processing/output",
             "--model-dir",
-            "/opt/ml/processing/model/model.tar.gz",
-            "--chunk-rows",
-            {
-              "Get": "Parameters.BatchChunkRows"
-            }
+            "/opt/ml/processing/model/model.tar.gz"
           ],
           "ContainerEntrypoint": [
             "python",
@@ -392,7 +388,8 @@
           },
           "IMAGE_URI": {
             "Get": "Parameters.InferenceImageUri"
-          }
+          },
+          "MLOPS_PREPARE_TRANSFORM_INPUT": "1"
         },
         "StoppingCondition": {
           "MaxRuntimeInSeconds": 900

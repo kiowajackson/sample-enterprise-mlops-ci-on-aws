@@ -30,9 +30,14 @@ For a model whose training already works:
    builder, dispatcher, runtime paths and inference entrypoints together. Run All
    in notebook 02 to publish the new graph and source.
 2. Adapt `model_base/inference/preprocess.py`. `process_inference` receives the
-   raw directory, output directory and saved configuration. The example reads
+   raw directory, selected-feature file, output directory, metadata dictionary
+   and parameter-file path, in the same order as `process_train`. The example reads
    `raw/data.csv`, keeps the primary key and columns in the saved feature mapping,
-   and writes `prepared/data.csv` plus `selection/selected_features.csv`. It does
+   and writes `prepared/data.csv`. The entrypoint creates
+   `selection/selected_features.csv` from the registered metadata before calling it.
+   `get_container_input` returns the raw dataframe and selected-feature dataframe.
+   The function calls `write_container_output` without returning anything; the
+   loader uploads its written files. It does
    not require a target or rerun feature selection. Apply the same column naming
    and fitted transformations as training wherever the customer code requires them.
 3. Adapt `model_base/inference/predict.py`. Its file hook
@@ -55,8 +60,11 @@ For a model whose training already works:
    Check the resolved model version, final row identifiers and scores against the
    model owner's original prediction before calling the port accepted.
 
-The archive already holds `parameters.json` and `model_metadata.json`; inference
-reads the files from that exact approved archive. For new registrations, Evaluate
+The archive already holds `parameters.json` and `model_metadata.json`; model loading
+uses that exact approved archive. Preprocessing reads its metadata there and receives
+the selected source folder's `parameters.json` path separately, matching training.
+With `model_code_source="pipeline"`, keep those source parameters compatible with the
+registered model; with `"artifact"`, they come from the archived source. For new registrations, Evaluate
 also publishes an identical `model_metadata.json` beside `evaluation.json`.
 RegisterModel verifies its checksum and records **ModelMetadataUri** and
 **ModelMetadataSha256** in the version's custom metadata. That URI lets an operator
@@ -81,16 +89,16 @@ archive root, as when the writer copies `AML.path`; the generic trainer records
 substitutes for learned metadata from the approved version. The mapping names
 columns; it does not calculate business features or recreate missing fitted state.
 
-Keep training and inference modules separate for this delivery. It is acceptable
-to copy an existing combined module while porting its two functions independently.
-After both paths pass, a later refactor can share a preprocessing implementation
-or a model-selection module behind the existing entrypoints. Training retains the
-target; inference uses saved selected features without requiring a target, so
-identical behavior must be verified before consolidating.
+Keep training and inference modules separate for this delivery. The generic
+preprocessing modules now have identical bodies except for the function name.
+They retain a target and timestamp when those columns exist; scoring data need
+not contain a target. The selected-feature file's first column supplies names.
+Customer code can be copied into both modules and later consolidated after both
+paths pass. Training itself still requires its configured target.
 
 Processing uses a whole-file model hook and loads prediction outputs into memory
 for analysis. Size the job for that workload or implement bounded processing in
-customer code. Optional Batch Transform uses JSON-lines shards and the HTTP
+customer code. Optional Batch Transform uses a separate CSV-to-JSON-lines adapter and the HTTP
 `predict_with_best_model(df)` adapter; replacing the Processing file hook does not
 implement that HTTP path or its messaging output. Container acceptance for native
 Transform remains separate.
@@ -448,17 +456,29 @@ the container. The model functions read those local inputs.
 | `process_train` | Raw directory, selected-feature file, output directory, metadata dictionary and parameter-file path | `prepared/` containing one or more CSVs; demo writes `data.csv` |
 | `train_model` | Prepared directory, selected-feature file, package/work paths and settings | Saved model directory with metadata, evaluation.json and runtime code |
 | Evaluation hook | Saved artifact containing evaluation.json and model_metadata.json; current quality thresholds | Published evaluation.json and an exact copy of model_metadata.json |
-| `process_inference` | Raw CSV directory and saved parameters/metadata | `prepared/data.csv`, `selection/selected_features.csv`; optional Transform shards under `prepared/shards/` |
+| `process_inference` | Raw directory, selected-feature file, output directory, registered metadata dictionary and parameter-file path | `prepared/data.csv`; entrypoint also writes `selection/selected_features.csv` |
 | `predict_with_model` | Prepared directory, extracted checkpoint and writable output | `predictions.csv`, `messaging.csv`, `messaging_final.csv` |
 | `postprocess_predictions` | Raw directory, selected-feature file, prediction directory and saved settings | `prediction_analysis.csv`, `summary.json`, effective `parameters.json` |
 
-Training preprocessing receives five arguments in that order. Its entrypoint
-loads `models/<ModelId>/model_metadata.json` as `config` and passes
-`models/<ModelId>/parameters.json` separately as `parameter_path`. It does not
-merge the two documents. The example preprocessing reads settings from that path;
-customer code can use both inputs. The use-case wrappers already re-export the
-base function and need no change. This correction applies to training only;
-inference currently retains its separate three-argument adapter.
+Both preprocessing functions receive
+`(data_directory, selection_file, output_directory, config, parameter_path)`.
+Training loads `models/<ModelId>/model_metadata.json` as `config`; inference loads
+the approved model's extracted `model_metadata.json`. Both pass the selected source
+folder's `models/<ModelId>/parameters.json` separately as a Path. They do not merge
+the documents. The use-case wrappers re-export the base function and need no change.
+
+Both functions call `get_container_input`, which returns two dataframes: the data
+and the selected-feature table. They process those dataframes and call
+`write_container_output` without returning anything. The loader uploads files under the supplied
+output directory according to the pipeline's output definitions. The entrypoints
+do not unpack an output path or row count. Keep writes under the supplied directory.
+There is no batching, generator or `shard_rows` setting in preprocessing.
+
+Native Batch Transform's existing HTTP server expects JSON lines. Only that
+optional route invokes `runtime/transform_input.py` after preprocessing has
+written its CSV. This adapter formats one file under `prepared/shards/`; it does
+not select features or divide the dataframe into batches. Processing inference
+uses the CSV directly and does not invoke this adapter.
 
 Training's demo selection CSV has a **`feature`** column. Inference reconstructs
 its selection from saved feature_mapping and writes **`features,description`**.
@@ -854,6 +874,14 @@ networking are different choices; jobs still require the service connectivity
 needed by their selected mode. Platform owners bind exact resources and roles.
 
 ## Validation
+
+The preprocessing-interface correction passed **144 source tests**. A customer
+function with the same five arguments as training returned nothing, wrote its
+prepared CSV, and the loader collected that file plus the saved selection.
+Checks also cover separate metadata/parameters, model identity, missing registered
+metadata, unchanged model artifacts, identical training/inference CSV outputs and
+Transform-only format conversion. AWS uploads were
+simulated; this correction has not yet been run in the receiving container.
 
 The explicit inference-stage update passed **138 source tests**, **26 simulated-AWS
 notebook scenarios**, and definition checks. Coverage includes the

@@ -562,6 +562,7 @@ def configure_approved_inference(body, group, source_uri, batch_runtime, region)
     steps["CreateModel"]["Arguments"]["PrimaryContainer"]["Environment"].update(
         PYTHONPATH="/opt/ml/model/code", PYTHONSAFEPATH="1")
     if batch_runtime == "processing":
+        steps["Preprocess"]["Arguments"]["Environment"].pop("MLOPS_PREPARE_TRANSFORM_INPUT", None)
         steps["Postprocess"]["Arguments"]["Environment"]["MLOPS_PREDICTION_FORMAT"] = "csv"
         score = deepcopy(steps["Preprocess"])
         score["Name"] = "Score"
