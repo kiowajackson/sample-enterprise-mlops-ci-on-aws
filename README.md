@@ -17,6 +17,76 @@ Implemented options, validation boundaries and planned work are distinguished be
 This README describes the source in this delivery; a previous model archive may
 contain an older copy of that source.
 
+## Running prediction from a registered model
+
+The model archive already contains `model_metadata.json`. Registry records the
+archive's S3 URI; ResolveModel selects a Completed, Approved version, and the
+loader extracts that exact archive for Preprocess, Score and Postprocess. There
+is no separate metadata upload or lookup. Keep `parameters.json` for settings
+such as primary key and task, and `model_metadata.json` for learned information.
+
+For a model whose training already works:
+
+1. Replace `mlops-models/src/mlops_models/entrypoints/preprocess_inference.py` and
+   `mlops-models/src/mlops_models/model_base/inference/preprocess.py`. The default
+   CSV preprocessing preserves all columns and identifiers, and writes bounded
+   JSON-lines shards. It requires no target or demo `features` setting. It does
+   not fit encoders/scalers. Feature Store mode queries the saved feature mapping.
+2. Adapt `mlops-models/src/mlops_models/model_base/inference/predict.py`. Its
+   `predict_with_model` function reads each shard, provides a temporary local CSV
+   to `ModelPredictor.predict_file(user_data_path)`, then saves the returned
+   dataframe through `write_container_output`. The CSV exists for the duration
+   of that synchronous call and is removed afterwards.
+3. Put the model's prediction code inside `ModelPredictor`. The file hook has
+   `user_data_path`, `self.feature_mapping`, `self.primary_key` and
+   `self.checkpoint_path` available. Replace initialization and prediction together
+   if your model loads differently. Use the extracted registered checkpoint;
+   do not search local timestamp folders for a newer model.
+4. Return one row per input with the original primary-key column and numeric
+   `score`. For regression this is the prediction in the intended output scale;
+   for binary classification it is the positive-class probability. The existing
+   Postprocess writes `predictions.csv` and the row-count summary. Additional
+   outputs such as messaging.csv require a model-specific output/postprocess
+   adapter; the generic formatter does not create them.
+5. Notebook 02 now defaults to `model_code_source="pipeline"`,
+   `batch_runtime="processing"` and `cache_steps=True`. Run All to publish
+   the updated source, then start **inference only** for the approved ModelId and
+   intended `CsvInputUri`. This permits new prediction code with an existing
+   compatible model archive. The optional `artifact` mode uses code saved when
+   that model was trained, so an uploaded code edit alone does not replace it.
+6. Check ResolveModel's version/artifact, then Score and the final prediction
+   file. Check row count, identifiers, score meaning and a small comparison with
+   the model owner's original prediction. A successful model lookup or
+   preprocessing job alone does not establish prediction compatibility.
+
+The supplied AutoGluon implementation expects this learned metadata:
+
+```json
+{
+  "feature_mapping": {"input_column": "model_column"},
+  "predictor_path": "."
+}
+```
+
+The mapping preserves input-to-model column correspondence; identity mappings
+are valid. Names must match exactly, including case. Any normalization, encoding,
+scaling or target reversal must match training and belongs in the model's
+predictor. The adapter checks the mapped names against the loaded predictor.
+It does not guess a mapping from every input column or from demo settings.
+The default model location is the archive root, as when the writer copies
+`AML.path`. The generic trainer explicitly writes `predictor_path="predictor"`
+because its model is in that subdirectory. Paths outside the archive are rejected.
+
+This delivery adds those two metadata fields to the **demo trainer only**.
+Keep an already adapted trainer that saves its own feature_mapping and root
+checkpoint. No training rerun is needed for that compatible archive. Older demo
+archives lacking feature_mapping need one new training run. Source-folder
+metadata is not substituted for metadata belonging to the approved version.
+
+Processing uses the file hook. The optional Batch Transform HTTP adapter uses
+`predict_with_best_model(df)`; replacing only the file hook does not implement
+that HTTP prediction path. This handoff targets Processing first.
+
 ## Updating a trainer that already contains your model code
 
 This version changes the training/evaluation handoff. Keep your adapted training
@@ -238,6 +308,7 @@ These options are declared in notebook 02's **Defaults** cell:
 data_source = "csv_direct"
 environment = "dev"
 batch_runtime = "processing"
+model_code_source = "pipeline"
 include_hpo = False
 cache_steps = True
 model_ids = None
@@ -356,7 +427,7 @@ the container. The model functions read those local inputs.
 | `process_train` | Raw directory, selected-feature file and settings | `prepared/` containing one or more CSVs; demo writes `data.csv` |
 | `train_model` | Prepared directory, selected-feature file, package/work paths and settings | Saved model directory with metadata, evaluation.json and runtime code |
 | Evaluation hook | Saved artifact containing evaluation.json; current use-case quality thresholds | Published evaluation.json with metrics, provenance and quality decision |
-| `process_inference` | Scoring snapshot and saved model settings | `shards/part-*.jsonl` |
+| `process_inference` | Scoring snapshot and saved model settings | All input columns in `shards/part-*.jsonl` |
 | `predict_with_model` | Shards, extracted checkpoint and writable output | Identified score records in `*.out` files |
 | `postprocess_predictions` | Score records and saved settings | `predictions.csv`, `summary.json`, effective `parameters.json` |
 
@@ -545,10 +616,10 @@ refitting a model that already contains evaluation.json. Older artifacts without
 that file require one new Train run; there is no re-scoring fallback. Inference
 has an explicit `model_code_source` choice in notebook 02's Defaults cell:
 
-- `artifact` (default): use the runtime source packaged with the approved model.
+- `artifact`: use the runtime source packaged with the approved model.
   Changing uploaded model code does not change what that archive executes.
   Batch Transform requires this mode.
-- `pipeline`: use uploaded preprocessing, prediction and postprocessing code with
+- `pipeline` (notebook default): use uploaded preprocessing, prediction and postprocessing code with
   the Registry-selected saved model. This supports debugging Processing steps
   independently; Registry approval is still required.
 
@@ -659,7 +730,8 @@ Newly trained archives retain this parameter schema and matching runtime code;
 keep older artifacts with their original code.
 
 The demo trainer saves effective parameters and newly generated metadata with
-the checkpoint. It does **not** consume prior metadata to implement customer
+the checkpoint, including the selected feature mapping and relative predictor
+path consumed by inference. It does **not** consume prior metadata to implement customer
 initial-selection/final-training choices. Its generated fields such as
 `selected_model` and input row count are not a complete `best_estimator` /
 `best_config` contract. The same metadata is written as `training.json` inside
@@ -740,6 +812,15 @@ networking are different choices; jobs still require the service connectivity
 needed by their selected mode. Platform owners bind exact resources and roles.
 
 ## Validation
+
+The inference metadata/file-handoff update passed **132 source tests** and real
+local AutoGluon regression and binary-classification checks. Each task was scored
+from both a nested demo checkpoint and an archive-root checkpoint with no demo
+features setting. All 37 scoring rows retained their identifiers and matched
+direct predictor scores; metadata traveled through the loader-created archive,
+and extracted model files were unchanged. S3 uploads were simulated. The receiving
+container and customer prediction/preprocessing logic still require acceptance.
+
 
 The saved-training-metrics update passed **120 source tests** and real local
 AutoGluon 1.4 training for both supplied tasks (200 synthetic rows each). Both

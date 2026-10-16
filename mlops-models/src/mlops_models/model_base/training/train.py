@@ -141,6 +141,8 @@ class ModelTrainer:
         # Customer trainers return the performance from their own validation call.
         performance = predictor.evaluate(df[selected + [config["target_key"]]])
         metadata = {"selected_model": predictor.model_best, "rows": {"input": len(df)},
+                    "feature_mapping": {name: name for name in selected},
+                    "predictor_path": "predictor",
                     "evaluation": {"usage": "prepared_input_smoke_check"}}
         if os.getenv("TUNING_OBJECTIVE"):
             score = predictor.leaderboard().set_index("model").loc[predictor.model_best, "score_val"]

@@ -1,32 +1,53 @@
-Saved training metrics and full job log cell
+Inference adapter + ready-to-run notebook 02
 
-Source commit: 16a38464012f8ff90e2473e9172b35e2216f5d18
-Full archive: wsf-full-handoff-2026-10-15T215814Z-password-protected.zip
+Source: f5e3c5074544b360528ef7cb7e77dafe8e6a4bf0
+Full archive: wsf-full-handoff-2026-10-15T235943Z-password-protected.zip
 Password: pass
 
-Changes since source 45a7675:
-  README.md
-  mlops-models/scratch/job_log_cell.py
-  mlops-models/src/mlops_models/entrypoints/evaluate.py
-  mlops-models/src/mlops_models/model_base/training/evaluate.py
-  mlops-models/src/mlops_models/model_base/training/train.py
-  mlops-models/src/mlops_models/models/usecase1/training/evaluate.py
-  mlops-models/src/mlops_models/models/usecase1/training/train.py
-  mlops-models/src/mlops_models/models/usecase2/training/evaluate.py
-  mlops-models/src/mlops_models/models/usecase2/training/train.py
-  tests/test_job_log_cell.py
-  tests/test_model_handoff.py
-  tests/test_saved_training_metrics.py
-  tests/test_step_io.py
-  tests/test_training_files.py
+FILES TO COPY / PORT INTO YOUR ADAPTED CHECKOUT
+- notebooks/02_deploy_pipelines.ipynb
+- mlops-models/src/mlops_models/entrypoints/preprocess_inference.py
+- mlops-models/src/mlops_models/model_base/inference/preprocess.py
+- mlops-models/src/mlops_models/model_base/inference/predict.py
 
-Keep your adapted model code and populated notebooks/config.json.
-Use README.md's "Updating a trainer that already contains your model code"
-section to port the two output functions and pass performance into the writer.
-The use-case evaluate adapters are identical; put one in each renamed model folder.
-The Training/Processing log cell is mlops-models/scratch/job_log_cell.py.
-Paste the whole file into a cell, set JOB_NAME, and run it.
+Notebook 02 defaults to model_code_source="pipeline", batch_runtime="processing",
+cache_steps=True. Keep your notebooks/config.json, restart the notebook kernel,
+and Run All. It publishes the pipelines; then execute inference for the approved
+ModelId with the intended scoring CsvInputUri. It does not start jobs automatically.
+No training rerun is needed for a compatible existing model with saved metadata.
 
-Validation: 120 source tests, four log-cell tests and two real local AutoGluon
-training runs passed. AWS uploads/Registry were simulated. BMO execution remains
-the next acceptance check. No notebook or runtime path changes.
+KEEP YOUR WORKING CUSTOM TRAINER. The generic model_base/training/train.py change
+only adds feature_mapping and predictor_path="predictor" to its demo metadata.
+An adapted trainer that saves its feature_mapping and root AML.path checkpoint
+can remain as it is. Metadata already travels inside registered model.tar.gz.
+
+The prediction file hook gets a local CSV, the saved mapping, primary key and
+registered checkpoint. Port the model-specific transformations/loading into the
+ModelPredictor class. Return primary key + numeric score, one row per input.
+Mapping is input-column -> model-column, exact case. Messaging/multiclass output
+needs a model-specific adapter. See README for the full contract.
+
+ALL SOURCE FILES CHANGED SINCE PREVIOUS DEV (11)
+README.md
+mlops-models/src/mlops_models/entrypoints/preprocess_inference.py
+mlops-models/src/mlops_models/model_base/inference/predict.py
+mlops-models/src/mlops_models/model_base/inference/preprocess.py
+mlops-models/src/mlops_models/model_base/training/train.py
+notebooks/02_deploy_pipelines.ipynb
+tests/test_feature_store_pipeline.py
+tests/test_inference_metadata.py
+tests/test_metadata_features.py
+tests/test_review_hardening.py
+tests/test_step_io.py
+
+All files above are individually available on dev and in the full ZIP.
+CHANGED_FILES.txt and the latest ZIP/checksum are also updated/added. Existing dev
+files, blank config files and the older published ZIP are preserved. The ZIP is a
+clean generic baseline; extract separately to retain adapted customer code.
+
+VERIFICATION
+The inference runtime passed 132 source tests and four real local prediction flows
+(regression/classification, nested/root checkpoints; 37 rows per flow). Scores/IDs
+matched direct prediction. This notebook passed 25 simulated-AWS scenarios,
+including full Run All and verified published definitions with pipeline-code mode
+and all three inference compute caches. No new managed AWS jobs ran.
