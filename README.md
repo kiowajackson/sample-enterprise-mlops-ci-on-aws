@@ -214,7 +214,7 @@ to the agreed data-access and size policy.
 Keep your adapted training implementation. Align its arguments and output writer
 with the entrypoint; the generic trainer remains an integration example.
 
-1. In your `ModelTrainer.evaluate_model`, keep the existing validation-probability
+1. In your `ModelTraining.evaluate_model`, keep the existing validation-probability
    return and also return the `performance` dictionary from `AML.evaluate(...)`.
    Unpack both at the call site; plotting still receives the probabilities.
 2. In `train_model`, accept `parameter_path` immediately after `config`, matching
@@ -588,11 +588,12 @@ recursively, with relative paths as dictionary keys such as
 `output/messaging_final.csv`. No flattening or CSV rewriting happens during
 publication; the model's analysis chooses which input files it consumes.
 
-Processing `predict_with_model` constructs the base example predictor directly;
-customer code can replace that section after the three inputs are resolved.
-A use-case-specific Processing implementation overrides `predict_with_model`.
-The separate `UseCaseModelPredictor` class remains the extension point for native
-Transform and the local dataframe-scoring helper.
+Processing and native Transform both call the selected use case's
+`predict_with_model`. Its wrapper imports only that function from the base module;
+there is no required `predict_model` helper or predictor-class export.
+The base example constructs its own predictor; customer code can replace that
+section after the three inputs are resolved. Override `predict_with_model` in a
+use-case folder when that model needs different prediction logic.
 
 Native Batch Transform's existing HTTP server expects JSON lines. Only that
 optional route invokes `runtime/transform_input.py` after preprocessing has
@@ -662,7 +663,8 @@ graph. The publication builder transforms them into the shared pipelines.
 Inspect the rendered definitions or publication receipt when tracing a run.
 
 Use-case modules inherit corresponding base functions/classes. For example,
-the use-case training wrapper passes its `UseCaseModelTrainer` into the base
+the use-case training wrapper passes its `UseCaseModelTraining`, derived from
+`ModelTraining`, into the base
 `train_model` function. Model-base code does not select another use case.
 Entry points load parameters from the selected model folder; the process
 working directory is not the parameter directory.

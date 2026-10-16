@@ -121,11 +121,3 @@ class ModelPredictor:
             self.primary_key: df[self.primary_key].astype(str).to_numpy(),
             "score": values,
         })
-
-
-def predict_model(df, checkpoint_path, *, predictor_cls=ModelPredictor, output_dir=None):
-    """Score an evaluation dataframe without the batch-file handoff."""
-    checkpoint_path = Path(checkpoint_path)
-    config = json.loads((checkpoint_path / "model_metadata.json").read_text())
-    parameters = json.loads((checkpoint_path / "parameters.json").read_text())
-    return predictor_cls(checkpoint_path, config, parameters).predict_with_best_model(df, output_dir=output_dir)

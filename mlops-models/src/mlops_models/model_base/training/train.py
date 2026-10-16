@@ -94,7 +94,7 @@ def evaluation_report(performance, parameters, data_usage):
             "raw_metrics": raw, "metrics": metrics}
 
 
-class ModelTrainer:
+class ModelTraining:
     """Accept input paths, then own the demo's entire training implementation."""
 
     def __init__(self, user_feature_path, user_data_path, config, parameters):

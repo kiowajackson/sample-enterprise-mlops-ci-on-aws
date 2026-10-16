@@ -1,36 +1,41 @@
 Current cumulative copy-over set — 2026-10-16
-Source checkpoint: 4cf6c9bdbeadb35366fe1ddee05f9527bb8b2e53
-Previous dev: 61de99ecc4590a47789f2cf11ec90fae24b16f0b
+Source checkpoint: 3d8c6b77c9d5ce70a514e0e52413dbc93229a4e0
+Previous dev: d59348c91a33e5ce520be1ebf58d3965a37761d9
 
 This update includes ALL pending metadata/parameter, prediction-output,
 postprocessing and serve changes. Earlier inference-stage updates remain here.
 Dev contains 28 application/documentation files, this index and three scratch
 helpers (32 files total). It is a partial copy-over set, not a complete checkout.
-17 files change in this publication, including this index. No files are deleted.
+8 files change in this publication, including this index. No files are deleted.
 Tests, ZIPs, generated outputs and config copies are excluded.
 
 Keep your populated notebooks/config.json, model parameters, metadata fixtures
 and customer model algorithms. Generic usecase1/usecase2 wrapper changes belong
 in your corresponding renamed model folders; do not rename those folders back.
 
-NEW OR UPDATED IN THIS PUBLICATION (17)
+LATEST FIX — MODEL WRAPPER IMPORTS
+Prediction wrappers now import only predict_with_model. Removed the unused
+predict_model helper, use_case_predict_model wrapper and predictor subclass.
+Both Processing and native Transform already call predict_with_model.
+Training imports ModelTraining and uses UseCaseModelTraining consistently.
+
+Immediate customer update: the four use-case inference/predict.py and
+training/train.py wrapper files, under your existing renamed model folders.
+If the base class is already ModelTraining, that rename is done. Keep customer
+model code; do not overwrite it with the generic example. The base prediction
+file only loses the unused dataframe helper, which your port need not contain.
+No entrypoint, notebook or pipeline-definition update is needed for this fix.
+After copying, rerun notebook 02 to publish the corrected source.
+
+NEW OR UPDATED IN THIS PUBLICATION (8)
 CHANGED_FILES.txt
 README.md
-mlops-models/src/mlops_models/entrypoints/__main__.py
-mlops-models/src/mlops_models/entrypoints/predict.py
-mlops-models/src/mlops_models/entrypoints/preprocess_inference.py
-mlops-models/src/mlops_models/entrypoints/serve.py
-mlops-models/src/mlops_models/entrypoints/train.py
-mlops-models/src/mlops_models/model_base/inference/postprocess.py
 mlops-models/src/mlops_models/model_base/inference/predict.py
 mlops-models/src/mlops_models/model_base/training/train.py
 mlops-models/src/mlops_models/models/usecase1/inference/predict.py
 mlops-models/src/mlops_models/models/usecase1/training/train.py
 mlops-models/src/mlops_models/models/usecase2/inference/predict.py
 mlops-models/src/mlops_models/models/usecase2/training/train.py
-mlops-models/src/mlops_models/pipelines/source.py
-mlops-models/src/mlops_models/runtime/load_source.py
-notebooks/02_deploy_pipelines.ipynb
 
 FULL COPY-OVER SET
 The lists below include earlier files, so use them if those updates were not
@@ -65,7 +70,7 @@ Pass parameter_path after config to train_model. Load the effective parameters
 from that path and pass them as parameters= to write_container_output; its
 evaluation_report also uses parameters for model_id/task_type. Keep the working
 customer trainer, checkpoint path, metadata and performance capture. The demo
-ModelTrainer is an example, not a replacement for the customer's algorithm.
+ModelTraining is an example, not a replacement for the customer's algorithm.
 
 Preprocessing accepts data_directory, selection_file, output_directory, config,
 parameter_path. Training loads local model_metadata.json; inference loads the
@@ -129,10 +134,11 @@ mlops-models/scratch/trace_evaluation_inputs.py
 mlops-models/scratch/trace_training_inputs.py
 
 VALIDATION
-All supplied application files match source 4cf6c9bdbeadb35366fe1ddee05f9527bb8b2e53.
-161 source tests, four underlying definitions and notebook processing/transform/
-both modes passed locally (AWS simulated). Real non-root Gunicorn checks passed
-for regression and binary classification: 37 rows per task, four HTTP requests
-per task, matching direct predictions and postprocessing. Read-only model
-artifacts stayed unchanged. Customer image startup and managed Transform still
-need testing in the receiving environment. No cloud jobs are run by this push.
+All supplied application files match source 3d8c6b77c9d5ce70a514e0e52413dbc93229a4e0.
+163 checks passed: 159 in the model environment and four notebook diagnostics
+in the existing IPython-enabled notebook environment. The regression tests import
+both prediction wrappers with only a customer predict_with_model export, and
+both training wrappers with ModelTraining. Tests stay in development.
+The previous serving revision passed real local non-root HTTP checks for both
+example tasks. This correction changes imports/names only; no new managed runs,
+model approvals or container changes. Receiving-container acceptance stays open.
