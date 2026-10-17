@@ -1,9 +1,29 @@
-Current dev copy-over set — SHAP diagnostic, wrappers and inference input trace
+Current dev copy-over set — temporary SHAP workaround and existing diagnostics
 
-This is a ten-file overlay for an existing application, not a full checkout.
+This is an eleven-file overlay for an existing application, not a full checkout.
 The six runtime files are unchanged from dev 0252c40.
 
 LATEST UPDATE — ONLY THESE TWO FILES CHANGED
+mlops-models/scratch/shap_xgboost_workaround.py
+CHANGED_FILES.txt
+
+Paste the complete workaround block immediately before the existing
+shap.TreeExplainer(trained_model, ...) call in your model code. Keep that call
+and the subsequent shap_values code. Republish the Processing job's source
+with notebook 02 and rerun inference using the existing approved model.
+Native Transform uses its packaged code and needs that code updated separately.
+
+This is a temporary, process-local SHAP 0.49.1 decoder fix for single-output
+XGBoost models. It changes no model files, input data or installed packages.
+Remove it when platform delivers a tested compatible image. It deliberately
+rejects another SHAP version and multi-output/multiclass intercepts.
+
+Local checks reproduced the error with SHAP 0.49.1, XGBoost 3.4.1 and NumPy
+1.26.4. Binary and regression explanations then matched XGBoost's native exact
+and approximate contributions. Predictions and model bytes stayed unchanged.
+Customer model/container execution remains to be verified.
+
+PREVIOUS SHAP DIAGNOSTIC — STILL INCLUDED
 mlops-models/scratch/shap_xgboost_check.py
 CHANGED_FILES.txt
 
@@ -49,4 +69,5 @@ No rebuild is needed to run the diagnostic against existing job inputs.
 The earlier complete copy set remains in Git history at 8446108.
 No ZIPs, notebooks, tests, populated configs or captured outputs are included.
 The previous input-trace update passed 15 focused checks with simulated AWS.
-The new SHAP diagnostic was syntax-checked; the target environment is not yet verified.
+The earlier SHAP diagnostic was syntax-checked; the new workaround has the
+local validation described above.
