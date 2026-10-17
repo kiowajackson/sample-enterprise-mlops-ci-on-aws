@@ -1,9 +1,31 @@
-Current dev copy-over set — temporary SHAP workaround and existing diagnostics
+Current dev copy-over set — postprocess score columns and existing updates
 
-This is an eleven-file overlay for an existing application, not a full checkout.
-The six runtime files are unchanged from dev 0252c40.
+This is a twelve-file overlay for an existing application, not a full checkout.
+The six earlier runtime files are unchanged from dev 0252c40.
+The added postprocess file contains the current column-formatting fix.
 
 LATEST UPDATE — ONLY THESE TWO FILES CHANGED
+mlops-models/src/mlops_models/model_base/inference/postprocess.py
+CHANGED_FILES.txt
+
+Merge only postprocess() from the runtime file into your adapted copy; its
+container input/output functions and all entrypoints are unchanged.
+
+Score/result column names accept upper/lower/mixed case and become uppercase.
+Classification: SCORE is retained as PROBABILITY in the analysis output;
+PREDICTION is the 0/1 label at the configured threshold (default 0.5).
+Regression: PREDICTION remains the numeric estimate, unchanged. The legacy/demo
+SCORE name is renamed to PREDICTION without an inverse transform or threshold.
+Existing PREDICTION values are preserved. IDs and explanation columns keep
+their names and values. The original prediction CSVs remain untouched.
+
+Logs now print input/output column names and the first output score values.
+Republish with notebook 02 and rerun Processing inference. The focused cache
+check confirms postprocess edits preserve GetData/Preprocess/Score fingerprints;
+actual cache reuse still depends on the execution inputs and cache lifetime.
+22 local focused checks passed. Tests and captured logs are not on dev.
+
+PREVIOUS SHAP WORKAROUND — STILL INCLUDED
 mlops-models/scratch/shap_xgboost_workaround.py
 CHANGED_FILES.txt
 
