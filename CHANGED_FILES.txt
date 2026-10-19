@@ -1,95 +1,76 @@
-Current dev copy-over set — postprocess score columns and existing updates
+FIRST HANDOFF — EXACT BMO COPY-OVER UPDATE
 
-This is a twelve-file overlay for an existing application, not a full checkout.
-The six earlier runtime files are unchanged from dev 0252c40.
-The added postprocess file contains the current column-formatting fix.
+This dev commit is one incremental update for an existing complete application.
+Source checkpoint: 2220b14cd50e7041ced44c7eb490ec0838cba422
+Previous full-source baseline: 06572e708458e8f54777d16c64db159eab1b1562
+Previous dev commit: 010beda895ab62276c67a16a41488835924765ae
 
-LATEST UPDATE — ONLY THESE TWO FILES CHANGED
-mlops-models/src/mlops_models/model_base/inference/postprocess.py
-CHANGED_FILES.txt
+HOW TO REVIEW
 
-Merge only postprocess() from the runtime file into your adapted copy; its
-container input/output functions and all entrypoints are unchanged.
+1. Open this dev commit's Files changed view for the complete delivery.
+2. Open release/first-handoff-code.patch for precise code/configuration edits
+   against the previous full-source baseline. Some files appear as entirely new
+   in the dev commit because dev did not previously contain those full files.
+3. Review and merge those shared changes into the receiving repository,
+   preserving customer model adaptations and private notebooks/config.json.
+   The patch identifies generic source edits; it is not proof of the exact
+   receiving revision and should not be applied blindly over adapted code.
 
-Score/result column names accept upper/lower/mixed case and become uppercase.
-Classification: SCORE is retained as PROBABILITY in the analysis output;
-PREDICTION is the 0/1 label at the configured threshold (default 0.5).
-Regression: PREDICTION remains the numeric estimate, unchanged. The legacy/demo
-SCORE name is renamed to PREDICTION without an inverse transform or threshold.
-Existing PREDICTION values are preserved. IDs and explanation columns keep
-their names and values. The original prediction CSVs remain untouched.
+CODE / CONFIGURATION / OPTIONAL DEPENDENCIES — SEVEN FILES
 
-Logs now print input/output column names and the first output score values.
-Republish with notebook 02 and rerun Processing inference. The focused cache
-check confirms postprocess edits preserve GetData/Preprocess/Score fingerprints;
-actual cache reuse still depends on the execution inputs and cache lifetime.
-22 local focused checks passed. Tests and captured logs are not on dev.
+mlops-models/src/mlops_models/entrypoints/evaluate.py
+mlops-models/src/mlops_models/pipelines/source.py
+mlops-models/src/mlops_models/pipelines/tracking.py
+mlops-models/src/mlops_models/runtime/load_source.py
+notebooks/02_deploy_pipelines.ipynb
+notebooks/config.example.json
+requirements-tracking.txt
 
-PREVIOUS SHAP WORKAROUND — STILL INCLUDED
-mlops-models/scratch/shap_xgboost_workaround.py
-CHANGED_FILES.txt
+The loader adds the configured TMPDIR correction and producer records.
+Evaluate publishes available saved parameters and training provenance.
+The pipeline builder, tracking module, notebook and blank example setting add
+optional MLflow integration. Keep tracking_uri blank until service, client/image
+and actual caller access are accepted. requirements-tracking.txt is optional.
+Model algorithms and the existing customer deployment are unchanged by a copy
+or Git commit. Runtime publication is a later deliberate action.
 
-Paste the complete workaround block immediately before the existing
-shap.TreeExplainer(trained_model, ...) call in your model code. Keep that call
-and the subsequent shap_values code. Republish the Processing job's source
-with notebook 02 and rerun inference using the existing approved model.
-Native Transform uses its packaged code and needs that code updated separately.
+GUIDES AND SOURCE EXPORT — FIVE FILES
 
-This is a temporary, process-local SHAP 0.49.1 decoder fix for single-output
-XGBoost models. It changes no model files, input data or installed packages.
-Remove it when platform delivers a tested compatible image. It deliberately
-rejects another SHAP version and multi-output/multiclass intercepts.
-
-Local checks reproduced the error with SHAP 0.49.1, XGBoost 3.4.1 and NumPy
-1.26.4. Binary and regression explanations then matched XGBoost's native exact
-and approximate contributions. Predictions and model bytes stayed unchanged.
-Customer model/container execution remains to be verified.
-
-PREVIOUS SHAP DIAGNOSTIC — STILL INCLUDED
-mlops-models/scratch/shap_xgboost_check.py
-CHANGED_FILES.txt
-
-Paste the SHAP diagnostic immediately before your existing
-shap.TreeExplainer(trained_model, ...) call. It uses the Booster already held in
-trained_model and prints versions plus selected model configuration fields.
-It is not a standalone cell without that variable. It does not modify the model
-or dependencies. Rerun the failing prediction code to capture these diagnostics.
-
-PREVIOUS UPDATE — STILL INCLUDED
-mlops-models/scratch/trace_inference_inputs.py
 README.md
+docs/implementation/README.md
+docs/integration/README.md
+release/README.md
+release/export.py
+
+README.md starts with the existing deployment, diagrams, outputs/logs and code.
+docs/implementation/README.md retains detailed contracts.
+docs/integration/README.md sets out post-handoff requirements and decisions.
+The export helper/guide explicitly include the two guides and optional tracking
+requirements. The README's code links resolve in the complete receiving source.
+
+REVIEW AIDS — TWO FILES
+
 CHANGED_FILES.txt
+release/first-handoff-code.patch
 
-Paste the entire diagnostic into one notebook cell. Set SCORE_JOB_NAME and
-PREPROCESS_JOB_NAME to the failed Processing Score and its producing Preprocess
-job. For cached input, use the original producer. It checks the recorded source
-parameters and original/raw/prepared CSV headers and saves deployed model scripts
-locally. It reads AWS only; it does not rerun jobs. Pipeline source mode only.
-Native Transform and artifact code require inspecting the registered archive.
+EARLIER DEV FILES RETAINED WITHOUT CHANGES
 
-TRAINING PORT — ALREADY IMPLEMENTED IN THE INCLUDED BASE EXAMPLE
-In model_base/training/train.py, accept trainer_cls after * in train_model.
-Replace the ModelTraining(...) constructor call with trainer_cls(...), keeping
-your constructor arguments. The use-case wrapper already supplies the class.
-Keep your customer training body and existing metadata/evaluation outputs.
-
-EXISTING WRAPPERS — KEEP THESE ALIGNED IN YOUR MODEL FOLDERS
-mlops-models/src/mlops_models/models/usecase1/training/train.py
-mlops-models/src/mlops_models/models/usecase1/inference/predict.py
-mlops-models/src/mlops_models/models/usecase2/training/train.py
-mlops-models/src/mlops_models/models/usecase2/inference/predict.py
-
-BASE EXAMPLES — MERGE RELEVANT INTERFACE CHANGES INTO CUSTOMER CODE
-mlops-models/src/mlops_models/model_base/training/train.py
+mlops-models/scratch/shap_xgboost_check.py
+mlops-models/scratch/shap_xgboost_workaround.py
+mlops-models/scratch/trace_inference_inputs.py
+mlops-models/src/mlops_models/model_base/inference/postprocess.py
 mlops-models/src/mlops_models/model_base/inference/predict.py
+mlops-models/src/mlops_models/model_base/training/train.py
+mlops-models/src/mlops_models/models/usecase1/inference/predict.py
+mlops-models/src/mlops_models/models/usecase1/training/train.py
+mlops-models/src/mlops_models/models/usecase2/inference/predict.py
+mlops-models/src/mlops_models/models/usecase2/training/train.py
 
-Training uses ModelTraining/UseCaseModelTraining. Prediction wrappers import
-only predict_with_model; keep your customer prediction implementation.
-Rebuild with your existing notebook 02 after changing executable code.
-No rebuild is needed to run the diagnostic against existing job inputs.
+The full source checkpoint retains six development-test changes. Tests, private
+planning, populated configuration, captured execution outputs and customer
+code/data are excluded from this incremental dev update.
 
-The earlier complete copy set remains in Git history at 8446108.
-No ZIPs, notebooks, tests, populated configs or captured outputs are included.
-The previous input-trace update passed 15 focused checks with simulated AWS.
-The earlier SHAP diagnostic was syntax-checked; the new workaround has the
-local validation described above.
+Validation: eight notebook/configuration checks; six tracking-disabled graph
+comparisons; 62 internal guide links; three rendered diagrams; real temporary
+source-export inspection. Earlier managed training/cache results remain
+separate evidence. First receiving acceptance uses the existing deployment.
