@@ -260,8 +260,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                       feature_store_config_uri="", universe_data_root="",
                       data_source="feature_store", inference_data_source=None, csv_input_uri="", preparation_cache_revision="",
                       model_package_group="", environment="dev", registry_group_prefix="",
-                      include_hpo=False, step_cache_revisions=None, model_code_source="artifact",
-                      tracking=None):
+                      include_hpo=False, step_cache_revisions=None, model_code_source="artifact"):
     """Render training registration and inference from an approved Registry version."""
     if batch_runtime == "both":
         settings = dict(
@@ -281,8 +280,6 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             batch_runtime="transform", model_code_source="artifact", **settings)
         definitions["inference"] = combine_inference_runtimes(
             definitions["inference"], native["inference"])
-        configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
-                           s3_root, environment, infrastructure, region)
         return definitions
     data_sources = {"training": data_source, "inference": inference_data_source or data_source}
     if any(value not in {"feature_store", "csv_direct"} for value in data_sources.values()):
@@ -461,110 +458,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
         if kind == "training":
             configure_registration(body, source_uri, region)
         definitions[kind] = flatten_joins(body)
-    configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
-                       s3_root, environment, infrastructure, region)
     return definitions
-
-
-def configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
-                       s3_root, environment, infrastructure, region):
-    """Add tracking jobs to the pipeline definitions; do not launch them here.
-
-    1. Validate tracking settings and describe the Processing job command/inputs.
-    2. Place StartTracking before model work and a final job after each result branch.
-    3. Record the tracking configuration in the generated definition metadata.
-
-    When these jobs execute, python -m mlops_models.pipelines.tracking runs main(),
-    which reads the supplied pipeline execution ARN and updates its MLflow run.
-    """
-    from .tracking import validate_tracking
-
-    # 1. Resolve the optional settings; an empty value leaves tracking disabled.
-    tracking = validate_tracking(tracking)
-    if tracking is None:
-        return
-    infrastructure = infrastructure or {}
-    if infrastructure.get("network", {}).get("isolation"):
-        raise ValueError("MLflow tracking needs connectivity to its service and S3.")
-    for kind, body in definitions.items():
-        settings = {**tracking, "s3_root": s3_root, "environment": environment, "kind": kind,
-                    "kms_key": infrastructure.get("output_kms_key_arn", "")}
-
-        def observer(name, phase, dependencies=()):
-            """Build one tracking job's definition, including its command and runtime inputs."""
-            # The command enters tracking.main(). This only constructs request data.
-            args = {
-                "RoleArn": job_role,
-                # SageMaker adds its execution/token suffix to this literal prefix.
-                "ProcessingJobName": f"{namespace}-track-{phase}",
-                "AppSpecification": {
-                    "ImageUri": tracking.get("image_uri") or image,
-                    "ContainerEntrypoint": [
-                        "python", "-m", "mlops_models.pipelines.tracking", "--phase", phase,
-                    ],
-                },
-                "ProcessingInputs": [source_input(source_uri)],
-                "ProcessingResources": {"ClusterConfig": {
-                    "InstanceType": tracking.get("instance_type", "ml.m5.large"),
-                    "InstanceCount": 1, "VolumeSizeInGB": 30,
-                }},
-                "Environment": {
-                    "PYTHONPATH": "/opt/ml/processing/source", "PYTHONUNBUFFERED": "1",
-                    "AWS_DEFAULT_REGION": region,
-                    "PYTHONSAFEPATH": "1", "MLFLOW_HTTP_REQUEST_TIMEOUT": "15",
-                    "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "2",
-                    # main() reads these environment variables inside the job.
-                    # The Get expression is resolved for the running pipeline execution.
-                    # Processing limits each environment value to 256 characters.
-                    "MLOPS_TRACKING_URI": settings["uri"],
-                    "MLOPS_TRACKING_EXPERIMENT_PREFIX": settings["experiment_prefix"],
-                    "MLOPS_TRACKING_S3_ROOT": settings["s3_root"],
-                    "MLOPS_TRACKING_ENVIRONMENT": settings["environment"],
-                    "MLOPS_TRACKING_KIND": settings["kind"],
-                    "MLOPS_TRACKING_KMS_KEY": settings["kms_key"],
-                    "PIPELINE_EXECUTION_ARN": {"Get": "Execution.PipelineExecutionArn"},
-                },
-                "StoppingCondition": {"MaxRuntimeInSeconds": 600},
-            }
-            network = infrastructure.get("network", {})
-            if network.get("subnet_ids"):
-                args["NetworkConfig"] = {"EnableNetworkIsolation": False, "VpcConfig": {
-                    "Subnets": network["subnet_ids"], "SecurityGroupIds": network["security_group_ids"],
-                }}
-            if infrastructure.get("volume_kms_key_arn"):
-                args["ProcessingResources"]["ClusterConfig"]["VolumeKmsKeyId"] = infrastructure["volume_kms_key_arn"]
-            step = {"Name": name, "Type": "Processing", "Arguments": args}
-            if dependencies:
-                step["DependsOn"] = list(dependencies)
-            return step
-
-        # 2. Wire the jobs into the graph. StartTracking checks job-role access and
-        # creates/updates the MLflow run before expensive model work begins.
-        for step in body["Steps"]:
-            if step["Name"] in {"GetData", "ResolveModel"}:
-                step.setdefault("DependsOn", []).append("StartTracking")
-        body["Steps"].insert(0, observer("StartTracking", "start"))
-
-        endings = {"RegisterModel": "TrackTraining", "RegisterTunedModel": "TrackTunedTraining",
-                   "Postprocess": "TrackInference", "PostprocessTransform": "TrackTransform"}
-
-        def add_finish(steps):
-            """Append a final tracking job after each successful result branch."""
-            for step in list(steps):
-                if step["Name"] in endings:
-                    steps.append(observer(endings[step["Name"]], "finish", [step["Name"]]))
-                if step["Type"] == "Condition":
-                    for branch in ("IfSteps", "ElseSteps"):
-                        add_finish(step["Arguments"].get(branch, []))
-
-        add_finish(body["Steps"])
-
-        # 3. Retain the tracking settings in the published pipeline definition.
-        # Pipeline Metadata values are strings, including structured settings.
-        body["Metadata"]["Tracking"] = json.dumps({
-            "uri": tracking["uri"], "experiment_prefix": tracking["experiment_prefix"],
-            "status_reconciliation": "sync_execution for failed/stopped executions",
-        }, sort_keys=True)
 
 
 def combine_inference_runtimes(processing, transform):
