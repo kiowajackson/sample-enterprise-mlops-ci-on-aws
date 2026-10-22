@@ -116,10 +116,10 @@ class PipelineCache(unittest.TestCase):
                 (model / "weights").write_text("saved model")
                 (Path(os.environ["SM_OUTPUT_DATA_DIR"]) / "metrics.json").write_text("{}")
             env = {"MLOPS_STEP_REVISION": "train-v1", "MLOPS_TRAINING_OUTPUT_UPLOAD": "application",
-                   "TRAINING_JOB_NAME": "own-job",
+                   "TRAINING_JOB_NAME": "own-job", "TMPDIR": str(root),
                    "TRAINING_JOB_ARN": "arn:aws:sagemaker:us-east-1:123456789012:training-job/own-job"}
             def scratch(**kwargs):
-                self.assertEqual(kwargs["dir"], "/var/tmp")
+                self.assertEqual(kwargs["dir"], str(root))
                 return TemporaryDirectory(prefix=kwargs["prefix"], dir=root)
             with patch.dict(os.environ, env), patch.object(load_source, "__file__", str(root / "load_source.py")), \
                     patch.object(sys, "argv", ["load_source.py", "train"]), \

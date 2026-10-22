@@ -10,8 +10,11 @@ The exporter packages current working files, including staged edits. It does
 not imply that those bytes match the last commit or have passed a cloud run.
 The checksum identifies the exact ZIP. An existing ZIP is not overwritten.
 
-The source includes README guides, code, templates, configurations, dependency
-declarations, synthetic CSVs and clean notebooks. Non-README Markdown, hidden
+The source includes the root README, the implementation and integration
+guides under docs/, code, templates, configurations, dependency declarations
+(including optional requirements-tracking.txt), synthetic CSVs and clean notebooks.
+ Only the two explicitly listed docs/ guides are included; other planning
+documents stay excluded. Non-README Markdown in the source folders, hidden
 working directories, deployment receipts, generated definitions and Git history
 are excluded. Notebook outputs, execution counts and transient metadata are
 removed during export.
