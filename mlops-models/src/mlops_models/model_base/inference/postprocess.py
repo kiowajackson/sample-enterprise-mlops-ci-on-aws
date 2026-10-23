@@ -2,50 +2,60 @@
 
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pandas as pd
 
 
 def postprocess_predictions(data_directory, selection_file, prediction_directory, output_directory,
-                            config, *, format_predictions, chunk_rows=10000, prediction_format="csv"):
-    """Replace the analysis; its inputs come from this inference execution's producers."""
-    data_path, selected_features, predictions = get_container_input(
-        data_directory, selection_file, prediction_directory, config,
-        prediction_format=prediction_format)
-    result = format_predictions(data_path, selected_features, predictions, config)
-    return write_container_output(result, output_directory, config)
+                            config, *, run_analysis, chunk_rows=10000, prediction_format="csv"):
+    """Resolve input paths, let analysis write its files, then check the output directory."""
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="postprocess-inputs-") as temporary:
+        source = Path(prediction_directory)
+        if prediction_format == "jsonlines":
+            # Preserve the existing Transform adapter. Only its selected response
+            # file survives serving; these are temporary compatibility CSVs,
+            # not the full set of files produced by Processing prediction.
+            frames = list(read_predictions(source, chunk_rows))
+            if not frames:
+                raise ValueError("No Transform predictions were found.")
+            result = pd.concat(frames, ignore_index=True)
+            source = Path(temporary)
+            result.to_csv(source / "predictions.csv", index=False)
+            result.to_csv(source / "messaging_final.csv", index=False)
+            result[[config["primary_key"]]].to_csv(source / "messaging.csv", index=False)
+        elif prediction_format != "csv":
+            raise ValueError("prediction_format must be csv or jsonlines.")
+        data_path, selection_path, predictions = get_container_input(
+            data_directory, selection_file, source)
+        # The use-case wrapper supplies run_analysis=postprocess directly.
+        # Customer analysis reads these paths and writes under output; no return is required.
+        run_analysis(data_path, selection_path, predictions, output, config)
+    return write_container_output(output)
 
 
-def get_container_input(data_directory, selection_file, prediction_directory, config, *, prediction_format="csv"):
-    """Read every prediction CSV, keyed by its path relative to the prediction root."""
+def get_container_input(data_directory, selection_file, prediction_directory):
+    """Resolve files without loading them; prediction keys retain their relative subfolders."""
     data_path = Path(data_directory) / "data.csv"
     if not data_path.is_file():
         raise FileNotFoundError(f"Postprocess needs the original GetData snapshot: {data_path}")
-    selected = pd.read_csv(selection_file, keep_default_na=False)
+    selection_path = Path(selection_file)
+    if not selection_path.is_file():
+        raise FileNotFoundError(f"Postprocess needs the saved selected-feature CSV: {selection_path}")
     source = Path(prediction_directory)
-    if prediction_format == "csv":
-        files = sorted(path for path in source.rglob("*")
-                       if path.is_file() and path.suffix.lower() == ".csv")
-        if not files:
-            raise FileNotFoundError(f"Postprocess found no prediction CSV files under: {source}")
-        predictions = {}
-        for path in files:
-            name = path.relative_to(source).as_posix()
-            print(json.dumps({"event": "prediction_input_csv", "path": str(path),
-                              "relative_path": name}), flush=True)
-            predictions[name] = pd.read_csv(path, dtype={config["primary_key"]: str},
-                                           keep_default_na=False, na_values=["", r"\N"])
-    elif prediction_format == "jsonlines":
-        # Native Transform returns line outputs, not the Processing model's three CSVs.
-        frames = list(read_predictions(source, 10000))
-        if not frames:
-            raise ValueError("No Transform predictions were found.")
-        result = pd.concat(frames, ignore_index=True)
-        predictions = {"predictions.csv": result, "messaging_final.csv": result,
-                       "messaging.csv": result[[config["primary_key"]]].copy()}
-    else:
-        raise ValueError("prediction_format must be csv or jsonlines.")
-    return data_path, selected, predictions
+    files = sorted(path for path in source.rglob("*")
+                   if path.is_file() and path.suffix.lower() == ".csv")
+    if not files:
+        raise FileNotFoundError(f"Postprocess found no prediction CSV files under: {source}")
+    predictions = {}
+    for path in files:
+        name = path.relative_to(source).as_posix()
+        print(json.dumps({"event": "prediction_input_csv", "path": str(path),
+                          "relative_path": name}), flush=True)
+        predictions[name] = path
+    return data_path, selection_path, predictions
 
 
 def read_predictions(source, chunk_rows):
@@ -59,28 +69,35 @@ def read_predictions(source, chunk_rows):
                     yield pd.DataFrame(records)
 
 
-def write_container_output(result, output, config):
-    """Publish the final analysis/leads file; the loader uploads this output directory."""
+def write_container_output(output):
+    """Check and log all analysis files; the loader uploads them without rewriting them."""
     output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-    if result.empty:
-        raise ValueError("Prediction analysis returned no rows.")
-    path = output / "prediction_analysis.csv"
-    result.to_csv(path, index=False)
-    (output / "summary.json").write_text(json.dumps({
-        "rows": len(result), "task": config["task_type"], "file": path.name}) + "\n")
-    return path
+    files = sorted(path for path in output.rglob("*") if path.is_file())
+    if not files:
+        raise FileNotFoundError(f"Prediction analysis wrote no files under: {output}")
+    for path in files:
+        print(json.dumps({"event": "prediction_analysis_output", "path": str(path),
+                          "relative_path": path.relative_to(output).as_posix()}), flush=True)
+    return output
 
 
-def postprocess(data_path, selected_features, predictions, config) -> pd.DataFrame:
-    """Replace with customer analysis using the raw CSV, selection and prediction files."""
+def postprocess(data_path, selection_file, predictions, output_directory, config):
+    """Replace this demo with prediction analysis using explicit input and output paths.
+
+    predictions maps relative CSV names to Paths, for example:
+    {"output/predictions.csv": Path(...), "output/messaging_final.csv": Path(...)}.
+    Pass those paths to the customer's analysis instead of reconstructing old
+    notebook folders. Set its destination to output_directory and retain its
+    plot/report writes there. Model-specific names/settings belong in config.
+    """
     # Only this example analysis chooses a particular input; the reader accepts all CSVs.
     matches = [name for name in predictions if Path(name).name.lower() == "messaging_final.csv"]
     if len(matches) != 1:
         raise ValueError("Example analysis needs exactly one messaging_final.csv at any depth; "
                          f"found {len(matches)}. Available CSVs: {list(predictions)}. "
                          "Adapt postprocess() to select the files required by your analysis.")
-    df = predictions[matches[0]].copy()
+    df = pd.read_csv(predictions[matches[0]], dtype={config["primary_key"]: str},
+                     keep_default_na=False, na_values=["", r"\N"])
     task = config["task_type"]
     print(json.dumps({"event": "postprocess_input_columns", "file": matches[0],
                       "task": task, "columns": list(df.columns)}), flush=True)
@@ -113,4 +130,11 @@ def postprocess(data_path, selected_features, predictions, config) -> pd.DataFra
               if column in df and not df.empty}
     print(json.dumps({"event": "postprocess_output_columns", "columns": list(df.columns),
                       "first_scores": sample}), flush=True)
-    return df
+    if df.empty:
+        raise ValueError("Prediction analysis returned no rows.")
+    # These are demo outputs, not mandatory filenames for a customer analysis.
+    output = Path(output_directory)
+    path = output / "prediction_analysis.csv"
+    df.to_csv(path, index=False)
+    (output / "summary.json").write_text(json.dumps({
+        "rows": len(df), "task": task, "file": path.name}) + "\n")

@@ -176,7 +176,7 @@ class ModelHandoff(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "tuning settings"):
                     self.definitions(include_hpo=True)
 
-    def test_renaming_changes_source_prefix_but_training_edits_do_not(self):
+    def test_content_edits_and_renames_both_change_source_prefix(self):
         identity = {"mode": "direct-deploy", "name": "review"}
         with TemporaryDirectory() as directory:
             package = Path(directory)
@@ -185,10 +185,12 @@ class ModelHandoff(unittest.TestCase):
             train.write_text("first")
             with patch.object(source, "PACKAGE", package):
                 original = source.source_location("s3://bucket/review", identity)
-                train.write_text("second")
                 self.assertEqual(original, source.source_location("s3://bucket/review", identity))
+                train.write_text("second")
+                edited = source.source_location("s3://bucket/review", identity)
+                self.assertNotEqual(original, edited)
                 train.parent.rename(package / "models/renamed")
-                self.assertNotEqual(original, source.source_location("s3://bucket/review", identity))
+                self.assertNotEqual(edited, source.source_location("s3://bucket/review", identity))
 
     def test_evaluation_publishes_saved_metrics_without_prediction_inputs(self):
         from mlops_models.model_base.training.evaluate import evaluate

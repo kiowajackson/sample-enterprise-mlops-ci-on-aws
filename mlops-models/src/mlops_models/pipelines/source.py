@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 
+from botocore.exceptions import ClientError
 from mlops_skeleton.names import discover_models, validate_namespace
 from mlops_skeleton.pipelines import load_definition, walk_steps, apply_job_settings
 from mlops_models.storage import data_prefix, s3_location
@@ -40,17 +41,17 @@ def source_identity(mode, name, commit=""):
 
 
 def source_location(s3_root, identity):
-    """Return the planned S3 source prefix without reading or writing S3."""
+    """Address the exact source bytes and identity, without reading or writing S3."""
+    _, revision = source_snapshot(identity)
+    return source_prefix(s3_root, identity, revision)
+
+
+def source_prefix(s3_root, identity, revision):
     data_prefix({"prefix": s3_location(s3_root)[1]})
     suffix = f"source/{identity['mode']}/{identity['name']}"
     if identity["mode"] == "ci-deploy":
         suffix += "/" + identity["commit"]
-    else:
-        # A new set of files needs a fresh prefix: S3 uploads do not remove old names.
-        names = [path.relative_to(PACKAGE).as_posix() for path in source_files()]
-        layout = hashlib.sha256("\n".join(names).encode()).hexdigest()[:16]
-        suffix += "/files-" + layout
-    return s3_root.rstrip("/") + "/" + suffix
+    return s3_root.rstrip("/") + "/" + suffix + "/sha256-" + revision
 
 
 def source_files():
@@ -61,17 +62,42 @@ def source_files():
                         for part in path.relative_to(PACKAGE).parts)]
 
 
-def upload_source(session, s3_root, identity):
-    """Upload the complete importable package and the tracked source loader to one prefix."""
-    uri = source_location(s3_root, identity)
+def source_snapshot(identity):
+    """Read once so the address and uploaded bytes describe the same snapshot."""
+    files = {path.relative_to(PACKAGE).as_posix(): path.read_bytes() for path in source_files()}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode())
+    for name, body in files.items():
+        digest.update(json.dumps([name, len(body)]).encode())
+        digest.update(body)
+    return files, digest.hexdigest()
+
+
+def put_immutable(s3, bucket, key, body, **settings):
+    """Create an object, or verify an identical existing object; never overwrite it."""
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=body, IfNoneMatch="*", **settings)
+    except ClientError as error:
+        if error.response["Error"]["Code"] not in {"PreconditionFailed", "412"}:
+            raise
+        with s3.get_object(Bucket=bucket, Key=key)["Body"] as stream:
+            if stream.read() != body:
+                raise ValueError(f"Refusing to replace different bytes at s3://{bucket}/{key}.") from error
+
+
+def upload_source(session, s3_root, identity, *, expected_uri=None):
+    """Publish one immutable snapshot; an interrupted upload can be safely repeated."""
+    files, revision = source_snapshot(identity)
+    uri = source_prefix(s3_root, identity, revision)
+    if expected_uri is not None and uri != expected_uri:
+        raise ValueError("Source changed after preview; rerun the preparation and definition cells before publishing.")
     bucket, prefix = s3_location(uri)
     s3 = session.client("s3")
-    for path in source_files():
-        relative = path.relative_to(PACKAGE)
-        s3.upload_file(str(path), bucket, f"{prefix}/{PACKAGE.name}/{relative.as_posix()}")
-    s3.upload_file(str(PACKAGE / "runtime/load_source.py"), bucket, prefix + "/load_source.py")
-    s3.put_object(Bucket=bucket, Key=prefix + "/source.json",
-                  Body=(json.dumps(identity, indent=2) + "\n").encode())
+    for relative, body in files.items():
+        put_immutable(s3, bucket, f"{prefix}/{PACKAGE.name}/{relative}", body)
+    put_immutable(s3, bucket, prefix + "/load_source.py", files["runtime/load_source.py"])
+    # Publish the identity last, after every runtime file is present.
+    put_immutable(s3, bucket, prefix + "/source.json",
+                  (json.dumps(identity, sort_keys=True, indent=2) + "\n").encode())
     return uri
 
 
@@ -260,7 +286,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                       feature_store_config_uri="", universe_data_root="",
                       data_source="feature_store", inference_data_source=None, csv_input_uri="", preparation_cache_revision="",
                       model_package_group="", environment="dev", registry_group_prefix="",
-                      include_hpo=False, step_cache_revisions=None, model_code_source="artifact"):
+                      include_hpo=False, step_cache_revisions=None, model_code_source="artifact",
+                      tracking=None):
     """Render training registration and inference from an approved Registry version."""
     if batch_runtime == "both":
         settings = dict(
@@ -280,6 +307,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             batch_runtime="transform", model_code_source="artifact", **settings)
         definitions["inference"] = combine_inference_runtimes(
             definitions["inference"], native["inference"])
+        configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
+                           s3_root, environment, infrastructure, region)
         return definitions
     data_sources = {"training": data_source, "inference": inference_data_source or data_source}
     if any(value not in {"feature_store", "csv_direct"} for value in data_sources.values()):
@@ -458,7 +487,110 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
         if kind == "training":
             configure_registration(body, source_uri, region)
         definitions[kind] = flatten_joins(body)
+    configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
+                       s3_root, environment, infrastructure, region)
     return definitions
+
+
+def configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
+                       s3_root, environment, infrastructure, region):
+    """Add tracking jobs to the pipeline definitions; do not launch them here.
+
+    1. Validate tracking settings and describe the Processing job command/inputs.
+    2. Place StartTracking before model work and a final job after each result branch.
+    3. Record the tracking configuration in the generated definition metadata.
+
+    When these jobs execute, python -m mlops_models.pipelines.tracking runs main(),
+    which reads the supplied pipeline execution ARN and updates its MLflow run.
+    """
+    from .tracking import validate_tracking
+
+    # 1. Resolve the optional settings; an empty value leaves tracking disabled.
+    tracking = validate_tracking(tracking)
+    if tracking is None:
+        return
+    infrastructure = infrastructure or {}
+    if infrastructure.get("network", {}).get("isolation"):
+        raise ValueError("MLflow tracking needs connectivity to its service and S3.")
+    for kind, body in definitions.items():
+        settings = {**tracking, "s3_root": s3_root, "environment": environment, "kind": kind,
+                    "kms_key": infrastructure.get("output_kms_key_arn", "")}
+
+        def observer(name, phase, dependencies=()):
+            """Build one tracking job's definition, including its command and runtime inputs."""
+            # The command enters tracking.main(). This only constructs request data.
+            args = {
+                "RoleArn": job_role,
+                # SageMaker adds its execution/token suffix to this literal prefix.
+                "ProcessingJobName": f"{namespace}-track-{phase}",
+                "AppSpecification": {
+                    "ImageUri": tracking.get("image_uri") or image,
+                    "ContainerEntrypoint": [
+                        "python", "-m", "mlops_models.pipelines.tracking", "--phase", phase,
+                    ],
+                },
+                "ProcessingInputs": [source_input(source_uri)],
+                "ProcessingResources": {"ClusterConfig": {
+                    "InstanceType": tracking.get("instance_type", "ml.m5.large"),
+                    "InstanceCount": 1, "VolumeSizeInGB": 30,
+                }},
+                "Environment": {
+                    "PYTHONPATH": "/opt/ml/processing/source", "PYTHONUNBUFFERED": "1",
+                    "AWS_DEFAULT_REGION": region,
+                    "PYTHONSAFEPATH": "1", "MLFLOW_HTTP_REQUEST_TIMEOUT": "15",
+                    "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "2",
+                    # main() reads these environment variables inside the job.
+                    # The Get expression is resolved for the running pipeline execution.
+                    # Processing limits each environment value to 256 characters.
+                    "MLOPS_TRACKING_URI": settings["uri"],
+                    "MLOPS_TRACKING_EXPERIMENT_PREFIX": settings["experiment_prefix"],
+                    "MLOPS_TRACKING_S3_ROOT": settings["s3_root"],
+                    "MLOPS_TRACKING_ENVIRONMENT": settings["environment"],
+                    "MLOPS_TRACKING_KIND": settings["kind"],
+                    "MLOPS_TRACKING_KMS_KEY": settings["kms_key"],
+                    "PIPELINE_EXECUTION_ARN": {"Get": "Execution.PipelineExecutionArn"},
+                },
+                "StoppingCondition": {"MaxRuntimeInSeconds": 600},
+            }
+            network = infrastructure.get("network", {})
+            if network.get("subnet_ids"):
+                args["NetworkConfig"] = {"EnableNetworkIsolation": False, "VpcConfig": {
+                    "Subnets": network["subnet_ids"], "SecurityGroupIds": network["security_group_ids"],
+                }}
+            if infrastructure.get("volume_kms_key_arn"):
+                args["ProcessingResources"]["ClusterConfig"]["VolumeKmsKeyId"] = infrastructure["volume_kms_key_arn"]
+            step = {"Name": name, "Type": "Processing", "Arguments": args}
+            if dependencies:
+                step["DependsOn"] = list(dependencies)
+            return step
+
+        # 2. Wire the jobs into the graph. StartTracking checks job-role access and
+        # creates/updates the MLflow run before expensive model work begins.
+        for step in body["Steps"]:
+            if step["Name"] in {"GetData", "ResolveModel"}:
+                step.setdefault("DependsOn", []).append("StartTracking")
+        body["Steps"].insert(0, observer("StartTracking", "start"))
+
+        endings = {"RegisterModel": "TrackTraining", "RegisterTunedModel": "TrackTunedTraining",
+                   "Postprocess": "TrackInference", "PostprocessTransform": "TrackTransform"}
+
+        def add_finish(steps):
+            """Append a final tracking job after each successful result branch."""
+            for step in list(steps):
+                if step["Name"] in endings:
+                    steps.append(observer(endings[step["Name"]], "finish", [step["Name"]]))
+                if step["Type"] == "Condition":
+                    for branch in ("IfSteps", "ElseSteps"):
+                        add_finish(step["Arguments"].get(branch, []))
+
+        add_finish(body["Steps"])
+
+        # 3. Retain the tracking settings in the published pipeline definition.
+        # Pipeline Metadata values are strings, including structured settings.
+        body["Metadata"]["Tracking"] = json.dumps({
+            "uri": tracking["uri"], "experiment_prefix": tracking["experiment_prefix"],
+            "status_reconciliation": "optional operations/completion adapter; sync_execution for operator replay",
+        }, sort_keys=True)
 
 
 def combine_inference_runtimes(processing, transform):

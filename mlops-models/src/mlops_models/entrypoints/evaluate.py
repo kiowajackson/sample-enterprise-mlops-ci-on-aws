@@ -56,25 +56,63 @@ def remove_unpacked_inputs(work):
 
 
 def evaluate_saved_model(model_id, model_dir, test_file, output):
-    """Publish saved scores using the selected use case's current quality thresholds."""
+    """Assemble the evaluation report and files consumed by Registry and tracking.
+
+    1. Load this use case's settings and evaluation function.
+    2. Call that function, then add source details and the quality-gate result.
+    3. Copy the model's metadata/settings/run record and write the completed report.
+
+    The default evaluation function reads scores saved during training. It does
+    not load the predictor or score another dataset; test_file is None for it.
+    """
+    # 1. Read the use-case settings and import its evaluation function.
     model_folder = Path(__file__).parents[1] / "models" / model_id
     config = json.loads((model_folder / "parameters.json").read_text())
     config["model_id"] = model_id
     evaluate = import_module(
         f"mlops_models.models.{model_id}.training.evaluate"
     ).use_case_evaluate
+
+    # 2. Delegate to the use case and receive its report dictionary.
+    # The default function also writes a report; we add fields and save it below.
     report = evaluate(test_file, model_dir, output, config)
+
+    # Add the model location and the code versions used for training/evaluation.
     report["checkpoint_uri"] = os.getenv("CHECKPOINT_URI", str(model_dir))
     identity_path = model_dir / "code/source.json"
     model_source = json.loads(identity_path.read_text()) if identity_path.is_file() else {}
     report["model_source_commit"] = model_source.get("commit", "unknown")
     report["model_source_dirty"] = str(model_source.get("dirty", True)).lower()
     report["evaluation_source_commit"] = os.getenv("SOURCE_COMMIT", "unknown")
+
+    # Compare the returned scores with configured limits; this is the quality gate.
     report["quality"] = check_quality_thresholds(report, config.get("quality_gate", {}))
-    # Keep a directly readable copy associated with this exact evaluated model.
+
+    # 3. Copy supporting files into this job's output directory for later upload.
+    # Validate metadata as JSON, but copy its original bytes so its checksum matches.
     metadata = (model_dir / "model_metadata.json").read_bytes()
     json.loads(metadata)
     (Path(output) / "model_metadata.json").write_bytes(metadata)
+
+    # These are the settings saved with the trained model. The config above holds
+    # the selected evaluator's settings; they are separate files and can differ.
+    # Older model packages may omit this file, so record whether it is available.
+    parameter_file = model_dir / "parameters.json"
+    report["effective_parameters_available"] = parameter_file.is_file()
+    if parameter_file.is_file():
+        parameters = parameter_file.read_bytes()
+        json.loads(parameters)
+        (Path(output) / "parameters.json").write_bytes(parameters)
+
+    # The loader wrote _execution.json when training finished: code/settings/run
+    # details identifying what produced the model. Older packages may lack it.
+    # Here provenance is a local Path; is_file() only checks whether it exists.
+    provenance = model_dir / "_execution.json"
+    if provenance.is_file():
+        (Path(output) / "training_execution.json").write_bytes(provenance.read_bytes())
+
+    # Save the final report, including the metadata checksum for Registry lookup.
+    # load_source.py uploads these local output files to S3 after this returns.
     report["model_metadata_sha256"] = hashlib.sha256(metadata).hexdigest()
     (Path(output) / "evaluation.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     return report

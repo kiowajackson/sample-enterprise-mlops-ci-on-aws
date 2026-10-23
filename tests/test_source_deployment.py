@@ -21,6 +21,8 @@ from mlops_models.registry.model_package import resolve_latest_approved_model
 from mlops_models.pipelines.source import build_definitions, source_identity, upload_source
 from mlops_skeleton.pipelines import walk_steps
 from model_fixtures import MODELS
+from test_execution_tracking import S3
+from mlops_models.pipelines import source
 
 
 class SourceDeployment(unittest.TestCase):
@@ -222,21 +224,69 @@ class SourceDeployment(unittest.TestCase):
             self.assertFalse(source_identity("ci-deploy", "release", "a" * 40)["dirty"])
 
     def test_source_upload_contains_importable_package_and_tracked_loader(self):
-        uploads = {}
-        def capture(path, bucket, key):
-            uploads[key] = Path(path).read_bytes()
-        session = Mock()
-        session.client.return_value.upload_file.side_effect = capture
+        s3 = S3()
+        session = SimpleNamespace(client=lambda name: s3)
         uri = upload_source(session, "s3://bucket/app", self.identity)
-        self.assertTrue(uri.startswith("s3://bucket/app/source/direct-deploy/review/files-"))
+        uploads = {key: body for (bucket, key), body in s3.objects.items()}
+        self.assertTrue(uri.startswith("s3://bucket/app/source/direct-deploy/review/sha256-"))
         prefix = uri.removeprefix("s3://bucket/")
         self.assertIn(prefix + f"/mlops_models/models/{MODELS[0].name}/parameters.json", uploads)
         self.assertEqual(uploads[prefix + "/load_source.py"],
                          (ROOT / "mlops-models/src/mlops_models/runtime/load_source.py").read_bytes())
         self.assertIn(prefix + "/mlops_models/entrypoints/get_data.py", uploads)
         self.assertFalse(any("/mlops_features/" in key for key in uploads))
-        request = session.client.return_value.put_object.call_args.kwargs
-        self.assertEqual(json.loads(request["Body"]), self.identity)
+        self.assertEqual(json.loads(uploads[prefix + "/source.json"]), self.identity)
+        self.assertEqual(uri, upload_source(session, "s3://bucket/app", self.identity))
+        self.assertEqual(uploads, {key: body for (bucket, key), body in s3.objects.items()})
+
+    def test_changed_preview_and_conflicting_objects_are_not_overwritten(self):
+        s3 = S3()
+        session = SimpleNamespace(client=lambda name: s3)
+        with TemporaryDirectory() as directory:
+            package = Path(directory) / "mlops_models"
+            loader = package / "runtime/load_source.py"
+            loader.parent.mkdir(parents=True)
+            loader.write_text("original")
+            with patch.object(source, "PACKAGE", package):
+                before = source.source_location("s3://bucket/app", self.identity)
+                loader.write_text("updated")
+                with self.assertRaisesRegex(ValueError, "Source changed after preview"):
+                    upload_source(session, "s3://bucket/app", self.identity, expected_uri=before)
+                self.assertFalse(s3.objects)
+                after = upload_source(session, "s3://bucket/app", self.identity)
+                self.assertNotEqual(before, after)
+                key = after.removeprefix("s3://bucket/") + "/mlops_models/runtime/load_source.py"
+                s3.objects["bucket", key] = b"unexpected"
+                with self.assertRaisesRegex(ValueError, "Refusing to replace different bytes"):
+                    upload_source(session, "s3://bucket/app", self.identity)
+                self.assertEqual(s3.objects["bucket", key], b"unexpected")
+
+    def test_upload_uses_captured_bytes_and_can_resume_after_interruption(self):
+        s3 = S3()
+        session = SimpleNamespace(client=lambda name: s3)
+        with TemporaryDirectory() as directory:
+            package = Path(directory) / "mlops_models"
+            loader = package / "runtime/load_source.py"
+            loader.parent.mkdir(parents=True)
+            loader.write_text("captured")
+            original_put = s3.put_object
+            def interrupt(**request):
+                original_put(**request)
+                raise RuntimeError("interrupted")
+            with patch.object(source, "PACKAGE", package):
+                with patch.object(s3, "put_object", side_effect=interrupt):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                        upload_source(session, "s3://bucket/app", self.identity)
+                self.assertFalse(any(key.endswith("/source.json") for bucket, key in s3.objects))
+                before = dict(s3.objects)
+                uri = upload_source(session, "s3://bucket/app", self.identity)
+                self.assertTrue(all(s3.objects[key] == value for key, value in before.items()))
+                snapshot = source.source_snapshot(self.identity)
+                loader.write_text("changed after snapshot")
+                with patch.object(source, "source_snapshot", return_value=snapshot):
+                    self.assertEqual(uri, upload_source(session, "s3://bucket/app", self.identity))
+                self.assertTrue(all(body == b"captured" for (bucket, key), body in s3.objects.items()
+                                    if key.endswith(".py")))
 
     def test_evaluation_loader_uses_checkpoint_source_over_uploaded_source(self):
         with TemporaryDirectory() as work:

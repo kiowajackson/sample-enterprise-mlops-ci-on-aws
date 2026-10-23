@@ -168,6 +168,22 @@ class SavedTrainingMetrics(unittest.TestCase):
             self.assertFalse((root / "output/evaluation.json").exists())
             self.assertFalse((root / "output/unpacked").exists())
 
+    def test_effective_parameters_and_training_provenance_are_copied_from_model(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model"
+            model.mkdir()
+            (model / "evaluation.json").write_text(json.dumps(self.report()))
+            (model / "model_metadata.json").write_text("{}")
+            parameters = b'{"task_type":"regression","num_cpus":17,"fitted_setting":"retained"}\n'
+            (model / "parameters.json").write_bytes(parameters)
+            (model / "_execution.json").write_text('{"source":{"commit":"training-source"}}')
+            report = entrypoint.execute(REGRESSION_MODEL, model, root / "output", input_path=None)
+            self.assertTrue(report["effective_parameters_available"])
+            self.assertEqual((root / "output/parameters.json").read_bytes(), parameters)
+            self.assertEqual((root / "output/training_execution.json").read_bytes(),
+                             (model / "_execution.json").read_bytes())
+
     def test_wrong_model_task_or_bad_metric_stops_publication(self):
         for change in ({"model_id": "wrong"}, {"task": "classification"},
                        {"metrics": {}}, {"metrics": {"r2": float("nan")}},
