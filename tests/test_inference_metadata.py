@@ -68,9 +68,9 @@ class InferenceMetadata(unittest.TestCase):
                 scores = predict.execute(REGRESSION_MODEL, prepared, model, root / "scores")
             load.assert_called_once_with(str(model.resolve()))
             final = postprocess.execute(REGRESSION_MODEL, scores, root / "final", model_dir=model, data_directory=raw.parent, selection_file=root / "prepared/selection/selected_features.csv")
-            df = pd.read_csv(final / "prediction_analysis.csv", dtype={"id": str})
+            df = pd.read_csv(final, dtype={"id": str})
             self.assertEqual(df.to_dict("list"),
-                             {"id": ["0001", "0002", "0003"], "PREDICTION": [6, 8, 10]})
+                             {"id": ["0001", "0002", "0003"], "prediction": [6, 8, 10]})
             for call in fitted.predict.call_args_list:
                 self.assertEqual(call.args[0].columns.tolist(), ["VALUE"])
 

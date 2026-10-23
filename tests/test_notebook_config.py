@@ -64,7 +64,7 @@ class NotebookConfiguration(unittest.TestCase):
                 settings = json.loads(self.path.read_text())
                 self.assertEqual(settings, dict.fromkeys((
                     "metadata_csv", "bucket", "role_arn", "image_uri",
-                    "csv_input", "feature_store_config_uri", "registry_group_prefix", "tracking_uri",
+                    "csv_input", "feature_store_config_uri", "registry_group_prefix",
                 ), ""))
 
     def test_saved_inputs_are_used_but_optional_settings_come_from_notebooks(self):
@@ -72,8 +72,7 @@ class NotebookConfiguration(unittest.TestCase):
                   feature_store_role_arn="writer-role", image_uri="existing-image",
                   csv_input="sample.csv", namespace="review", registry_group_prefix="long-team-prefix-",
                   sample_rows=7, cache_steps=False, batch_runtime="processing",
-                  model_code_source="artifact", custom_setting={"keep": "this"},
-                  tracking_uri="arn:aws:sagemaker:us-east-1:123456789012:mlflow-tracking-server/test")
+                  model_code_source="artifact", custom_setting={"keep": "this"})
         before = self.path.read_bytes()
         first, second = self.load(PREPARE), self.load(DEPLOY)
         self.assertEqual(first["metadata_csv"], "table.csv")
@@ -90,32 +89,7 @@ class NotebookConfiguration(unittest.TestCase):
         self.assertEqual(second["batch_runtime"], "both")
         self.assertEqual(second["model_code_source"], "pipeline")
         self.assertEqual(second["csv_input"], "sample.csv")
-        self.assertEqual(second["tracking_uri"],
-                         "arn:aws:sagemaker:us-east-1:123456789012:mlflow-tracking-server/test")
         self.assertEqual(self.path.read_bytes(), before)
-
-    def test_notebook_sync_uses_selected_execution_and_job_bindings(self):
-        from mlops_models.pipelines import tracking as tracking_module
-        self.save(tracking_uri="arn:aws:sagemaker:us-east-1:123456789012:mlflow-tracking-server/test")
-        variables = self.load(DEPLOY)
-        session, sm = Mock(), Mock()
-        arn = "arn:aws:sagemaker:us-east-1:123456789012:pipeline/test-training/execution/run"
-        sm.list_pipeline_executions.return_value = {
-            "PipelineExecutionSummaries": [{"PipelineExecutionArn": arn}]}
-        variables.update(tracking={"uri": variables["tracking_uri"], "experiment_prefix": "models"},
-                         session=session, sm=sm, published={"training": {"name": "test-training"}},
-                         environment="dev", s3_root="s3://test-bucket/test", infrastructure={})
-        receipt = {"pipeline_status": "Failed", "status": "FAILED", "run_id": "one",
-                   "receipt_uri": "s3://test-bucket/test/tracking/receipt.json"}
-        with patch.object(tracking_module, "sync_execution", return_value=receipt) as sync:
-            exec(DEPLOY[-1], variables)
-            self.assertEqual(sync.call_args.args[:2], (session, arn))
-            self.assertEqual(sync.call_args.args[2]["kind"], "training")
-            self.assertEqual(sync.call_args.args[2]["s3_root"], "s3://test-bucket/test")
-        variables["tracking"] = None
-        with patch.object(tracking_module, "sync_execution") as sync:
-            exec(DEPLOY[-1], variables)
-            sync.assert_not_called()
 
     def test_csv_handoff_is_read_by_next_notebook_and_preserves_other_settings(self):
         self.save(bucket="test-bucket", role_arn="pipeline-role",
@@ -154,7 +128,6 @@ class NotebookConfiguration(unittest.TestCase):
             write.assert_called_once()
         second = self.load(DEPLOY)
         self.assertEqual(second["csv_input"], "sample.csv")
-        self.assertEqual(second["tracking_uri"], "")
         self.assertEqual(second["inference_data_source"], "csv_direct")
         self.assertTrue(second["feature_store_config_uri"].startswith(
             "s3://test-bucket/review/features/configurations/"))

@@ -228,16 +228,7 @@ class ModelContracts(unittest.TestCase):
                     patch.object(dispatcher, "main", side_effect=dispatch), \
                     patch("boto3.client", return_value=s3):
                 load_source.main()
-            self.assertEqual(set(uploaded), {
-                "run/selection/selected_features.csv", "run/prepared/data.csv",
-                "run/selection/_execution.json", "run/prepared/_execution.json",
-            })
-            record = json.loads(uploaded["run/prepared/_execution.json"])
-            self.assertEqual(record["step"], "preprocess")
-            self.assertEqual(record["model_code_source"], "pipeline")
-            self.assertEqual(uploaded["run/prepared/_execution.json"],
-                             uploaded["run/selection/_execution.json"])
-            self.assertEqual(uploaded["run/prepared/data.csv"], b"id,value\n0001,2\n")
+            self.assertEqual(set(uploaded), {"run/selection/selected_features.csv", "run/prepared/data.csv"})
             self.assertEqual(archive_path.read_bytes(), before)
             self.assertFalse(configured_output.exists())
 

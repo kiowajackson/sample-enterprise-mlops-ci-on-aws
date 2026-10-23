@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enterprise-mlops-ci"
+version = "0.1.0"
+description = "Shared SageMaker pipelines using an existing image and supplied source"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "pandas==2.3.3",
+    "scikit-learn==1.7.2",
+    "joblib==1.6.0",
+    "boto3==1.43.98",
+    "flask==3.1.2",
+    "gunicorn==23.0.0",
+]
+
+[project.optional-dependencies]
+checks = ["PyYAML==6.0.3"]
+autogluon = ["autogluon.tabular==1.4.0", "typing_extensions==4.16.0"]
+pytorch = ["torch==2.14.0"]
+
+[tool.setuptools.packages.find]
+where = ["mlops-models/src", "mlops-features"]
+
+[tool.setuptools.package-data]
+mlops_models = [
+    "model_base/requirements*.txt",
+    "model_base/*/definition.json",
+    "models/*/parameters.json",
+    "models/*/model_metadata.json",
+    "models/*/requirements*.txt",
+    "models/*/*/definition.json",
+]
+
+[dependency-groups]
+build = ["setuptools==80.9.0", "wheel==0.45.1"]

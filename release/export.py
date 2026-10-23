@@ -9,11 +9,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 FOLDERS = ("config", "notebooks", "examples", "mlops-models", "mlops-features", "release", "tests")
-# Explicit handoff guides are public source; other planning documents stay excluded.
-FILES = ("README.md", "docs/implementation/README.md", "docs/integration/README.md",
-         "docs/integration/mlflow-app.md",
-         "pyproject.toml", "requirements-infrastructure.txt", "requirements-infrastructure.lock.txt",
-         "requirements-tracking.txt", ".gitignore", ".gitlab-ci.yml")
+FILES = ("README.md", "pyproject.toml", "requirements-infrastructure.txt", "requirements-infrastructure.lock.txt", ".gitignore", ".gitlab-ci.yml")
 SUFFIXES = {".py", ".json", ".yaml", ".yml", ".toml", ".txt", ".csv", ".ipynb", ".md", ".Dockerfile"}
 
 
@@ -28,7 +24,7 @@ def source_files():
             if relative.as_posix() == "notebooks/config.json":
                 continue  # Local connection values and generated data paths are not source.
             if any(part.startswith(".") or part.endswith((".egg-info", ".dist-info"))
-                   or part in {"node_modules", "__pycache__", "cdk.out", "build", "dist", "scratch"}
+                   or part in {"node_modules", "__pycache__", "cdk.out", "build", "dist"}
                    for part in relative.parts):
                 continue
             if path.suffix not in SUFFIXES:

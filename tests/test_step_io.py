@@ -51,10 +51,9 @@ class StepIO(unittest.TestCase):
             self.assertEqual(records, [{"id": "0001", "score": 42.0}, {"id": "0002", "score": 42.0}])
             self.assertEqual(calls, [root / "checkpoint"])
 
-    def test_batch_postprocessing_passes_paths_and_publishes_customer_files_unchanged(self):
+    def test_batch_postprocessing_uses_the_use_case_formatter_and_saved_config(self):
         import json
         from mlops_models.entrypoints import postprocess
-        from mlops_models.runtime.load_source import upload_processing_outputs
         one = import_module(f"mlops_models.models.{FIRST}.inference.postprocess")
 
         with TemporaryDirectory() as directory:
@@ -72,83 +71,25 @@ class StepIO(unittest.TestCase):
             selection.write_text("features,description\nvalue,value\n")
             (inputs / "batches").mkdir()
             (inputs / "batches/leads.CSV").write_text("id,score,var1,var1_value\n0001,42,value,4\n0002,43,value,5\n")
-            calls = []
-            def customer_analysis(data_path, selected, predictions, destination, settings):
+            chunks = []
+            def customer_format(data_path, selected, predictions, settings):
                 self.assertEqual(data_path.read_bytes(), (raw / "data.csv").read_bytes())
-                self.assertEqual(selected, selection)
+                self.assertEqual(selected["features"].tolist(), ["value"])
                 self.assertEqual(settings["model_metadata"]["feature_mapping"], {"value": "value"})
                 self.assertEqual(list(predictions), ["batches/leads.CSV"])
-                self.assertEqual(predictions["batches/leads.CSV"], inputs / "batches/leads.CSV")
-                result = pd.read_csv(predictions["batches/leads.CSV"], dtype={"id": str})
+                result = predictions["batches/leads.CSV"]
                 self.assertEqual(settings["customer_setting"], "saved")
-                calls.append(len(result))
-                reports = destination / "reports"
-                plots = destination / "plots"
-                reports.mkdir()
-                plots.mkdir()
-                result = result.rename(columns={"score": "prediction"}).assign(prediction=result["score"] * 2)
-                result.to_csv(reports / "leads.csv", index=False)
-                (reports / "regression_metrics.json").write_text('{"mae": 0.25}\n')
-                (plots / "analysis.pdf").write_bytes(b"customer PDF bytes")
-                (plots / "segment.png").write_bytes(b"customer PNG bytes")
-                # File-producing customer analysis returns None and need not write summary.json.
-            with patch.object(one, "postprocess", customer_analysis):
+                chunks.append(len(result))
+                return result.rename(columns={"score": "prediction"}).assign(prediction=result["score"] * 2)
+            with patch.object(one, "use_case_postprocess", customer_format):
                 output = postprocess.execute(FIRST, inputs, root / "output", model_dir=model, data_directory=raw, selection_file=selection, chunk_rows=1)
-            df = pd.read_csv(output / "reports/leads.csv", dtype={"id": str})
+            df = pd.read_csv(output, dtype={"id": str})
             self.assertEqual(df["id"].tolist(), ["0001", "0002"])
             self.assertEqual(df["prediction"].tolist(), [84, 86])
-            self.assertEqual(calls, [2])
+            self.assertEqual(chunks, [2])
             self.assertEqual(df["var1_value"].tolist(), [4, 5])
-            self.assertEqual(output, root / "output")
-            self.assertFalse((output / "summary.json").exists())
-            expected = {p.relative_to(output).as_posix(): p.read_bytes()
-                        for p in output.rglob("*") if p.is_file()}
-            uploaded = {}
-            def upload_file(path, bucket, key, **kwargs):
-                self.assertEqual(bucket, "artifacts")
-                uploaded[key.removeprefix("runs/example/predictions/")] = Path(path).read_bytes()
-            with patch("boto3.client") as client:
-                client.return_value.upload_file.side_effect = upload_file
-                upload_processing_outputs({"Outputs": [{
-                    "OutputName": "predictions", "S3Output": {
-                        "LocalPath": "/opt/ml/processing/output",
-                        "S3Uri": "s3://artifacts/runs/example/predictions",
-                    },
-                }]}, Path("/opt/ml/processing/output"), output)
-            self.assertEqual(uploaded, expected)
-
-    def test_postprocessing_fails_when_analysis_writes_nothing(self):
-        from mlops_models.model_base.inference.postprocess import write_container_output
-        with TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(FileNotFoundError, "wrote no files"):
-                write_container_output(directory)
-
-    def test_transform_analysis_still_receives_file_paths_with_string_ids(self):
-        import json
-        from mlops_models.model_base.inference.postprocess import postprocess_predictions
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            raw, scores = root / "raw", root / "scores"
-            raw.mkdir()
-            scores.mkdir()
-            (raw / "data.csv").write_text("id,value\n0001,4\n0002,5\n")
-            selection = root / "selection.csv"
-            selection.write_text("features\nvalue\n")
-            (scores / "part.out").write_text(
-                json.dumps({"id": "0001", "score": 0.8}) + "\n"
-                + json.dumps({"id": "0002", "score": 0.2}) + "\n")
-            observed = []
-            def analysis(data_path, selection_path, predictions, destination, config):
-                observed.append(predictions["messaging_final.csv"])
-                frame = pd.read_csv(observed[0], dtype={"id": str})
-                self.assertEqual(frame["id"].tolist(), ["0001", "0002"])
-                self.assertEqual(frame["score"].tolist(), [0.8, 0.2])
-                frame.to_csv(destination / "leads.csv", index=False)
-            result = postprocess_predictions(
-                raw, selection, scores, root / "output", {"primary_key": "id"},
-                run_analysis=analysis, prediction_format="jsonlines", chunk_rows=1)
-            self.assertTrue((result / "leads.csv").is_file())
-            self.assertFalse(observed[0].exists())
+            self.assertEqual(output.name, "prediction_analysis.csv")
+            self.assertEqual(json.loads((output.parent / "summary.json").read_text())["rows"], 2)
 
     def test_local_csv_readers_preserve_identifiers_and_missing_values(self):
         for model_id in (FIRST, SECOND):

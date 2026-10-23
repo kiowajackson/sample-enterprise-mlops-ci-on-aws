@@ -25,18 +25,6 @@ from mlops_models.runtime.load_source import upload_processing_outputs, prepare_
 
 
 class InferenceStages(unittest.TestCase):
-    def example_analysis(self, frame, config, name="messaging_final.csv"):
-        """Exercise the example through real CSV inputs and written output."""
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            path = root / "input" / name
-            path.parent.mkdir(parents=True)
-            frame.to_csv(path, index=False)
-            key = config.get("primary_key", "id")
-            base_postprocess.postprocess(None, None, {name: path}, root,
-                                         {"primary_key": key, **config})
-            return pd.read_csv(root / "prediction_analysis.csv", dtype={key: str})
-
     def definitions(self, **settings):
         return source.build_definitions(
             "review", "arn:aws:iam::123456789012:role/jobs", "image:tag",
@@ -269,14 +257,14 @@ class InferenceStages(unittest.TestCase):
                 self.assertEqual(pd.read_csv(output / "native/output/messaging_final.csv").columns.tolist(), final.columns.tolist())
                 result = postprocess.execute("usecase1", output, root / "analysis", model_dir=model,
                                              data_directory=raw, selection_file=selection)
-                data = pd.read_csv(result / "prediction_analysis.csv", dtype={"id": str})
+                data = pd.read_csv(result, dtype={"id": str})
                 self.assertEqual(data["id"].tolist(), ["0001"])
                 self.assertEqual(data["PREDICTION"].tolist(), [0.8 if task == "regression" else 1])
                 if task == "classification":
                     self.assertEqual(data["PROBABILITY"].tolist(), [0.8])
                 for n in range(1, 4):
                     self.assertEqual(data[f"variable_{n}_value"].tolist(), [n])
-                self.assertEqual(result, root / "analysis")
+                self.assertEqual(result.name, "prediction_analysis.csv")
                 (output / "native/output/messaging.csv").unlink()
                 # This analysis only needs the combined result, not a fixed trio of files.
                 postprocess.execute("usecase1", output, root / "without-messaging", model_dir=model,
@@ -298,9 +286,9 @@ class InferenceStages(unittest.TestCase):
                 before = frame.copy(deep=True)
                 log = io.StringIO()
                 with redirect_stdout(log):
-                    result = self.example_analysis(frame, {
-                        "primary_key": "CAD_ECIF_ID", "task_type": "classification", "threshold": 0.7,
-                    }, name="output/messaging_final.csv")
+                    result = base_postprocess.postprocess(
+                        None, None, {"output/messaging_final.csv": frame},
+                        {"task_type": "classification", "threshold": 0.7})
                 self.assertEqual(result["PREDICTION"].tolist(), [0, 1, 1])
                 self.assertEqual(result["PROBABILITY"].tolist(), [0.69, 0.7, 0.9])
                 pd.testing.assert_frame_equal(result.iloc[:, :3], before.iloc[:, :3])
@@ -314,12 +302,14 @@ class InferenceStages(unittest.TestCase):
         for column in ("PREDICTION", "prediction", "SCORE"):
             with self.subTest(column=column):
                 frame = pd.DataFrame({"id": ["001", "002"], column: [-2.5, 200.25]})
-                result = self.example_analysis(frame, {"task_type": "regression"})
+                result = base_postprocess.postprocess(
+                    None, None, {"messaging_final.csv": frame}, {"task_type": "regression"})
                 self.assertEqual(result["PREDICTION"].tolist(), [-2.5, 200.25])
                 self.assertNotIn("PROBABILITY", result)
                 self.assertEqual(result["id"].tolist(), ["001", "002"])
         frame = pd.DataFrame({"id": ["001"], "prediction": ["positive"], "probability": [0.8]})
-        result = self.example_analysis(frame, {"task_type": "classification"})
+        result = base_postprocess.postprocess(
+            None, None, {"messaging_final.csv": frame}, {"task_type": "classification"})
         self.assertEqual(result["PREDICTION"].tolist(), ["positive"])
         self.assertEqual(result["PROBABILITY"].tolist(), [0.8])
 
@@ -332,7 +322,9 @@ class InferenceStages(unittest.TestCase):
         ]
         for columns, message in cases:
             with self.subTest(columns=columns), self.assertRaisesRegex(ValueError, message):
-                self.example_analysis(pd.DataFrame(columns), {"task_type": "classification"})
+                base_postprocess.postprocess(
+                    None, None, {"messaging_final.csv": pd.DataFrame(columns)},
+                    {"task_type": "classification"})
 
     def test_postprocess_keeps_duplicate_basenames_separate_and_rejects_ambiguous_example_input(self):
         with TemporaryDirectory() as directory:
@@ -345,16 +337,13 @@ class InferenceStages(unittest.TestCase):
                 folder = root / "scores" / part
                 folder.mkdir(parents=True)
                 (folder / "messaging_final.csv").write_text(f"id,score\n0001,{score}\n")
-            with patch.object(base_postprocess.pd, "read_csv", side_effect=AssertionError("Paths only")):
-                data_path, selected, predictions = base_postprocess.get_container_input(
-                    root / "raw", selection, root / "scores")
+            data_path, selected, predictions = base_postprocess.get_container_input(
+                root / "raw", selection, root / "scores", {"primary_key": "id"})
             self.assertEqual(list(predictions), ["first/messaging_final.csv", "second/messaging_final.csv"])
-            self.assertEqual(selected, selection)
-            self.assertEqual(predictions["first/messaging_final.csv"], root / "scores/first/messaging_final.csv")
-            self.assertEqual(predictions["second/messaging_final.csv"], root / "scores/second/messaging_final.csv")
+            self.assertEqual(predictions["first/messaging_final.csv"]["id"].tolist(), ["0001"])
+            self.assertEqual(predictions["second/messaging_final.csv"]["score"].tolist(), [0.8])
             with self.assertRaisesRegex(ValueError, "found 2"):
-                base_postprocess.postprocess(data_path, selected, predictions, root / "output",
-                                             {"primary_key": "id", "task_type": "regression"})
+                base_postprocess.postprocess(data_path, selected, predictions, {"task_type": "regression"})
 
     def test_postprocess_reports_when_no_prediction_csv_exists(self):
         with TemporaryDirectory() as directory:
@@ -363,7 +352,7 @@ class InferenceStages(unittest.TestCase):
             selection = root / "selection.csv"
             selection.write_text("features\nvalue\n")
             with self.assertRaisesRegex(FileNotFoundError, "no prediction CSV"):
-                base_postprocess.get_container_input(root, selection, root / "missing")
+                base_postprocess.get_container_input(root, selection, root / "missing", {"primary_key": "id"})
 
 
 if __name__ == "__main__":

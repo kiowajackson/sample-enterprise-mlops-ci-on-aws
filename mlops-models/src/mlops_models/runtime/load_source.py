@@ -1,9 +1,16 @@
-"""Wrap a step's entrypoint: prepare input/output paths, run it, and upload outputs.
+"""Load supplied source and work around non-root output-directory permissions.
 
 The current non-root image cannot write to SageMaker's standard output
-directories. Its output workaround uses a temporary job folder and direct S3
-uploads. If native output writes become available, that workaround can be
-removed; source/model loading and step dispatch are separate responsibilities.
+directories. When application-managed output uploads are enabled, this loader:
+- Leaves SageMaker's input downloads and local input paths unchanged.
+- Runs the step with writable temporary output directories.
+- Uploads completed outputs to their configured S3 locations after the step succeeds.
+
+The publisher ships this file with the source; SageMaker downloads it as an input.
+Model artifacts supply the saved model and settings. MLOPS_MODEL_CODE_SOURCE
+chooses artifact code or the separately supplied pipeline code for evaluation/
+prediction. This workaround covers Processing and ordinary Training; HPO uses
+the image entrypoint.
 
 AWS references for the native I/O contract (the permission failure is specific to
 the current image/job setup):
@@ -103,30 +110,8 @@ def upload_training_outputs(work):
                       "reports_uri": os.environ["MLOPS_TRAINING_REPORTS_URI"]}), flush=True)
 
 
-def write_execution_record(directory, record):
-    """Write a small record of which execution, code and settings produced these files.
-
-    Called after model code returns and before its outputs are uploaded. The
-    resulting _execution.json is framework bookkeeping, separate from model
-    metadata. It travels with the original output when a later run uses the cache.
-    """
-    directory = Path(directory)
-    # Require real output files first: this record must not hide a missing result.
-    if directory.is_dir() and any(path.is_file() and path.name != "_execution.json"
-                                  for path in directory.rglob("*")):
-        (directory / "_execution.json").write_text(json.dumps(record, indent=2) + "\n")
-
-
 def main():
-    """Configure input/output paths around the selected step's entrypoint.
-
-    1. Read the step request and remember the current process settings.
-    2. Locate model/source files and configure writable output directories.
-    3. Call the step's entrypoint, which runs the model code.
-    4. Record what produced the outputs and upload them to the configured S3 paths.
-    5. Restore this process's directory, arguments and environment.
-    """
-    # 1. Read the job command and retain process state for the final cleanup.
+    """Load source, dispatch one step, then publish its application-managed outputs."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("step")
     parser.add_argument("--model", default=os.getenv("MODEL_ID"))
@@ -147,16 +132,11 @@ def main():
     original_tempdir = tempfile.tempdir
 
     try:
-        # 2. Prepare local input/code and writable output locations.
-        # workspace manages this job's temporary folder; it is not a repo or Studio workspace.
-        # Prefer the image's owned scratch directory. Managed containers can
-        # remove world-write permissions from /tmp and /var/tmp for non-root users.
-        scratch_root = os.getenv("TMPDIR") or ("/var/tmp" if managed_training else "/tmp")
+        # This non-root image can use /var/tmp even when Training's /tmp is read-only.
         workspace = (nullcontext() if selected.step == "train" and not managed_training else
-                     tempfile.TemporaryDirectory(prefix="mlops-step-", dir=scratch_root))
+                     tempfile.TemporaryDirectory(prefix="mlops-step-",
+                                                 dir="/var/tmp" if managed_training else "/tmp"))
         with workspace as work:
-            # Inference/evaluation unpack the supplied model. Choose its archived
-            # code or the separately uploaded pipeline code before importing modules.
             checkpoint = None
             if selected.step in {"get-inference-data", "evaluate", "preprocess", "score", "predict", "postprocess"}:
                 archive_path = selected.model_dir or "/opt/ml/processing/model/model.tar.gz"
@@ -178,8 +158,6 @@ def main():
             sys.path.insert(0, str(source))
             identity = source / "source.json"
             source_metadata = json.loads(identity.read_text()) if identity.exists() else {}
-
-            # Read the configured S3 destinations and identify the producing run.
             processing_job = None
             output_uri = os.getenv("MLOPS_TRAINING_MODEL_URI", "")
             if os.getenv("MLOPS_TRAINING_OUTPUT_UPLOAD") == "application" and selected.step == "train":
@@ -219,8 +197,6 @@ def main():
                               "model_code_source": os.getenv("MLOPS_MODEL_CODE_SOURCE", "artifact") if checkpoint else "pipeline",
                               "identity": source_metadata}),
                   flush=True)
-
-            # Redirect Training's model/report writes into writable scratch folders.
             if managed_training:
                 work = Path(work)
                 for name in ("tmp", "output", "model"):
@@ -240,7 +216,6 @@ def main():
             if checkpoint is not None:
                 sys.argv.extend(["--model-dir", str(checkpoint)])
 
-            # Processing has its own declared output folders; redirect those writes too.
             output_config = None
             if os.getenv("MLOPS_PROCESSING_OUTPUT_UPLOAD") == "application" and selected.step != "train":
                 job = processing_job or json.loads(Path("/opt/ml/config/processingjobconfig.json").read_text())
@@ -253,49 +228,18 @@ def main():
                 sys.argv.extend(["--output", str(scratch)])
                 print(json.dumps({"event": "processing_output_directory", "step": selected.step,
                                   "configured": str(output_dir), "writable": str(scratch)}), flush=True)
-
-            # Inference preprocessing also needs the saved model's selected-feature CSV.
             if selected.step == "preprocess":
                 from mlops_models.runtime.job_paths import job_paths
                 preparation_output = scratch if output_config is not None else Path(
                     selected.output or job_paths(selected.step)[1])
                 selection_file = prepare_inference_inputs(checkpoint, preparation_output, selected.model)
                 sys.argv.extend(["--selection", str(selection_file)])
-
-            # 3. RUN THE MODEL STEP through entrypoints.__main__.main().
-            # Its selected entrypoint delegates to the use-case/model_base function.
             dispatch_command()
-
-            # 4. Describe which execution/code produced the files just written.
-            # write_execution_record() saves this dictionary as _execution.json.
-            execution_record = {
-                "step": selected.step, "source": source_metadata,
-                "producer_execution_id": os.getenv("PIPELINE_EXECUTION_ID", ""),
-                "step_revision": os.getenv("MLOPS_STEP_REVISION", os.getenv("MLOPS_PREPARATION_REVISION", "")),
-                "model_code_source": os.getenv("MLOPS_MODEL_CODE_SOURCE", "artifact") if checkpoint else "pipeline",
-            }
-            # Preserve source settings and saved-model settings separately; inference
-            # can use newer source with an older registered model.
-            if selected.model:
-                parameter_file = source / "mlops_models/models" / selected.model / "parameters.json"
-                if parameter_file.is_file():
-                    execution_record["source_parameters"] = json.loads(parameter_file.read_text())
-            if checkpoint and (Path(checkpoint) / "parameters.json").is_file():
-                execution_record["checkpoint_parameters"] = json.loads(
-                    (Path(checkpoint) / "parameters.json").read_text())
-
-            # Save that record beside each result, then upload the result files.
             if managed_training:
-                write_execution_record(work / "output", execution_record)
-                write_execution_record(work / "model", execution_record)
                 upload_training_outputs(work)
             if output_config is not None:
-                for item in output_config["Outputs"]:
-                    relative = Path(item["S3Output"]["LocalPath"]).relative_to(output_dir)
-                    write_execution_record(scratch / relative, execution_record)
                 upload_processing_outputs(output_config, output_dir, scratch)
     finally:
-        # 5. Restore process state even if the model step or an upload failed.
         os.chdir(original_directory)
         sys.argv[:] = original_arguments
         sys.path[:] = original_path
