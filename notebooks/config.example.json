@@ -8,5 +8,6 @@
   "feature_store_config_uri": "",
   "tracking_uri": "",
   "namespace": "",
-  "completion_code_uri": ""
+  "completion_code_uri": "",
+  "user_alias": ""
 }

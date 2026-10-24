@@ -1,4 +1,4 @@
-"""Publish saved training metrics and check thresholds before model registration."""
+"""Publish model details and optional metrics, then apply configured thresholds."""
 
 from importlib import import_module
 import hashlib
@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import tarfile
 import math
-from shutil import rmtree
+from tempfile import TemporaryDirectory
 
 import os
 
@@ -19,17 +19,18 @@ def execute(model_id, model_dir, output_dir, *, input_path):
     - Check the saved scores against thresholds and publish the report.
     """
     print(json.dumps({"event": "event_received", "step": "Evaluate",
-                      "model": model_id, "input": str(input_path)}), flush=True)
+                      "model": model_id, "model_artifact": str(model_dir),
+                      "checkpoint_uri": os.getenv("CHECKPOINT_URI", ""),
+                      "input_path": str(input_path)}), flush=True)
 
-    # Locate the saved checkpoint containing evaluation.json.
-    model_dir, test_file, work = prepare_evaluation_files(
-        model_dir, input_path, output_dir,
-    )
-
-    try:
-        report = evaluate_saved_model(model_id, model_dir, test_file, output_dir)
-    finally:
-        remove_unpacked_inputs(work)
+    # Locate the saved checkpoint and its optional evaluation.json.
+    with TemporaryDirectory(prefix="evaluate-model-") as temporary:
+        model_dir = Path(model_dir)
+        if model_dir.is_file():
+            with tarfile.open(model_dir) as archive:
+                model_dir = Path(temporary)
+                archive.extractall(model_dir, filter="data")
+        report = evaluate_saved_model(model_id, model_dir, output_dir, input_path=input_path)
 
     print(json.dumps({"event": "success", "step": "Evaluate", "model": model_id,
                       "output": str(output_dir), **report}), flush=True)
@@ -37,33 +38,17 @@ def execute(model_id, model_dir, output_dir, *, input_path):
     return report
 
 
-def prepare_evaluation_files(model_path, test_file, output_dir):
-    """Take checkpoint and test-data locations; unpack archives and return local paths."""
-    work = Path(output_dir) / "unpacked"
-    work.mkdir(parents=True, exist_ok=False)
-    model_dir = Path(model_path)
-    if model_dir.is_file():
-        model_dir = work / "checkpoint"
-        model_dir.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(model_path) as archive:
-            archive.extractall(model_dir, filter="data")
-    return model_dir, test_file, work
-
-
-def remove_unpacked_inputs(work):
-    """Take the temporary evaluation directory and remove its unpacked inputs."""
-    rmtree(work)
-
-
-def evaluate_saved_model(model_id, model_dir, test_file, output):
+def evaluate_saved_model(model_id, model_dir, output_dir, *, input_path):
     """Assemble the evaluation report and files consumed by Registry and tracking.
 
     1. Load this use case's settings and evaluation function.
     2. Call that function, then add source details and the quality-gate result.
     3. Copy the model's metadata/settings/run record and write the completed report.
 
-    The default evaluation function reads scores saved during training. It does
-    not load the predictor or score another dataset; test_file is None for it.
+    The default function passes through any scores saved during training. Missing
+    scores are allowed unless a configured quality threshold needs them. It does
+    not load the predictor or score another dataset; input_path is None for it.
+    model_dir is the checkpoint directory; evaluation.json is optional.
     """
     # 1. Read the use-case settings and import its evaluation function.
     model_folder = Path(__file__).parents[1] / "models" / model_id
@@ -75,7 +60,7 @@ def evaluate_saved_model(model_id, model_dir, test_file, output):
 
     # 2. Delegate to the use case and receive its report dictionary.
     # The default function also writes a report; we add fields and save it below.
-    report = evaluate(test_file, model_dir, output, config)
+    report = evaluate(input_path, model_dir, output_dir, config)
 
     # Add the model location and the code versions used for training/evaluation.
     report["checkpoint_uri"] = os.getenv("CHECKPOINT_URI", str(model_dir))
@@ -94,7 +79,7 @@ def evaluate_saved_model(model_id, model_dir, test_file, output):
     # Validate metadata as JSON, but copy its original bytes so its checksum matches.
     metadata = (model_dir / "model_metadata.json").read_bytes()
     json.loads(metadata)
-    (Path(output) / "model_metadata.json").write_bytes(metadata)
+    (Path(output_dir) / "model_metadata.json").write_bytes(metadata)
 
     # These are the settings saved with the trained model. The config above holds
     # the selected evaluator's settings; they are separate files and can differ.
@@ -104,19 +89,19 @@ def evaluate_saved_model(model_id, model_dir, test_file, output):
     if parameter_file.is_file():
         parameters = parameter_file.read_bytes()
         json.loads(parameters)
-        (Path(output) / "parameters.json").write_bytes(parameters)
+        (Path(output_dir) / "parameters.json").write_bytes(parameters)
 
     # The loader wrote _execution.json when training finished: code/settings/run
     # details identifying what produced the model. Older packages may lack it.
     # Here provenance is a local Path; is_file() only checks whether it exists.
     provenance = model_dir / "_execution.json"
     if provenance.is_file():
-        (Path(output) / "training_execution.json").write_bytes(provenance.read_bytes())
+        (Path(output_dir) / "training_execution.json").write_bytes(provenance.read_bytes())
 
     # Save the final report, including the metadata checksum for Registry lookup.
     # load_source.py uploads these local output files to S3 after this returns.
     report["model_metadata_sha256"] = hashlib.sha256(metadata).hexdigest()
-    (Path(output) / "evaluation.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    (Path(output_dir) / "evaluation.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     return report
 
 
