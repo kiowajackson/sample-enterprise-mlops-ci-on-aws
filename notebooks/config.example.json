@@ -7,5 +7,6 @@
   "csv_input": "",
   "feature_store_config_uri": "",
   "tracking_uri": "",
-  "namespace": ""
+  "namespace": "",
+  "completion_code_uri": ""
 }

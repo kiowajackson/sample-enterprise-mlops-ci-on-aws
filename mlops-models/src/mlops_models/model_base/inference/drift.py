@@ -15,7 +15,7 @@ def compare_drift(data_directory, selection_file, prediction_directory, output_d
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
     compare_batches(data, selection, predictions, output, config)
-    from mlops_models.runtime.execution import write_inference_report
+    from mlops_models.pipelines.inspect import write_inference_report
     write_inference_report(output, data_path=data, selection_file=selection,
                            predictions=predictions, config=config)
     return write_container_output(output)
@@ -74,7 +74,7 @@ def read_batch(data, predictions, *, primary_key, features, target, score_column
 
 def reference_outputs(session, execution_arn, model_id, environment):
     """Read the prior inference's declared artifacts, independent of its step names."""
-    from mlops_models.runtime.execution import read_run_report
+    from mlops_models.pipelines.inspect import read_run_report
     report = read_run_report(session, execution_arn)
     artifacts = report.get("inference")
     if not artifacts:
@@ -93,7 +93,7 @@ def compare_batches(data_path, selection_file, predictions, output, config):
             reference_arn.count("/execution/") != 1 or reference_arn == execution_arn):
         raise ValueError("ReferenceExecutionArn must be a different execution in this account and region.")
     import boto3
-    from mlops_models.runtime.execution import inference_artifacts
+    from mlops_models.pipelines.inspect import inference_artifacts
     from mlops_models.monitoring.report import write_report
 
     settings = json.loads(os.environ["MLOPS_MONITORING_CONFIG"])

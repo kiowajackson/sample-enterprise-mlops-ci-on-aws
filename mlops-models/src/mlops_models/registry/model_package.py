@@ -194,7 +194,7 @@ def resolve_latest_approved_model(group, output_dir, *, namespace, model_id, env
 def write_registration_record(result, *, s3):
     """Publish the same output description used by other Processing jobs."""
     from tempfile import TemporaryDirectory
-    from mlops_models.runtime.execution import processing_record
+    from mlops_models.runtime.load_source import processing_record
 
     job = json.loads(Path("/opt/ml/config/processingjobconfig.json").read_text())
     source = Path("/opt/ml/processing/source/source.json")

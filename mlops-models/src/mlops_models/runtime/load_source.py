@@ -23,6 +23,9 @@ import tarfile
 import tempfile
 from urllib.parse import urlparse
 
+MAX_REPORT_BYTES = 10 * 1024 * 1024
+REPORT_SUFFIXES = {".csv", ".png", ".jpg", ".jpeg", ".svg", ".html", ".json", ".txt", ".pdf"}
+
 
 def prepare_inference_inputs(model_dir, output_dir, model_id):
     """Prepare the saved selection before calling the preprocessing entrypoint."""
@@ -109,6 +112,62 @@ def upload_training_outputs(work):
                       "reports_uri": os.environ["MLOPS_TRAINING_REPORTS_URI"]}), flush=True)
 
 
+def describe_outputs(record, directories):
+    """Record declared output files and small JSON reports before upload.
+
+    directories maps an output name to (local directory, actual S3 destination).
+    Data/model files remain in S3; artifact publication is an explicit job setting.
+    """
+    artifacts, reports, datasets, registry = [], {}, [], []
+    publish = os.getenv("MLOPS_LOG_ARTIFACTS") == "1"
+    for name, (directory, uri) in directories.items():
+        directory, uri = Path(directory), uri.rstrip("/") + "/"
+        for path in sorted(directory.rglob("*")):
+            if not path.is_file() or path.is_symlink() or path.name in {"_execution.json", "run.json"}:
+                continue
+            relative = path.relative_to(directory).as_posix()
+            artifact = {
+                "output": name, "relative_path": relative, "uri": uri + relative,
+                "size": path.stat().st_size,
+                "publish_to_mlflow": publish and path.suffix.lower() in REPORT_SUFFIXES
+                                     and path.stat().st_size <= MAX_REPORT_BYTES,
+            }
+            artifacts.append(artifact)
+            if path.suffix.lower() != ".json" or artifact["size"] > MAX_REPORT_BYTES:
+                continue
+            document = json.loads(path.read_text())
+            reports[relative] = document
+            # These are the existing output contracts, independent of step names.
+            if relative == "provenance.json":
+                datasets.append({"uri": uri + "data.csv", "provenance": document})
+            elif relative == "package.json":
+                registry.append(document)
+    return {**record, "record_version": 1, "artifacts": artifacts, "reports": reports,
+            "datasets": datasets, "registry": registry}
+
+
+def processing_record(job, record, output_root, local_root):
+    """Describe a Processing job from its own configuration and local outputs."""
+    pipeline = os.getenv("MLOPS_PIPELINE_ARN", os.getenv("MLOPS_TRACKING_PIPELINE_ARN", ""))
+    producer = os.getenv("PIPELINE_EXECUTION_ID", "")
+    outputs = job["ProcessingOutputConfig"]["Outputs"]
+    directories = {
+        item["OutputName"]: (
+            Path(local_root) / Path(item["S3Output"]["LocalPath"]).relative_to(output_root),
+            item["S3Output"]["S3Uri"])
+        for item in outputs
+    }
+    result = describe_outputs({
+        **record, "step": os.getenv("MLOPS_STEP_NAME", record.get("step", "")),
+        "producer_execution_arn": pipeline + "/execution/" + producer if pipeline and producer else "",
+        "inputs": {item["InputName"]: item["S3Input"]["S3Uri"]
+                   for item in job.get("ProcessingInputs", []) if "S3Input" in item},
+        "outputs": {item["OutputName"]: item["S3Output"]["S3Uri"] for item in outputs},
+        "image": job["AppSpecification"]["ImageUri"],
+    }, directories)
+    return result
+
+
 def write_execution_record(directory, record):
     """Write a small record of which execution, code and settings produced these files.
 
@@ -140,7 +199,6 @@ def main():
     parser.add_argument("--output")
     selected, _ = parser.parse_known_args()
     source = Path(__file__).resolve().parent
-    recording_source = source / "mlops_models/runtime/execution.py"
     logging_source = source / "mlops_models/pipelines/tracking.py"
     original_directory, original_arguments = Path.cwd(), sys.argv[:]
     original_path = sys.path[:]
@@ -328,9 +386,7 @@ def main():
                     write_execution_record(work / "model", execution_record)
                     upload_training_outputs(work)
                 if output_config is not None:
-                    recording = runpy.run_path(str(recording_source))
-                    execution_record = recording["processing_record"](
-                        job, execution_record, output_dir, scratch)
+                    execution_record = processing_record(job, execution_record, output_dir, scratch)
                     for item in output_config["Outputs"]:
                         relative = Path(item["S3Output"]["LocalPath"]).relative_to(output_dir)
                         write_execution_record(scratch / relative, execution_record)

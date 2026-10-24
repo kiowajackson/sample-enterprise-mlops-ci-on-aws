@@ -170,7 +170,8 @@ def pipeline_fingerprints(session, csv_uri="", local_csv=None):
             # Monitoring code is saved in the trained model's source archive.
             steps = ("Train", "DriftComparison")
         elif relative == Path("pipelines/inspect.py"):
-            steps = ("Postprocess", "DriftComparison")
+            # Inference reports run from the source saved in the trained model.
+            steps = ("Train", "Postprocess", "DriftComparison")
         elif relative.parent == Path("entrypoints") and path.name in entrypoints:
             steps = entrypoints[path.name]
         elif relative.parent == Path("entrypoints") and path.name in {
@@ -604,7 +605,7 @@ def configure_tracking(definitions, tracking, namespace, job_role, image, source
             })
         body["Metadata"]["Tracking"] = json.dumps({
             "uri": tracking["uri"], "experiment_prefix": tracking["experiment_prefix"],
-            "logging": "direct from model jobs", "final_status_owner": "notebook or orchestrator",
+            "logging": "direct from model jobs", "final_status_owner": "EventBridge completion Lambda",
         }, sort_keys=True)
 
 

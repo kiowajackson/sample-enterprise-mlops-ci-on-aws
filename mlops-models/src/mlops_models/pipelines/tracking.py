@@ -1,8 +1,8 @@
-"""Log from the jobs that do the work; the caller finalizes pipeline status.
+"""Log from the jobs that do the work; the completion service finalizes pipeline status.
 
 job_tracking() supplies one shared run ID inside each executing container.
 log_job_outputs() publishes local reports directly. sync_execution() is called
-by the notebook/Airflow after completion, including cache-only and failed runs.
+by the completion Lambda after terminal events, including cache-only and failed runs.
 This module declares or launches no SageMaker jobs.
 """
 
@@ -96,7 +96,7 @@ def _lease(s3, uri, kms_key):
     """Allow one writer at a time using a temporary S3 lock file.
 
     Create the lock or take over an expired one, yield to the caller, then remove
-    our lock. This protects run creation when a job and notebook sync overlap.
+    our lock. This protects run creation when a job and completion invocation overlap.
     """
     token = uuid4().hex
     payload = {"owner": token, "expires": time.time() + 900}
@@ -177,7 +177,7 @@ def ensure_run(client, session, execution_arn, model, settings, *, created=None)
             raise ValueError("Tracking receipt belongs to another execution or service.")
         return receipt
     # A Studio execution can initialize its run in its first uncached job. A
-    # concurrent notebook inspection must not create a second run for it.
+    # concurrent completion invocation must not create a second run for it.
     with _lease(s3, receipt_uri.removesuffix("run.json") + "lock.json", settings.get("kms_key", "")):
         receipt = _read_json(s3, receipt_uri, optional=True)
         if receipt:
@@ -357,11 +357,11 @@ def log_dataset(client, run_id, uri, provenance, producer):
 
 
 def sync_execution(session, execution_arn, settings, *, client=None):
-    """Finalize from the caller; copy cached reports and link the original producers.
+    """Finalize from the completion service; copy cached reports and link the original producers.
 
     Jobs already publish live metrics/artifacts. This reads native final status,
     handles steps that never ran, and completes cached-output/Registry navigation.
-    Call after waiting for completion, including failed/stopped executions.
+    Called automatically for completed, failed and stopped executions.
     """
     from mlops_models.pipelines.inspect import collect_execution, write_run_index
 
