@@ -33,6 +33,8 @@ def parse_job_arguments():
     parser.add_argument("--data", default="/opt/ml/processing/raw")
     parser.add_argument("--model-dir", default=None)
     parser.add_argument("--chunk-rows", type=int, default=10000)
+    parser.add_argument("--analysis-mode", choices=["prediction_inference", "prediction_test"],
+                        default=os.getenv("MLOPS_ANALYSIS_MODE", "prediction_inference"))
     parser.add_argument("--model-package", default="")
     parser.add_argument("--image-uri", default="")
     parser.add_argument("--checkpoint-uri", default="")
@@ -112,7 +114,8 @@ def dispatch_pipeline_step(args):
         from . import postprocess
         return postprocess.execute(args.model, args.input, args.output,
                                    model_dir=args.model_dir, chunk_rows=args.chunk_rows,
-                                    data_directory=args.data, selection_file=args.selection)
+                                   data_directory=args.data, selection_file=args.selection,
+                                   analysis_mode=args.analysis_mode)
     if args.step == "drift":
         from . import drift
         return drift.execute(args.model, args.input, args.output, model_dir=args.model_dir,

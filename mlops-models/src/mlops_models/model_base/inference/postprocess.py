@@ -2,46 +2,30 @@
 
 import json
 from pathlib import Path
-from tempfile import TemporaryDirectory
+import tarfile
 
 import pandas as pd
 
 
 def postprocess_predictions(data_directory, selection_file, prediction_directory, output_directory,
-                            config, *, run_analysis, chunk_rows=10000, prediction_format="csv"):
-    """Resolve input paths, let analysis write its files, then check the output directory."""
-    output = Path(output_directory)
-    output.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix="postprocess-inputs-") as temporary:
-        source = Path(prediction_directory)
-        if prediction_format == "jsonlines":
-            # Preserve the existing Transform adapter. Only its selected response
-            # file survives serving; these are temporary compatibility CSVs,
-            # not the full set of files produced by Processing prediction.
-            frames = list(read_predictions(source, chunk_rows))
-            if not frames:
-                raise ValueError("No Transform predictions were found.")
-            result = pd.concat(frames, ignore_index=True)
-            source = Path(temporary)
-            result.to_csv(source / "predictions.csv", index=False)
-            result.to_csv(source / "messaging_final.csv", index=False)
-            result[[config["primary_key"]]].to_csv(source / "messaging.csv", index=False)
-        elif prediction_format != "csv":
-            raise ValueError("prediction_format must be csv or jsonlines.")
-        data_path, selection_path, predictions = get_container_input(
-            data_directory, selection_file, source)
-        # The use-case wrapper supplies run_analysis=postprocess directly.
-        # Customer analysis reads these paths and writes under output; no return is required.
-        run_analysis(data_path, selection_path, predictions, output, config)
-        # Postprocess owns prediction analysis and its execution report.
-        from mlops_models.pipelines.inspect import write_inference_report
-        write_inference_report(output, data_path=data_path, selection_file=selection_path,
-                               predictions=predictions, config=config)
-    return write_container_output(output)
+                            model_directory, *, analysis_mode="prediction_inference"):
+    """Resolve inputs, run the requested analysis, then publish its output files."""
+    data_path, selection_path, predictions, output, parameters = get_container_input(
+        data_directory, selection_file, prediction_directory, output_directory, model_directory)
+    if analysis_mode == "prediction_inference":
+        prediction_inference(data_path, selection_path, predictions, output, parameters)
+    elif analysis_mode == "prediction_test":
+        prediction_test(data_path, selection_path, predictions, output, parameters)
+    else:
+        raise ValueError("analysis_mode must be prediction_inference or prediction_test.")
+    return write_container_output(
+        output, data_path=data_path, selection_file=selection_path,
+        predictions=predictions, parameters=parameters)
 
 
-def get_container_input(data_directory, selection_file, prediction_directory):
-    """Resolve files without loading them; prediction keys retain their relative subfolders."""
+def get_container_input(data_directory, selection_file, prediction_directory,
+                        output_directory, model_directory):
+    """Resolve CSV paths and the destination; read the saved model's parameters."""
     data_path = Path(data_directory) / "data.csv"
     if not data_path.is_file():
         raise FileNotFoundError(f"Postprocess needs the original GetData snapshot: {data_path}")
@@ -59,7 +43,29 @@ def get_container_input(data_directory, selection_file, prediction_directory):
         print(json.dumps({"event": "prediction_input_csv", "path": str(path),
                           "relative_path": name}), flush=True)
         predictions[name] = path
-    return data_path, selection_path, predictions
+    parameters = load_model_parameters(model_directory)
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    print(json.dumps({
+        "event": "postprocess_inputs", "data_file": str(data_path),
+        "selection_file": str(selection_path), "prediction_directory": str(source),
+        "output_directory": str(output), "parameters_source": str(model_directory),
+        "project": parameters.get("project"), "test_ymid": parameters.get("test_ymid"),
+    }), flush=True)
+    return data_path, selection_path, predictions, output, parameters
+
+
+def load_model_parameters(model_directory):
+    """Read parameters.json and model_metadata.json from the selected checkpoint."""
+    model = Path(model_directory)
+    if model.is_file():
+        with tarfile.open(model) as archive:
+            parameters = json.load(archive.extractfile("parameters.json"))
+            parameters["model_metadata"] = json.load(archive.extractfile("model_metadata.json"))
+    else:
+        parameters = json.loads((model / "parameters.json").read_text())
+        parameters["model_metadata"] = json.loads((model / "model_metadata.json").read_text())
+    return parameters
 
 
 def read_predictions(source, chunk_rows):
@@ -73,8 +79,21 @@ def read_predictions(source, chunk_rows):
                     yield pd.DataFrame(records)
 
 
-def write_container_output(output):
-    """Check and log all analysis files; the loader uploads them without rewriting them."""
+def convert_transform_predictions(source, destination, model_directory, chunk_rows):
+    """Adapt native Batch Transform JSON-lines output before calling CSV analysis."""
+    frames = list(read_predictions(source, chunk_rows))
+    if not frames:
+        raise ValueError("No Transform predictions were found.")
+    result = pd.concat(frames, ignore_index=True)
+    primary_key = load_model_parameters(model_directory)["primary_key"]
+    destination = Path(destination)
+    result.to_csv(destination / "predictions.csv", index=False)
+    result.to_csv(destination / "messaging_final.csv", index=False)
+    result[[primary_key]].to_csv(destination / "messaging.csv", index=False)
+
+
+def write_container_output(output, *, data_path, selection_file, predictions, parameters):
+    """Check analysis files and write run.json; the loader uploads the files unchanged."""
     output = Path(output)
     files = sorted(path for path in output.rglob("*") if path.is_file())
     if not files:
@@ -82,24 +101,30 @@ def write_container_output(output):
     for path in files:
         print(json.dumps({"event": "prediction_analysis_output", "path": str(path),
                           "relative_path": path.relative_to(output).as_posix()}), flush=True)
+    # This records artifact locations for the execution, not customer analysis metrics.
+    from mlops_models.pipelines.inspect import write_inference_report
+    write_inference_report(output, data_path=data_path, selection_file=selection_file,
+                           predictions=predictions, config=parameters)
     return output
 
 
-def postprocess(data_path, selection_file, predictions, output_directory, config):
+def prediction_inference(data_path, selection_file, predictions, output_directory, parameters):
     """Replace this demo with prediction analysis using explicit input and output paths.
 
     predictions maps relative CSV names to Paths, for example:
     {"output/predictions.csv": Path(...), "output/messaging_final.csv": Path(...)}.
     Pass those paths to the customer's analysis instead of reconstructing old
     notebook folders. Set its destination to output_directory and retain its
-    plot/report writes there. Model-specific names/settings belong in config.
+    plot/report writes there. Project and test YMID can be read from parameters
+    using the customer's actual keys (the example names are project and test_ymid).
     """
+    config = parameters
     # Only this example analysis chooses a particular input; the reader accepts all CSVs.
     matches = [name for name in predictions if Path(name).name.lower() == "messaging_final.csv"]
     if len(matches) != 1:
         raise ValueError("Example analysis needs exactly one messaging_final.csv at any depth; "
                          f"found {len(matches)}. Available CSVs: {list(predictions)}. "
-                         "Adapt postprocess() to select the files required by your analysis.")
+                         "Adapt prediction_inference() to select the files required by your analysis.")
     df = pd.read_csv(predictions[matches[0]], dtype={config["primary_key"]: str},
                      keep_default_na=False, na_values=["", r"\N"])
     task = config["task_type"]
@@ -142,3 +167,8 @@ def postprocess(data_path, selection_file, predictions, output_directory, config
     df.to_csv(path, index=False)
     (output / "summary.json").write_text(json.dumps({
         "rows": len(df), "task": task, "file": path.name}) + "\n")
+
+
+def prediction_test(data_path, selection_file, predictions, output_directory, parameters):
+    """Placeholder for customer test analysis; the demo writes the same example files."""
+    prediction_inference(data_path, selection_file, predictions, output_directory, parameters)

@@ -501,6 +501,15 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                     "artifact" if step["Name"] == "GetData" else model_code_source)
         if kind == "inference":
             configure_monitoring(body, monitoring, namespace, job_role, region, environment, batch_runtime)
+            body["Parameters"].append({
+                "Name": "PredictionAnalysis", "Type": "String",
+                "DefaultValue": "prediction_inference",
+                "EnumValues": ["prediction_inference", "prediction_test"],
+            })
+            for step in walk_steps(body["Steps"]):
+                if step["Name"] == "Postprocess":
+                    step["Arguments"]["Environment"]["MLOPS_ANALYSIS_MODE"] = {
+                        "Get": "Parameters.PredictionAnalysis"}
         if kind == "training":
             configure_registration(body, source_uri, region)
         configure_execution_records(body, kind, namespace, job_role, region, environment, batch_runtime)
