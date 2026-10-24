@@ -83,6 +83,8 @@ def evaluate_saved_model(model_id, model_dir, test_file, output):
     model_source = json.loads(identity_path.read_text()) if identity_path.is_file() else {}
     report["model_source_commit"] = model_source.get("commit", "unknown")
     report["model_source_dirty"] = str(model_source.get("dirty", True)).lower()
+    report["model_source_uri"] = model_source.get("uri", "")
+    report["model_source_digest"] = model_source.get("sha256", "")
     report["evaluation_source_commit"] = os.getenv("SOURCE_COMMIT", "unknown")
 
     # Compare the returned scores with configured limits; this is the quality gate.

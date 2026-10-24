@@ -97,7 +97,8 @@ def upload_source(session, s3_root, identity, *, expected_uri=None):
     put_immutable(s3, bucket, prefix + "/load_source.py", files["runtime/load_source.py"])
     # Publish the identity last, after every runtime file is present.
     put_immutable(s3, bucket, prefix + "/source.json",
-                  (json.dumps(identity, sort_keys=True, indent=2) + "\n").encode())
+                  (json.dumps({**identity, "uri": uri, "sha256": revision},
+                              sort_keys=True, indent=2) + "\n").encode())
     return uri
 
 
@@ -121,11 +122,11 @@ def preparation_fingerprint(session, csv_uri, local_csv=None):
     for path in source_files():
         relative = path.relative_to(PACKAGE)
         # These modules do not run in preparation jobs. Unknown shared helpers do.
-        if relative.parts[0] in {"pipelines", "registry"} or "inference" in relative.parts:
+        if relative.parts[0] in {"pipelines", "registry", "monitoring"} or "inference" in relative.parts:
             continue
         steps = digests.keys()
         if relative.parent == Path("entrypoints"):
-            if path.name in {"train.py", "evaluate.py", "predict.py", "postprocess.py",
+            if path.name in {"train.py", "evaluate.py", "predict.py", "postprocess.py", "drift.py",
                              "preprocess_inference.py", "serve.py"}:
                 continue
             if path.name in entrypoints:
@@ -148,21 +149,29 @@ def pipeline_fingerprints(session, csv_uri="", local_csv=None):
     """Identify the source consumed by each expensive step, independently."""
     revisions = preparation_fingerprint(session, csv_uri, local_csv)
     digests = {name: hashlib.sha256() for name in
-               ("Train", "Evaluate", "BatchPreprocess", "Score", "Postprocess")}
+               ("Train", "Evaluate", "BatchPreprocess", "Score", "Postprocess", "DriftComparison")}
     entrypoints = {"train.py": ("Train",), "evaluate.py": ("Evaluate",),
                    "preprocess_inference.py": ("Train", "BatchPreprocess"),
                    "predict.py": ("Train", "Evaluate", "Score"),
                    "postprocess.py": ("Train", "Evaluate", "Postprocess"),
+                   "drift.py": ("Train", "DriftComparison"),
                    "serve.py": ("Train",)}
     inference = {"preprocess.py": ("Train", "BatchPreprocess"),
                  "predict.py": ("Train", "Evaluate", "Score"),
-                 "postprocess.py": ("Train", "Evaluate", "Postprocess")}
+                 "postprocess.py": ("Train", "Evaluate", "Postprocess"),
+                 "drift.py": ("Train", "DriftComparison")}
     for path in source_files():
         relative = path.relative_to(PACKAGE)
-        if relative.parts[0] in {"pipelines", "registry"} or path.name == "definition.json":
+        if (relative.parts[0] in {"pipelines", "registry"} and relative != Path("pipelines/inspect.py")
+                or path.name == "definition.json"):
             continue
         steps = digests.keys()
-        if relative.parent == Path("entrypoints") and path.name in entrypoints:
+        if relative.parts[0] == "monitoring":
+            # Monitoring code is saved in the trained model's source archive.
+            steps = ("Train", "DriftComparison")
+        elif relative == Path("pipelines/inspect.py"):
+            steps = ("Postprocess", "DriftComparison")
+        elif relative.parent == Path("entrypoints") and path.name in entrypoints:
             steps = entrypoints[path.name]
         elif relative.parent == Path("entrypoints") and path.name in {
                 "get_data.py", "feature_selection.py", "preprocess_training.py"}:
@@ -185,6 +194,10 @@ def pipeline_fingerprints(session, csv_uri="", local_csv=None):
 def configure_step_cache(body, revisions, kind, data_source):
     """Cache compute steps; keep registry checks and side effects live."""
     for step in walk_steps(body["Steps"]):
+        if step["Arguments"].get("Environment", {}).get("MLOPS_WRITE_RUN_REPORT") == "1":
+            # The final report describes this execution, including cached producers.
+            step.pop("CacheConfig", None)
+            continue
         name = ({"GetData": "BatchGetData", "Preprocess": "BatchPreprocess"}.get(step["Name"], step["Name"])
                 if kind == "inference" else step["Name"])
         if name not in revisions or step["Type"] not in {"Processing", "Training"}:
@@ -287,7 +300,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                       data_source="feature_store", inference_data_source=None, csv_input_uri="", preparation_cache_revision="",
                       model_package_group="", environment="dev", registry_group_prefix="",
                       include_hpo=False, step_cache_revisions=None, model_code_source="artifact",
-                      tracking=None):
+                      tracking=None, monitoring=None):
     """Render training registration and inference from an approved Registry version."""
     if batch_runtime == "both":
         settings = dict(
@@ -301,7 +314,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
         )
         definitions = build_definitions(
             namespace, job_role, image, s3_root, source_uri, identity,
-            batch_runtime="processing", model_code_source=model_code_source, **settings)
+            batch_runtime="processing", model_code_source=model_code_source, monitoring=monitoring, **settings)
         native = build_definitions(
             namespace, job_role, image, s3_root, source_uri, identity,
             batch_runtime="transform", model_code_source="artifact", **settings)
@@ -390,7 +403,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                                 Release=identity["name"], BatchRuntime=batch_runtime, DataSource=data_sources[kind],
                                 RegistryMode="model_registry", Environment=environment,
                                 ModelCodeSource=model_code_source,
-                                HpoEnabled=str(include_hpo).lower())
+                                HpoEnabled=str(include_hpo).lower(),
+                                DeploymentNamespace=namespace, RegistryStage="Development")
         for step in walk_steps(body["Steps"]):
             args = step["Arguments"]
             if step["Type"] == "Processing":
@@ -436,7 +450,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             from .training_files import configure_file_training
             configure_file_training(body)
         if kind == "inference":
-            configure_approved_inference(body, group, source_uri, batch_runtime, region)
+            configure_approved_inference(body, group, source_uri, batch_runtime, region,
+                                         model_code_source=model_code_source)
         if data_sources[kind] == "feature_store":
             configure_feature_store(body, feature_store_config_uri, universe_data_root, region)
         else:
@@ -478,118 +493,118 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                     "Evaluate", "EvaluateTuned", "GetData", "Preprocess", "Score", "Postprocess"}:
                 if kind == "training" and step["Name"] in {"GetData", "Preprocess"}:
                     continue
-                # Evaluation is independently editable. Batch defaults to code
-                # packaged with the approved Registry model.
+                # Evaluation belongs to this training deployment. Inference
+                # consistently uses the selected model release by default.
                 step["Arguments"]["Environment"]["MLOPS_MODEL_CODE_SOURCE"] = (
-                    "pipeline" if kind == "training" or step["Name"] == "GetData" else model_code_source)
-        if step_cache_revisions:
-            configure_step_cache(body, step_cache_revisions, kind, data_sources[kind])
+                    "pipeline" if kind == "training" else
+                    "artifact" if step["Name"] == "GetData" else model_code_source)
+        if kind == "inference":
+            configure_monitoring(body, monitoring, namespace, job_role, region, environment, batch_runtime)
         if kind == "training":
             configure_registration(body, source_uri, region)
+        configure_execution_records(body, kind, namespace, job_role, region, environment, batch_runtime)
+        if step_cache_revisions:
+            configure_step_cache(body, step_cache_revisions, kind, data_sources[kind])
         definitions[kind] = flatten_joins(body)
     configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
                        s3_root, environment, infrastructure, region)
     return definitions
 
 
+def configure_execution_records(body, kind, namespace, job_role, region, environment, batch_runtime):
+    """Attach stable producer identity; final Processing inference writes run.json."""
+    partition, account = job_role.split(":")[1], job_role.split(":")[4]
+    pipeline = f"arn:{partition}:sagemaker:{region}:{account}:pipeline/{namespace}-{kind}"
+    for step in walk_steps(body["Steps"]):
+        if step["Type"] not in {"Processing", "Training"}:
+            continue
+        args = step["Arguments"]
+        args.setdefault("Environment", {}).update(
+            MLOPS_PIPELINE_ARN=pipeline, MLOPS_STEP_NAME=step["Name"], MLOPS_ENVIRONMENT=environment)
+        if (kind == "inference" and batch_runtime == "processing" and step["Type"] == "Processing"
+                and args["AppSpecification"]["ContainerEntrypoint"][-1] in {"postprocess", "drift"}):
+            resolver = next(s for s in body["Steps"] if s["Name"] == "ResolveModel")
+            decision_uri = resolver["Arguments"]["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
+            args["Environment"].update(
+                MLOPS_WRITE_RUN_REPORT="1",
+                MLOPS_MODEL_PACKAGE={"Std:JsonGet": {"S3Uri": join(decision_uri, "package.json"), "Path": "package"}})
+
+
+def configure_monitoring(body, settings, namespace, job_role, region, environment, batch_runtime):
+    """Run a separate comparison job only when ReferenceExecutionArn is supplied."""
+    if not settings or not settings.get("enabled", False):
+        return
+    if batch_runtime != "processing":
+        raise ValueError("Integrated monitoring currently requires Processing inference.")
+    allowed = {"enabled", "threshold", "drift_share", "prediction_file", "score_column"}
+    if set(settings) - allowed:
+        raise ValueError(f"Unknown monitoring settings: {sorted(set(settings) - allowed)}")
+    steps = {step["Name"]: step for step in body["Steps"]}
+    comparison = deepcopy(steps["Postprocess"])
+    comparison.update(Name="DriftComparison", DependsOn=["Postprocess"])
+    comparison.pop("CacheConfig", None)
+    args = comparison["Arguments"]
+    if args.get("NetworkConfig", {}).get("EnableNetworkIsolation", False):
+        raise ValueError("Reference monitoring needs connectivity to SageMaker and S3.")
+    body["Parameters"].append({"Name": "ReferenceExecutionArn", "Type": "String", "DefaultValue": ""})
+    args["ProcessingJobName"] = args["ProcessingJobName"].removesuffix("-post") + "-drift"
+    args["AppSpecification"]["ContainerEntrypoint"][-1] = "drift"
+    args["AppSpecification"].pop("ContainerArguments", None)
+    # Reuse the selected model's source, image, raw data, selection and scores.
+    # The existing job settings carry the role, network and encryption bindings.
+    args["ProcessingOutputConfig"]["Outputs"] = [{
+        "OutputName": "comparison", "AppManaged": True, "S3Output": {
+            "S3Uri": join({"Get": "Parameters.OutputDataRoot"}, {"Get": "Parameters.ModelId"},
+                          "runs", {"Get": "Execution.PipelineExecutionId"}, "reports/drift"),
+            "LocalPath": "/opt/ml/processing/output", "S3UploadMode": "EndOfJob"}}]
+    args["Environment"].update({
+        "MLOPS_MONITORING_CONFIG": json.dumps(settings, sort_keys=True),
+        "MLOPS_REFERENCE_EXECUTION_ARN": {"Get": "Parameters.ReferenceExecutionArn"},
+    })
+    body["Steps"].append({
+        "Name": "HasReference", "Type": "Condition", "DependsOn": ["Postprocess"],
+        "Arguments": {
+            "Conditions": [{"Type": "Not", "Condition": {
+                "Type": "Equals", "LeftValue": {"Get": "Parameters.ReferenceExecutionArn"}, "RightValue": ""}}],
+            "IfSteps": [comparison], "ElseSteps": [],
+        },
+    })
+    body["Metadata"]["Monitoring"] = "Conditional DriftComparison; ReferenceExecutionArn; same inference MLflow run"
+
+
 def configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
                        s3_root, environment, infrastructure, region):
-    """Add tracking jobs to the pipeline definitions; do not launch them here.
-
-    1. Validate tracking settings and describe the Processing job command/inputs.
-    2. Place StartTracking before model work and a final job after each result branch.
-    3. Record the tracking configuration in the generated definition metadata.
-
-    When these jobs execute, python -m mlops_models.pipelines.tracking runs main(),
-    which reads the supplied pipeline execution ARN and updates its MLflow run.
-    """
+    """Configure direct logging in the existing jobs, using their one approved image."""
     from .tracking import validate_tracking
 
-    # 1. Resolve the optional settings; an empty value leaves tracking disabled.
     tracking = validate_tracking(tracking)
     if tracking is None:
         return
-    infrastructure = infrastructure or {}
-    if infrastructure.get("network", {}).get("isolation"):
-        raise ValueError("MLflow tracking needs connectivity to its service and S3.")
+    if tracking.get("image_uri") and tracking["image_uri"] != image:
+        raise ValueError("Tracking runs in the model image; remove the separate tracking image.")
+    if (infrastructure or {}).get("network", {}).get("isolation"):
+        raise ValueError("MLflow logging needs connectivity to its service and S3.")
+    partition, account = job_role.split(":")[1], job_role.split(":")[4]
     for kind, body in definitions.items():
-        settings = {**tracking, "s3_root": s3_root, "environment": environment, "kind": kind,
-                    "kms_key": infrastructure.get("output_kms_key_arn", "")}
-
-        def observer(name, phase, dependencies=()):
-            """Build one tracking job's definition, including its command and runtime inputs."""
-            # The command enters tracking.main(). This only constructs request data.
-            args = {
-                "RoleArn": job_role,
-                # SageMaker adds its execution/token suffix to this literal prefix.
-                "ProcessingJobName": f"{namespace}-track-{phase}",
-                "AppSpecification": {
-                    "ImageUri": tracking.get("image_uri") or image,
-                    "ContainerEntrypoint": [
-                        "python", "-m", "mlops_models.pipelines.tracking", "--phase", phase,
-                    ],
-                },
-                "ProcessingInputs": [source_input(source_uri)],
-                "ProcessingResources": {"ClusterConfig": {
-                    "InstanceType": tracking.get("instance_type", "ml.m5.large"),
-                    "InstanceCount": 1, "VolumeSizeInGB": 30,
-                }},
-                "Environment": {
-                    "PYTHONPATH": "/opt/ml/processing/source", "PYTHONUNBUFFERED": "1",
-                    "AWS_DEFAULT_REGION": region,
-                    "PYTHONSAFEPATH": "1", "MLFLOW_HTTP_REQUEST_TIMEOUT": "15",
-                    "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "2",
-                    # main() reads these environment variables inside the job.
-                    # The Get expression is resolved for the running pipeline execution.
-                    # Processing limits each environment value to 256 characters.
-                    "MLOPS_TRACKING_URI": settings["uri"],
-                    "MLOPS_TRACKING_EXPERIMENT_PREFIX": settings["experiment_prefix"],
-                    "MLOPS_TRACKING_S3_ROOT": settings["s3_root"],
-                    "MLOPS_TRACKING_ENVIRONMENT": settings["environment"],
-                    "MLOPS_TRACKING_KIND": settings["kind"],
-                    "MLOPS_TRACKING_KMS_KEY": settings["kms_key"],
-                    "PIPELINE_EXECUTION_ARN": {"Get": "Execution.PipelineExecutionArn"},
-                },
-                "StoppingCondition": {"MaxRuntimeInSeconds": 600},
-            }
-            network = infrastructure.get("network", {})
-            if network.get("subnet_ids"):
-                args["NetworkConfig"] = {"EnableNetworkIsolation": False, "VpcConfig": {
-                    "Subnets": network["subnet_ids"], "SecurityGroupIds": network["security_group_ids"],
-                }}
-            if infrastructure.get("volume_kms_key_arn"):
-                args["ProcessingResources"]["ClusterConfig"]["VolumeKmsKeyId"] = infrastructure["volume_kms_key_arn"]
-            step = {"Name": name, "Type": "Processing", "Arguments": args}
-            if dependencies:
-                step["DependsOn"] = list(dependencies)
-            return step
-
-        # 2. Wire the jobs into the graph. StartTracking checks job-role access and
-        # creates/updates the MLflow run before expensive model work begins.
-        for step in body["Steps"]:
-            if step["Name"] in {"GetData", "ResolveModel"}:
-                step.setdefault("DependsOn", []).append("StartTracking")
-        body["Steps"].insert(0, observer("StartTracking", "start"))
-
-        endings = {"RegisterModel": "TrackTraining", "RegisterTunedModel": "TrackTunedTraining",
-                   "Postprocess": "TrackInference", "PostprocessTransform": "TrackTransform"}
-
-        def add_finish(steps):
-            """Append a final tracking job after each successful result branch."""
-            for step in list(steps):
-                if step["Name"] in endings:
-                    steps.append(observer(endings[step["Name"]], "finish", [step["Name"]]))
-                if step["Type"] == "Condition":
-                    for branch in ("IfSteps", "ElseSteps"):
-                        add_finish(step["Arguments"].get(branch, []))
-
-        add_finish(body["Steps"])
-
-        # 3. Retain the tracking settings in the published pipeline definition.
-        # Pipeline Metadata values are strings, including structured settings.
+        pipeline_arn = f"arn:{partition}:sagemaker:{region}:{account}:pipeline/{namespace}-{kind}"
+        for step in walk_steps(body["Steps"]):
+            if step["Type"] not in {"Processing", "Training"}:
+                continue
+            # These values are stable across executions. The loader derives the
+            # execution ID at runtime, so tracking does not invalidate step caching.
+            step["Arguments"].setdefault("Environment", {}).update({
+                "MLOPS_TRACKING_URI": tracking["uri"],
+                "MLOPS_TRACKING_EXPERIMENT_PREFIX": tracking["experiment_prefix"],
+                "MLOPS_TRACKING_S3_ROOT": s3_root,
+                "MLOPS_TRACKING_ENVIRONMENT": environment,
+                "MLOPS_TRACKING_KIND": kind,
+                "MLOPS_TRACKING_STEP": step["Name"],
+                "MLOPS_TRACKING_PIPELINE_ARN": pipeline_arn,
+                "MLOPS_TRACKING_KMS_KEY": (infrastructure or {}).get("output_kms_key_arn", ""),
+            })
         body["Metadata"]["Tracking"] = json.dumps({
             "uri": tracking["uri"], "experiment_prefix": tracking["experiment_prefix"],
-            "status_reconciliation": "optional operations/completion adapter; sync_execution for operator replay",
+            "logging": "direct from model jobs", "final_status_owner": "notebook or orchestrator",
         }, sort_keys=True)
 
 
@@ -617,15 +632,24 @@ def combine_inference_runtimes(processing, transform):
                     return f"Steps.{after}." + value[len(f"Steps.{before}."):]
         return value
 
+    drift_gate = next((s for s in processing["Steps"] if s["Name"] == "HasReference"), None)
     body["Steps"] = deepcopy(processing_shared) + [{
         "Name": "InferenceMode", "Type": "Condition", "DependsOn": ["GetData"],
         "Arguments": {
             "Conditions": [{"Type": "Equals", "LeftValue": {"Get": "Parameters.InferenceRuntime"},
                             "RightValue": "transform"}],
             "IfSteps": rename([s for s in transform["Steps"] if s["Name"] not in shared]),
-            "ElseSteps": deepcopy([s for s in processing["Steps"] if s["Name"] not in shared]),
+            "ElseSteps": deepcopy([s for s in processing["Steps"]
+                                  if s["Name"] not in shared and s["Name"] != "HasReference"]),
         },
     }]
+    if drift_gate:
+        # Keep conditions at the top level; nested Condition steps are unsupported.
+        gate = deepcopy(drift_gate)
+        gate["DependsOn"] = ["GetData"]
+        gate["Arguments"]["Conditions"].append({
+            "Type": "Equals", "LeftValue": {"Get": "Parameters.InferenceRuntime"}, "RightValue": "processing"})
+        body["Steps"].append(gate)
     existing = {parameter["Name"]: parameter for parameter in body["Parameters"]}
     for parameter in transform["Parameters"]:
         if parameter["Name"] not in existing:
@@ -668,8 +692,11 @@ def configure_registration(body, source_uri, region):
             "IMAGE_URI": request["InferenceSpecification"]["Containers"][0]["Image"],
             "EVALUATION_URI": report_uri, "REGISTRATION_OUTPUT_URI": output_uri,
             "SOURCE_URI": source_uri, "DEPLOY_MODE": body["Metadata"]["DeployMode"],
+            "DEPLOYMENT_NAMESPACE": body["Metadata"]["DeploymentNamespace"],
+            "ENVIRONMENT": body["Metadata"]["Environment"],
             "PIPELINE_EXECUTION_ARN": {"Get": "Execution.PipelineExecutionArn"},
             "AWS_DEFAULT_REGION": region, "PYTHONUNBUFFERED": "1",
+            "PYTHONPATH": "/opt/ml/processing/source", "PYTHONSAFEPATH": "1",
             "S3_KMS_KEY": args["ProcessingOutputConfig"].get("KmsKeyId", ""),
         }
         step.update(Type="Processing", Arguments=args)
@@ -724,7 +751,8 @@ def configure_feature_store(body, config_uri, universe_root, region):
         )
 
 
-def configure_approved_inference(body, group, source_uri, batch_runtime, region):
+def configure_approved_inference(body, group, source_uri, batch_runtime, region, *,
+                                 model_code_source="artifact"):
     """Resolve one approved package, then feed its exact image and checkpoint to all scoring steps."""
     steps = {step["Name"]: step for step in body["Steps"]}
     resolver = steps["ValidatePackage"]
@@ -732,9 +760,13 @@ def configure_approved_inference(body, group, source_uri, batch_runtime, region)
     args = resolver["Arguments"]
     args["Environment"] = {"MODEL_ID": {"Get": "Parameters.ModelId"},
                            "MODEL_PACKAGE_GROUP": group, "PYTHONUNBUFFERED": "1",
+                           "DEPLOYMENT_NAMESPACE": body["Metadata"]["DeploymentNamespace"],
+                           "ENVIRONMENT": body["Metadata"]["Environment"],
                            "AWS_DEFAULT_REGION": region}
     args["AppSpecification"]["ContainerEntrypoint"][-1] = "resolve-model"
-    args["AppSpecification"]["ContainerArguments"] = ["--output", "/opt/ml/processing/output"]
+    args["AppSpecification"]["ContainerArguments"] = [
+        "--output", "/opt/ml/processing/output",
+        "--model-package", {"Get": "Parameters.ModelPackageArn"}]
     args["ProcessingInputs"] = [source_input(source_uri)]
     args["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["LocalPath"] = "/opt/ml/processing/output"
     decision_uri = args["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
@@ -747,6 +779,7 @@ def configure_approved_inference(body, group, source_uri, batch_runtime, region)
     ])
     body["Parameters"] = [p for p in body["Parameters"]
                            if p["Name"] not in {"ModelDataUri", "InferenceImageUri", "ModelPackageArn"}]
+    body["Parameters"].append({"Name": "ModelPackageArn", "Type": "String", "DefaultValue": ""})
     steps = {step["Name"]: step for step in body["Steps"]}
     for name in ("GetData", "Preprocess", "CreateModel", "Postprocess"):
         dependencies = steps[name].setdefault("DependsOn", [])
@@ -755,6 +788,12 @@ def configure_approved_inference(body, group, source_uri, batch_runtime, region)
         args = steps[name]["Arguments"]
         if steps[name]["Type"] == "Processing":
             args["AppSpecification"]["ImageUri"] = selected("image")
+            if model_code_source == "artifact" or name == "GetData":
+                # Use the saved release even for the loader and reporting code.
+                # The Registry resolver itself remains current deployment policy.
+                for item in args["ProcessingInputs"]:
+                    if item["InputName"] == "source":
+                        item["S3Input"]["S3Uri"] = selected("source_uri")
     steps["CreateModel"]["Arguments"]["PrimaryContainer"]["Environment"].update(
         PYTHONPATH="/opt/ml/model/code", PYTHONSAFEPATH="1")
     if batch_runtime == "transform":

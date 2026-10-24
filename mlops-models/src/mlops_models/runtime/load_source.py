@@ -16,6 +16,7 @@ from contextlib import nullcontext
 import csv
 import json
 import os
+import runpy
 from pathlib import Path
 import sys
 import tarfile
@@ -98,6 +99,11 @@ def upload_training_outputs(work):
                           "destination": uri, "bytes": archive_path.stat().st_size}), flush=True)
         s3.upload_file(str(archive_path), location.netloc, location.path.lstrip("/"),
                        ExtraArgs=encryption)
+    # The same record is readable without downloading/unpacking the trained model.
+    location = urlparse(os.environ["MLOPS_TRAINING_MODEL_URI"])
+    s3.upload_file(str(model / "_execution.json"), location.netloc,
+                   location.path.lstrip("/").rsplit("/", 1)[0] + "/_execution.json",
+                   ExtraArgs=encryption)
     print(json.dumps({"event": "training_outputs_uploaded",
                       "model_uri": os.environ["MLOPS_TRAINING_MODEL_URI"],
                       "reports_uri": os.environ["MLOPS_TRAINING_REPORTS_URI"]}), flush=True)
@@ -134,6 +140,8 @@ def main():
     parser.add_argument("--output")
     selected, _ = parser.parse_known_args()
     source = Path(__file__).resolve().parent
+    recording_source = source / "mlops_models/runtime/execution.py"
+    logging_source = source / "mlops_models/pipelines/tracking.py"
     original_directory, original_arguments = Path.cwd(), sys.argv[:]
     original_path = sys.path[:]
     managed_training = selected.step == "train" and bool(
@@ -145,6 +153,7 @@ def main():
                           "MLOPS_TRAINING_MODEL_URI", "MLOPS_TRAINING_REPORTS_URI", "MLOPS_TRAINING_KMS_KEY")
     original_environment = {key: os.environ.get(key) for key in training_variables}
     original_tempdir = tempfile.tempdir
+    output_config = None
 
     try:
         # 2. Prepare local input/code and writable output locations.
@@ -158,7 +167,7 @@ def main():
             # Inference/evaluation unpack the supplied model. Choose its archived
             # code or the separately uploaded pipeline code before importing modules.
             checkpoint = None
-            if selected.step in {"get-inference-data", "evaluate", "preprocess", "score", "predict", "postprocess"}:
+            if selected.step in {"get-inference-data", "evaluate", "preprocess", "score", "predict", "postprocess", "drift"}:
                 archive_path = selected.model_dir or "/opt/ml/processing/model/model.tar.gz"
                 checkpoint = Path(work) / "model"
                 with tarfile.open(archive_path, "r:gz") as archive:
@@ -212,8 +221,10 @@ def main():
                     if not separator or not suffix.split("/")[0]:
                         raise ValueError("Cached steps need an execution-scoped /runs/<id>/ output.")
                     os.environ["PIPELINE_EXECUTION_ID"] = suffix.split("/")[0]
-                os.environ.update(SOURCE_COMMIT=source_metadata.get("commit", "uncommitted"),
-                                  SOURCE_DIRTY=str(source_metadata.get("dirty", True)).lower())
+            # Report the code actually loaded, including uncached Postprocess
+            # from an older registered release after the pipeline is republished.
+            os.environ.update(SOURCE_COMMIT=source_metadata.get("commit", "uncommitted"),
+                              SOURCE_DIRTY=str(source_metadata.get("dirty", True)).lower())
             print(json.dumps({"event": "source_loaded", "step": selected.step,
                               "source": str(source),
                               "model_code_source": os.getenv("MLOPS_MODEL_CODE_SOURCE", "artifact") if checkpoint else "pipeline",
@@ -245,6 +256,9 @@ def main():
             if os.getenv("MLOPS_PROCESSING_OUTPUT_UPLOAD") == "application" and selected.step != "train":
                 job = processing_job or json.loads(Path("/opt/ml/config/processingjobconfig.json").read_text())
                 output_config = job["ProcessingOutputConfig"]
+                output_uri = output_config["Outputs"][0]["S3Output"]["S3Uri"]
+                if "/runs/" in output_uri:
+                    os.environ["PIPELINE_EXECUTION_ID"] = output_uri.rsplit("/runs/", 1)[1].split("/")[0]
                 from mlops_models.runtime.job_paths import job_paths
                 output_dir = Path(selected.output or job_paths(selected.step)[1])
                 scratch = Path(work) / "outputs"
@@ -262,44 +276,79 @@ def main():
                 selection_file = prepare_inference_inputs(checkpoint, preparation_output, selected.model)
                 sys.argv.extend(["--selection", str(selection_file)])
 
-            # 3. RUN THE MODEL STEP through entrypoints.__main__.main().
-            # Its selected entrypoint delegates to the use-case/model_base function.
-            dispatch_command()
+            # The published source mount supplies the standalone logger. For
+            # model-bound inference that mount is the registered source release.
+            logger = runpy.run_path(str(logging_source)) if os.getenv("MLOPS_TRACKING_URI") else None
+            connection = logger["job_tracking"](selected.model, output_uri) if logger else nullcontext(None)
+            with connection as tracking:
+                # 3. RUN THE MODEL STEP through entrypoints.__main__.main().
+                # Its selected entrypoint delegates to the use-case/model_base function.
+                dispatch_command()
 
-            # 4. Describe which execution/code produced the files just written.
-            # write_execution_record() saves this dictionary as _execution.json.
-            execution_record = {
-                "step": selected.step, "source": source_metadata,
-                "producer_execution_id": os.getenv("PIPELINE_EXECUTION_ID", ""),
-                "step_revision": os.getenv("MLOPS_STEP_REVISION", os.getenv("MLOPS_PREPARATION_REVISION", "")),
-                "model_code_source": os.getenv("MLOPS_MODEL_CODE_SOURCE", "artifact") if checkpoint else "pipeline",
-            }
-            # Preserve source settings and saved-model settings separately; inference
-            # can use newer source with an older registered model.
-            if selected.model:
-                parameter_file = source / "mlops_models/models" / selected.model / "parameters.json"
-                if parameter_file.is_file():
-                    execution_record["source_parameters"] = json.loads(parameter_file.read_text())
-            if checkpoint and (Path(checkpoint) / "parameters.json").is_file():
-                execution_record["checkpoint_parameters"] = json.loads(
-                    (Path(checkpoint) / "parameters.json").read_text())
+                # 4. Describe which execution/code produced the files just written.
+                # write_execution_record() saves this dictionary as _execution.json.
+                execution_record = {
+                    "step": os.getenv("MLOPS_STEP_NAME", selected.step), "source": source_metadata,
+                    "producer_execution_id": os.getenv("PIPELINE_EXECUTION_ID", ""),
+                    "step_revision": os.getenv("MLOPS_STEP_REVISION", os.getenv("MLOPS_PREPARATION_REVISION", "")),
+                    "model_code_source": os.getenv("MLOPS_MODEL_CODE_SOURCE", "artifact") if checkpoint else "pipeline",
+                }
+                # Preserve source settings and saved-model settings separately; inference
+                # can use newer source with an older registered model.
+                if selected.model:
+                    parameter_file = source / "mlops_models/models" / selected.model / "parameters.json"
+                    if parameter_file.is_file():
+                        execution_record["source_parameters"] = json.loads(parameter_file.read_text())
+                if checkpoint and (Path(checkpoint) / "parameters.json").is_file():
+                    execution_record["checkpoint_parameters"] = json.loads(
+                        (Path(checkpoint) / "parameters.json").read_text())
+                if checkpoint and (Path(checkpoint) / "_execution.json").is_file():
+                    execution_record["model_training"] = json.loads(
+                        (Path(checkpoint) / "_execution.json").read_text())
+                if output_config is not None:
+                    execution_record["outputs"] = {item["OutputName"]: item["S3Output"]["S3Uri"]
+                                                   for item in output_config["Outputs"]}
 
-            # Save that record beside each result, then upload the result files.
-            if managed_training:
-                write_execution_record(work / "output", execution_record)
-                write_execution_record(work / "model", execution_record)
-                upload_training_outputs(work)
-            if output_config is not None:
-                for item in output_config["Outputs"]:
-                    relative = Path(item["S3Output"]["LocalPath"]).relative_to(output_dir)
-                    write_execution_record(scratch / relative, execution_record)
-                upload_processing_outputs(output_config, output_dir, scratch)
+                if tracking is not None:
+                    execution_record["mlflow"] = {key: tracking[key] for key in
+                        ("run_id", "tracking_uri", "experiment_id", "execution_arn")}
+                # Save that record beside each result, then upload the result files.
+                if managed_training:
+                    execution_record.update(
+                        record_version=1,
+                        producer_execution_arn=(os.environ["MLOPS_PIPELINE_ARN"] + "/execution/" +
+                                                os.environ["PIPELINE_EXECUTION_ID"]
+                                                if os.getenv("MLOPS_PIPELINE_ARN") else ""),
+                        model_artifact=os.environ["MLOPS_TRAINING_MODEL_URI"],
+                        artifacts=[], datasets=[], registry=[],
+                        reports={path.name: json.loads(path.read_text())
+                                 for path in (work / "output").glob("*.json")
+                                 if path.name != "_execution.json"})
+                    write_execution_record(work / "output", execution_record)
+                    write_execution_record(work / "model", execution_record)
+                    upload_training_outputs(work)
+                if output_config is not None:
+                    recording = runpy.run_path(str(recording_source))
+                    execution_record = recording["processing_record"](
+                        job, execution_record, output_dir, scratch)
+                    for item in output_config["Outputs"]:
+                        relative = Path(item["S3Output"]["LocalPath"]).relative_to(output_dir)
+                        write_execution_record(scratch / relative, execution_record)
+                    upload_processing_outputs(output_config, output_dir, scratch)
+                # Log from the job that produced these files; the caller ends the shared run.
+                if logger:
+                    from mlops_models.runtime.job_paths import job_paths
+                    directories = ([work / "output", work / "model"] if managed_training else
+                                   [scratch / Path(item["S3Output"]["LocalPath"]).relative_to(output_dir)
+                                    for item in output_config["Outputs"]] if output_config is not None else
+                                   [Path(selected.output or job_paths(selected.step)[1])])
+                    logger["log_job_outputs"](tracking, directories, execution_record)
     finally:
         # 5. Restore process state even if the model step or an upload failed.
         os.chdir(original_directory)
         sys.argv[:] = original_arguments
         sys.path[:] = original_path
-        if cached_step:
+        if cached_step or output_config is not None:
             for key, value in original_provenance.items():
                 if value is None:
                     os.environ.pop(key, None)

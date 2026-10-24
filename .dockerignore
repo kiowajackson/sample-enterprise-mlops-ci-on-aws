@@ -1,9 +1,0 @@
-**
-!mlops-models/
-!mlops-models/src/
-!mlops-models/src/mlops_models/
-!mlops-models/src/mlops_models/**
-!mlops-models/mlops_skeleton/
-!mlops-models/mlops_skeleton/**
-**/__pycache__/**
-**/*.pyc

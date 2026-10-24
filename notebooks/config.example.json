@@ -6,5 +6,6 @@
   "registry_group_prefix": "",
   "csv_input": "",
   "feature_store_config_uri": "",
-  "tracking_uri": ""
+  "tracking_uri": "",
+  "namespace": ""
 }

@@ -1,184 +1,122 @@
-# Metrics, reports and execution completion
+# Direct logging, reports and execution status
 
-These helpers extend the existing training and inference pipelines. Model code
-still owns preprocessing, fitting, predictions and analysis.
+Model code owns preprocessing, fitting, predictions and analysis. The existing
+jobs log their outputs directly to one MLflow run for the pipeline execution.
+Training/evaluation share a run; inference gets its own run linked to the model.
+Inference monitoring adds its reports and metrics to that same inference run.
 
-## Publish prediction-analysis metrics
+## Capture analysis metrics and plots
 
-Keep the existing analysis files. Write an optional `metrics.json` directly in
-the supplied postprocessing output directory:
+Write optional `metrics.json` in the supplied analysis output directory:
 
 ```python
-import json
-
-metrics = {
-    "rmse": float(rmse),
-    "mae": float(mae),
-    "rows_labeled": int(len(labels)),
-    "r2": None,  # Leave unavailable metrics unreported.
-}
-(output_directory / "metrics.json").write_text(
-    json.dumps(metrics, indent=2, allow_nan=False) + "\n"
-)
+metrics = {"rmse": float(rmse), "mae": float(mae), "rows_labeled": int(len(labels))}
+(output_directory / "metrics.json").write_text(json.dumps(metrics, allow_nan=False))
 ```
 
-The file is a plain dictionary of names and numbers. The collector publishes
-`prediction.rmse`, `prediction.mae` and `prediction.rows_labeled` on this
-inference execution's MLflow run. Agree the metric definitions, units and
-evaluation population with the model owner. Save label/batch context in the
-analysis summary or another JSON file alongside the metrics.
+The runtime logs these as `prediction.rmse`, `prediction.mae`, etc. Null values are
+unavailable and are omitted. It uploads the existing analysis CSV/PNG/PDF/TXT/HTML/JSON
+files up to 10 MiB each, preserving subdirectories under `outputs/<step>/`.
+Known JSON reports are under `reports/<step>/`. Larger files and model binaries
+stay in their declared S3 outputs. No changes inside customer analysis are required.
+Report-producing jobs declare `MLOPS_LOG_ARTIFACTS=1`; new step names do not require
+editing a list inside the logger.
+An analysis function may also use the runtime's MLFLOW_TRACKING_URI/MLFLOW_RUN_ID;
+use explicit client logging and leave final run status to the caller.
 
-There is no dependency on MLflow inside customer analysis. With tracking disabled,
-the file is still uploaded to S3. With tracking enabled, the closing tracking job
-copies it and logs the numbers. Missing `metrics.json` preserves the existing
-behavior. A null metric is unavailable, not zero.
+## Finalize from the existing orchestrator
 
-FeatureSelection files are now included. CSV, PNG, PDF, TXT, HTML and JSON reports
-up to 10 MiB each are copied into MLflow. Known reports live under `reports/`;
-other files retain their subfolders under `outputs/<step>/`. Larger files stay
-in S3 and retain their links in the execution inventory. The collector does not
-derive scalar metrics from plots or arbitrary tables.
+The loader derives the execution ID inside the running job. It does not put a
+new MLflow run ID into the job definition's Environment, which participates in
+SageMaker cache keys. The S3 tracking receipt associates the execution with its run.
+A cache hit does not execute model or logging code: finalization records the original
+producer and makes its small reports available on the new execution run.
 
-## Find an execution's files
-
-Tracking writes:
+After SageMaker reaches Succeeded, Failed or Stopped, notebook 02 or the Airflow
+caller invokes `sync_execution(session, execution_arn, settings)`. This reads native
+status, finalizes the same MLflow run and updates:
 
 ```text
 <OutputDataRoot>/<ModelId>/runs/<execution-id>/run.json
 ```
 
-The index lists data, reports, model/Registry references, jobs, source records
-and the MLflow run. A cached step links its original producer/output. Failed
-steps retain their status and declared output locations; successful artifacts
-remain where their jobs wrote them.
+Processing inference's Postprocess writes this report after prediction analysis.
+When requested, DriftComparison extends it with comparison artifacts. Each producing job writes `_execution.json` describing its actual output
+files. The final report assembles those records and native cached-producer links;
+adding or renaming a step does not require artifact-discovery rules in `inspect.py`.
+Postprocess and DriftComparison remain uncached; upstream compute can reuse successful results.
+Before the job finishes uploading, the report says `outputs_prepared` and retains
+the native in-progress status. The caller refreshes final status, including upload
+failures. For training or an execution that fails before Postprocess, the caller
+assembles the available producer records.
 
-To create or refresh this index without MLflow:
+For executions started in Studio, run notebook 02's final cell after completion.
+Without that caller action, direct metrics/artifacts are visible but MLflow's run
+can remain RUNNING. No completion Lambda or tracking-only Processing job is deployed.
+The same finalization call handles failures, stops and executions consisting of cache hits.
 
-```python
-from mlops_models.pipelines.tracking import index_execution
+## Native SageMaker lineage
 
-index_uri = index_execution(session, execution_arn)
-print(index_uri)
-```
+Notebook 03 contains the optional native graph functions. They link existing data,
+source, model and job records without inventing duplicate jobs. Graph publication is
+an explicit notebook operation; it is not required for logging or ordinary execution.
 
-To refresh both MLflow and the index, use the existing `sync_execution` helper.
-A tracking-service failure can be retried without running the model again.
+## Evidently batch comparison
 
-## Complete tracking automatically
+Notebook 02's `monitoring` setting adds HasReference and a separate DriftComparison
+Processing step after Postprocess. Notebook 04 walks through an initial execution
+and a second execution with `ReferenceExecutionArn` pointing to the first. An empty
+reference skips DriftComparison entirely; Postprocess still writes customer analysis. An explicit reference
+must be a successful Processing inference for the same model/environment.
+The job reads that execution's `run.json` and its declared input/prediction locations,
+including the original producers when outputs were cached. The reference must
+have been run with this report-writing pipeline; older executions are not reconstructed
+using assumptions about their step names.
+It joins inputs/predictions by the configured record key; no model is re-scored.
+Current and reference populations need not contain the same record IDs.
 
-An in-pipeline closing job observes the pipeline while it is still running.
-Install the optional [completion adapter](../../operations/completion/README.md)
-to synchronize after SageMaker reports Succeeded, Failed or Stopped. The adapter
-also covers executions started through Studio.
+Under the current run's `reports/drift/monitoring/` folder, when comparison runs:
 
-The adapter reuses the tracking image, source, network and role from the definition
-for that specific execution. It launches a tracking-only Processing job. It does
-not retrain, score, register or approve a model. Duplicate native events reuse the
-same job; a failed completion job gets one retry. An operator can replay after
-correcting an access or service problem.
+- `evidently_data_drift/report.html`: selected feature distributions, when a reference is supplied.
+- `evidently_prediction_drift/report.html`: score distributions, when a reference is supplied.
+- `evidently_data_quality/report.html`: current and available reference dataset summaries.
+- `evidently_model_quality/report.html`: classification or regression quality when labels are available.
+- `metrics.json` and `summary.json`: metrics, availability and exact execution/model/S3 references.
 
-Deployment is separate from copying application code. BMO can adapt the included
-small resource example to its existing constructs or host the callback through
-its own platform. Keep the pipeline/job-role allowlists scoped to this application.
+MLflow report artifacts are under `outputs/DriftComparison/monitoring/`. Numeric metrics
+start with `monitoring.`; reference identities are also tags. Customer analysis
+keeps its own files, including its top-level `summary.json` and `metrics.json`.
+Postprocess calls customer analysis and execution reporting. The drift entrypoint
+dispatches to models/<ModelId>/inference/drift.py, which defaults to
+model_base/inference/drift.py. That base owns get_container_input(), comparison/report
+calls in compare_drift(), and write_container_output(). It uses monitoring/report.py
+as the shared Evidently generator. The main processing function updates run.json.
+Drift edits invalidate training so the new model archive contains the updated code. All Processing
+inference steps, including DriftComparison, use the selected model's saved source
+and pinned image. Train and approve a version containing the drift entrypoint
+before using the new graph. The current deployment's Registry resolver still
+controls which exact package is eligible.
+`load_source.py` prepares paths, loads the selected source, dispatches the entrypoint
+and uploads declared outputs; it does not invoke monitoring itself.
 
-## Try native SageMaker lineage
+Model-quality metrics require actual labels. Without labels the quality status is
+unavailable and the data reports still run. Without a reference, drift is not
+evaluated, no comparison job starts and no zero/healthy drift metric is emitted. Later outcomes can be joined
+to saved predictions and evaluated without scoring again. Model owners choose the
+prediction CSV/score column, thresholds, populations and business response.
+The report helper retains optional SNS publication for platform use; inference
+does not create alert infrastructure. Outcome ingestion, scheduling and alert
+routing remain platform integration work.
 
-[Notebook 03](../../notebooks/03_inspect_results.ipynb) inspects an existing
-execution and optionally publishes a native graph. It creates native Artifact
-records for input/output locations and reuses SageMaker's existing TrialComponent
-for each successful job, then associates them with the registered model. Cached
-steps use their original job identity. If native job metadata is missing or
-ambiguous, publication stops before writing metadata; resolve that condition and
-retry. It never creates a second job record. Feature Store group and population references are included when
-already present in GetData's provenance.
+The job role needs SageMaker execution/parameter/step reads, Processing job and
+model-package descriptions, and read access to the selected S3 reference (plus
+KMS decrypt where applicable). Existing MLflow permissions are unchanged.
 
-```python
-from mlops_models.pipelines.lineage import publish_lineage, query_lineage
+## One image
 
-native = publish_lineage(session, execution_arn)
-graph = query_lineage(session, native["package_roots"][0])
-print(native["receipt_uri"])
-```
-
-This is an explicit metadata-publication operation. It reads the existing job
-records and locations; no dataset hashing, split reconstruction or model execution
-is added. The graph identifies recorded locations and producers. It does not
-certify the bytes at a mutable S3 location.
-
-The caller needs the normal execution/job/output read permissions, plus
-`sagemaker:ListArtifacts`, `CreateArtifact`, `ListTrialComponents`,
-`ListAssociations`, `AddAssociation`, `QueryLineage`, and `AddTags` where required.
-Use the platform's approved lineage permission scope. Routine tracking jobs do
-not need these additional write permissions unless the platform deliberately
-hosts graph publication there.
-
-SageMaker queries one starting entity and up to ten relationship levels at a
-time. Query an intermediate job to inspect earlier inputs or a different branch.
-The receipt lists all relationships created/reused by this example.
-
-The graph is retained for review. The receipt's `jobs` mapping contains existing
-native TrialComponents; these are never owned by this publisher and must not be
-deleted during cleanup. `created` records this invocation's added artifacts and
-associations, and `owned_artifacts` identifies this example's artifact records.
-Preserve reused artifacts and native associations. No model/data resource needs
-to be deleted. Older receipts containing custom `actions` require a separate,
-scoped migration of their saved associations; normal publication does not remove
-existing records.
-
-## Run the small monitoring example
-
-[Notebook 04](../../notebooks/04_monitoring_example.ipynb) compares two supplied
-batches with Evidently. Its default data is explicitly synthetic. Install
-`requirements-monitoring.txt` in a notebook/report environment; the existing
-model image does not need this dependency.
-
-`write_report` writes `report.html`, `evidently.json`, `summary.json` and
-`metrics.json`. Pass the numerical/categorical feature names and tune the PSI
-threshold and drift share with the model owner. Optional `quality_metrics` are
-numbers from their existing prediction analysis. Without labels/analysis,
-quality is **unavailable**. A drift flag does not establish poor predictions.
-
-`publish_report` uploads those files to a unique S3 report prefix. It can also:
-
-- Attach the metrics and reports to a caller-supplied MLflow analysis or inference
-  run. Use one analysis run per report for straightforward comparison.
-- Publish `DriftedFraction` to an approved CloudWatch namespace, dimensioned by
-  model and environment.
-- Send a breach message to one existing approved SNS topic. The JSON includes the
-  exact report URI, model/batch context and metric values.
-
-The notification may be delivered more than once; a receiver can deduplicate on
-`summary_uri`. Reuse a destination prefix only when intentionally replacing the
-same report. MLflow/network failures are surfaced, and the uploaded S3 files
-remain available for replay.
-
-BMO owns the scheduled trigger, reference-data selection, approved thresholds,
-recipient/subscriber configuration, alarms, escalation and recovery actions.
-The publishing helper creates no scheduler, queue, alarm or response worker.
-An explicit `configure_drift_alarm` helper demonstrates one CloudWatch alarm on
-`DriftedFraction` with the same SNS destination. Choose either the direct report
-message or the alarm as the notification trigger. The alarm example's description
-points to the specific report under review; BMO defines ongoing report lookup
-when adapting it to a continuously monitored stream.
-
-```python
-from mlops_models.monitoring.report import configure_drift_alarm
-
-configure_drift_alarm(
-    session.client("cloudwatch"), name="example-batch-drift",
-    namespace="Example/Monitoring", model_id="usecase2", environment="dev",
-    threshold=0.5, topic_arn=approved_topic_arn, report_uri=receipt["summary_uri"],
-)
-# Remove the example alarm when review is complete:
-# session.client("cloudwatch").delete_alarms(AlarmNames=["example-batch-drift"])
-```
-
-It is an Evidently batch report and notification pattern; it does not configure
-a native SageMaker Model Monitor schedule.
-
-The publishing caller needs S3 writes to its report prefix and, when enabled,
-MLflow run/artifact writes, `cloudwatch:PutMetricData` restricted by namespace,
-and `sns:Publish` on the selected topic for direct messages. Installing the optional
-alarm additionally needs `cloudwatch:PutMetricAlarm`/`DeleteAlarms` on that example
-alarm and a topic policy allowing the CloudWatch alarm to publish. No model's
-Registry approval is changed.
+The root requirements and lock describe one Linux Python 3.12 image containing the
+model runtime, mlflow-skinny 3.10.1, sagemaker-mlflow 0.5.0 and Evidently 0.7.20.
+The model-library pins are unchanged. Evidently needs requests >=2.32, so the shared
+image explicitly updates the supplied requests 2.31.0 pin to 2.34.2. This needs to
+be applied through BMO's image process; there is no runtime package installer.
+MLflow remains optional: leave tracking_uri empty until its service/access are ready.

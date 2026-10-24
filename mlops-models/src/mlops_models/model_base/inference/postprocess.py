@@ -33,6 +33,10 @@ def postprocess_predictions(data_directory, selection_file, prediction_directory
         # The use-case wrapper supplies run_analysis=postprocess directly.
         # Customer analysis reads these paths and writes under output; no return is required.
         run_analysis(data_path, selection_path, predictions, output, config)
+        # Postprocess owns prediction analysis and its execution report.
+        from mlops_models.runtime.execution import write_inference_report
+        write_inference_report(output, data_path=data_path, selection_file=selection_path,
+                               predictions=predictions, config=config)
     return write_container_output(output)
 
 

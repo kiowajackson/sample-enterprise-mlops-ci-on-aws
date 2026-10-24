@@ -1,5 +1,7 @@
-# Model dependencies pinned to the supplied approved-runtime inventory.
-# Tracking/notebook tools have their own requirements.
+# One Linux Python 3.12 image for model jobs, MLflow logging and Evidently reports.
+# Model-library pins follow the supplied BMO image.
+# Required platform change: requests 2.31.0 -> 2.34.2 for Evidently (requires >=2.32).
+# mlflow-skinny is the client; the managed MLflow App hosts the server.
 autogluon-common==1.2
 autogluon-core==1.2
 autogluon-features==1.2
@@ -35,7 +37,7 @@ pyarrow==24.0.0
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 pytz==2026.3.post1
-requests==2.31.0
+requests==2.34.2
 s3transfer==0.13.1
 scikit-learn==1.5.2
 scipy==1.15.3
@@ -49,9 +51,13 @@ typing-extensions==4.16.0
 tzdata==2026.3
 urllib3==2.7.0
 xgboost==3.4.1
-
-# Existing optional HTTP serving dependencies; not present in the supplied inventory.
 flask==3.1.2
 gunicorn==23.0.0
 itsdangerous==2.2.0
 werkzeug==3.1.9
+mlflow-skinny==3.10.1
+sagemaker-mlflow==0.5.0
+evidently==0.7.20
+cachetools==6.2.6
+protobuf==6.31.1
+pydantic==2.13.4

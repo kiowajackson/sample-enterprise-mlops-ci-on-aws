@@ -8,8 +8,10 @@ a new pipeline version.
 
 The application has **one shared training pipeline and one shared inference
 pipeline**. Each execution selects its model through `ModelId`. Model Registry
-connects training to inference: training registers a candidate, an authorized
-reviewer approves a version, and inference loads an approved model.
+connects training to inference: notebook training registers a Development version,
+an authorized reviewer approves it, and inference selects it within that
+deployment namespace. The future CDK/CI route will register ProductionCandidate
+versions in the same existing group; that integration remains platform work.
 
 **MLflow is optional and defaults off.** An MLflow service is not required for
 this first handoff. The source includes basic tracking support for later
@@ -41,18 +43,22 @@ You can complete this walkthrough without starting jobs.
 **To test with an existing approved model**, start at step 3 below. A new scoring
 batch does not require another training run.
 
-1. **Train when a new candidate is needed.** Open the existing training pipeline,
+1. **Train when a new Development model is needed.** Open the existing training pipeline,
    select the accepted published version and set `ModelId` and `CsvInputUri` to
    the intended model and training CSV. Use the deployment's existing settings.
    Training data must contain the columns and target required by that model.
-2. **Review the candidate.** After Evaluate, QualityGate and RegisterModel
-   succeed, open the resulting version in Model Registry. Registration creates
-   a pending version. An authorized reviewer inspects its metrics/artifacts and
-   approves it when appropriate.
+2. **Review the Development version.** After Evaluate, QualityGate and RegisterModel
+   succeed, open the resulting version in Model Registry. Check its namespace and
+   outputs. Set model approval to `Approved` and lifecycle to
+   `Development / Approved`. Notebook 02 includes an optional exact-version cell
+   that updates both fields together after review.
 3. **Run batch inference.** Open the existing inference pipeline with the same
    `ModelId` and the scoring `CsvInputUri`. Where `InferenceRuntime` is exposed,
    use `processing` for the baseline. ResolveModel selects the highest numeric
-   Completed, Approved version and records the exact package used. Scoring
+   Completed, Approved version with lifecycle `Development / Approved` and matching
+   namespace, environment and ModelId. Set `ModelPackageArn` to replay an exact
+   version with those same checks. Other namespaces and ProductionCandidate
+   versions are excluded. Scoring
    inputs need model features and identifiers; a target is not required.
 4. **Inspect results.** Open the producing Postprocess job's S3 output. Check the
    final analysis, row identifiers/counts and expected result columns. Retain
@@ -76,8 +82,9 @@ show where to connect the model's prediction-analysis function.
 An unchanged repeat can reuse successful compute outputs. Follow the **actual
 producer's** job/output location shown by the cached step. A new execution folder
 can contain only a registration receipt while its data/model/reports remain
-under an older execution. Tracking now writes a per-run `run.json` index with
-those original producer/output links; Notebook 03 can create it without MLflow.
+under an older execution. Processing inference always runs Postprocess, which
+writes `run.json` with the original producer/output links. Notebook 03 reads that
+report and refreshes native execution status; MLflow is optional.
 
 For complete logs, use the existing
 [job-log helper](mlops-models/scratch/job_log_cell.py) with the linked job name.
@@ -99,10 +106,10 @@ flowchart TB
         Select --> PrepTrain["Preprocess<br/>prepared training files"]
         PrepTrain --> Train["Train<br/>model + metadata + saved metrics"]
         Train --> Evaluate["Evaluate + QualityGate"]
-        Evaluate --> Register["RegisterModel<br/>pending version"]
+        Evaluate --> Register["RegisterModel<br/>Development / PendingApproval"]
     end
     Register --> Approval["Authorized model review and approval"]
-    Approval --> Registry["Model Registry<br/>approved model + image + metadata"]
+    Approval --> Registry["Model Registry<br/>approved Development model + source + image"]
     ScoringCSV["Scoring CSV<br/>features + identifiers"] --> GetScore
     Registry --> Resolve
     subgraph Inference["Shared inference pipeline — Processing baseline"]
@@ -110,6 +117,9 @@ flowchart TB
         GetScore --> PrepScore["Preprocess<br/>use saved model metadata"]
         PrepScore --> Score["Score<br/>prediction files"]
         Score --> Post["Postprocess<br/>final analysis / leads"]
+        Post --> Gate{"ReferenceExecutionArn supplied?"}
+        Gate -->|Yes| Drift["DriftComparison<br/>Evidently reports"]
+        Gate -->|No| Done["Finish"]
     end
     Post --> Results["S3 outputs<br/>inspect and pass to downstream owner"]
 ```
@@ -168,6 +178,35 @@ When a new deployment is intended, follow the
 [notebook publication guide](docs/implementation/README.md#run-the-two-notebooks).
 Keep existing environment configuration and adapted model code.
 
+## Notebook isolation and the future CDK route
+
+Notebook 02 generates a namespace on first use and saves it in
+`notebooks/config.json`; subsequent runs reuse it. Supply an explicit namespace
+for an existing deployment. Each person uses their own config/namespace, while
+model versions remain in the existing shared Registry group.
+
+Training retains the source snapshot, including uncommitted model code and the
+existing metadata input. The registered version links its source URI/digest,
+commit, image digest and trained artifacts. All Processing inference steps,
+including GetData, Postprocess and optional DriftComparison, use that model's saved release. Train and
+approve a new version to test changed inference code. Retain its S3 source/model
+objects and ECR image for replay; code pinning does not make randomized training
+deterministic. Older versions without namespace and source metadata stay untouched
+and require new training before these new pipelines can select them.
+
+| Deployment route | Registration stage | Current scope |
+| --- | --- | --- |
+| Notebook, isolated namespace | Development / PendingApproval | Implemented; approve within Development and run inference in that namespace |
+| Trusted CDK/CI pipeline | ProductionCandidate / PendingApproval | Platform integration to implement; no notebook switch enables it |
+
+For the CDK route, agree a protected CI build from the merge commit, an immutable
+source release and image digest, a dedicated registration role, and restrictions
+on pipeline updates, role passing and Registry stage transitions. A notebook
+parameter or editable environment variable is not that permission boundary.
+The production candidate must come from a new training execution of the trusted
+pipeline, rather than relabeling a notebook model. Account/environment names are
+separate from the lifecycle stage.
+
 ## Read the code
 
 Follow this chain for any Processing or ordinary Training step:
@@ -183,13 +222,21 @@ Follow this chain for any Processing or ordinary Training step:
 | [Per-model folders](mlops-models/src/mlops_models/models) | Model-specific parameters and training/inference overrides |
 | [Model base](mlops-models/src/mlops_models/model_base) | Shared example implementations that model code replaces or extends |
 | [Registry operations](mlops-models/src/mlops_models/registry/model_package.py) | Registers versions and resolves approved models |
-| [Optional tracking](mlops-models/src/mlops_models/pipelines/tracking.py) | Collects execution/producer records and writes them to MLflow |
+| [Optional tracking](mlops-models/src/mlops_models/pipelines/tracking.py) | Logs directly from existing jobs; the caller finalizes native status and cached-producer references |
 
 Model scripts retain **read inputs → model code → write outputs**. The
 orchestration supplies paths and configuration. Start with one execution's step
 and follow its entrypoint into the matching model folder; the
 [implementation reference](docs/implementation/README.md#execution-and-code-map)
 covers overrides, archived source and file contracts.
+
+Drift follows the same chain: `entrypoints/drift.py` calls
+`models/<ModelId>/inference/drift.py`, which defaults to
+`model_base/inference/drift.py`. The base module owns `get_container_input()`,
+the comparison/report calls in `compare_drift()`, and `write_container_output()`.
+Customize the use-case module to change that model's comparison workflow.
+Drift code is saved with the trained model; changing it also invalidates the
+training cache so the next model archive includes the updated implementation.
 
 ## What this source includes
 
@@ -200,27 +247,39 @@ The latest shared additions leave model algorithms unchanged:
 | Configured temporary directory | The loader honors the image's `TMPDIR`, allowing the approved non-root user to use owned writable scratch |
 | Producer records beside outputs | `_execution.json` records source, execution and settings, including when later runs reuse cached artifacts |
 | Evaluation support files | Publishes available saved training parameters and producer metadata with evaluation; older packages may omit those records |
-| Optional MLflow integration | Adds tracking jobs and notebook synchronization only when tracking is configured; includes the scoped job-name and optional KMS-value fixes |
+| Optional MLflow integration | Existing jobs log to one shared execution run when configured; no tracking-only jobs are added |
 | Analysis metrics and reports | Optional `metrics.json` publishes prediction metrics; selection outputs and HTML/JSON reports are visible alongside evaluation |
-| Run index and completion adapter | Each tracking sync writes a run-folder index; the optional platform callback reconciles terminal status using the original execution's tracking settings |
+| Run index and final status | The notebook or Airflow caller finalizes the run from native status and writes the run-folder index; cached outputs retain their original producers |
 | Optional native lineage | Notebook 03 links the existing data/source locations, actual jobs and model package in SageMaker's lineage service |
-| Minimal monitoring pattern | Notebook 04 compares supplied batches, saves an Evidently report and optionally publishes MLflow metrics, a CloudWatch metric and an SNS breach message |
+| Batch monitoring | The HasReference gate runs DriftComparison only when `ReferenceExecutionArn` is supplied; compares saved inputs/scores and publishes Evidently reports in the same inference MLflow run |
 
 Keep `"tracking_uri": ""` in the source configuration until an approved service,
 compatible clients, connectivity and caller permissions are ready. With tracking
-off, the builder adds no tracking jobs and makes no MLflow connection. Existing
+off, the jobs make no MLflow connection. The pipeline graph is the same with tracking on or off. Existing
 published pipelines retain their own configuration until deliberately republished.
 
 For an MLflow App, use the [App integration guide](docs/integration/mlflow-app.md):
 it maps the App API, UI and S3 permissions to the actual callers and explains
 how to publish and verify the binding using the existing notebook.
 
-Basic tracking has managed training and cached-repeat evidence in the sandbox.
-The [metrics and completion guide](docs/integration/observability.md) covers
-analysis output mapping, the run index and the optional EventBridge adapter.
-Receiving-environment acceptance and deployment of that adapter remain separate
-from copying source. The same guide covers the small Evidently/SNS example.
+The [logging and monitoring guide](docs/integration/observability.md) explains the
+run ID, finalization call and report locations. The image build uses the root
+`requirements.txt` and its resolved lock for model jobs, MLflow and Evidently.
+The model-library versions remain pinned. Evidently requires the documented
+`requests` update from 2.31.0 to 2.34.2; apply that through the approved image build.
 BMO extends its scheduling, model-quality analysis and response integration.
+
+Enable `monitoring` in notebook 02 once Evidently is available in the approved
+image. Notebook 04 runs ordinary inference first without a reference, then with
+that successful execution's ARN. HasReference skips the DriftComparison job when
+no reference is supplied; Postprocess still writes prediction analysis and run.json.
+With a reference, DriftComparison uses the same saved model source/image and writes
+`reports/drift/monitoring/` under the current run folder. MLflow artifacts appear
+under `outputs/DriftComparison/monitoring/`. Missing outcomes mean quality is unavailable.
+The reference's job-written run.json identifies its actual cached producers,
+independently of MLflow. An invalid supplied reference fails the comparison. Use the same model version for the first
+comparison. Model owners configure the prediction CSV/score column and drift
+thresholds; shared code aligns records by the configured primary key.
 
 ## First walkthrough and feedback
 

@@ -16,8 +16,8 @@ completed within the engagement.
 | --- | --- | --- |
 | First handoff | Team can understand and test the existing published pipelines and read the matching source | Receiving engineer follows an execution to Registry/S3, inspects a step's code/logs and records findings |
 | Basic tracking activation | Accepted service, clients and identities; optional source enabled through a planned publication | Actual target notebook/job logging and human UI/report access |
-| Tracking completion | Per-run S3 artifact index and automatic terminal-state synchronization | Fresh/cached runs and success/failure/stop/retry show the correct producers and final state without manual notebook sync |
-| Monitoring reports | Small Evidently comparison of supplied batches; existing model analysis supplies quality metrics | Correct HTML/JSON/metrics and explicit unavailable quality when analysis is absent |
+| Tracking completion | Direct job logging, per-run S3 index and caller finalization | Fresh/cached runs retain original producers; notebook/Airflow finalizes after native success/failure/stop |
+| Monitoring reports | Evidently data drift, data quality and labelled model-quality comparison | Native HTML/JSON, reference/current metric differences and explicit unavailable quality without labels |
 | Alert handoff | Demonstrated message to an approved SNS destination; BMO chooses its receiving workflow | Correlated report/message receipt, with consumer and operating ownership assigned |
 | Remaining agreed integration | Prioritized HPO/final training, Feature Store, container/release and downstream work | Acceptance recorded for each selected item; remaining gates have owners |
 
@@ -79,25 +79,24 @@ current execution, registered version, MLflow run when present, reports and
 actual producing artifacts. Cached outputs retain their original locations.
 Failure/partial-output records must remain understandable.
 
-**Terminal synchronization:** terminal means Succeeded, Failed or Stopped.
-The current closing tracking job runs before its pipeline is terminal; an earlier
-failure can prevent that job from running. The existing synchronization function
-can reconcile later. The optional `operations/completion` adapter supplies
-automatic invocation when deployed by the platform owner.
+**Terminal synchronization:** existing model jobs log directly to one MLflow run
+per pipeline execution. They leave it open while SageMaker runs. The notebook or
+Airflow caller invokes `sync_execution` after the native execution reaches
+Succeeded, Failed or Stopped. It finalizes status and links cached outputs to
+their original producers. No tracking-only Processing job or completion Lambda
+is deployed. A Studio UI launch also needs the notebook's finalization cell or
+an equivalent caller action after completion.
 
-The adapter reads the actual execution and dispatches a tracking-only Processing
-job using that execution's original definition. Pipeline status events cover
-Studio and scheduler launches. Duplicate events reuse a job; a failed sync gets
-one retry, with an explicit replay path. The platform must deploy and accept it.
-See [metrics and completion](observability.md) for the implementation and
-prediction-analysis metric file format. This work leaves customer preprocessing,
-split/held-out modeling logic and deeper dataset identity to their owners.
+See [metrics and completion](observability.md) for the caller function and the
+prediction-analysis metric file format. Customer preprocessing, split/held-out
+modeling logic and deeper dataset identity stay with their owners.
 
 ## Minimal Evidently implementation
 
 The included [monitoring example](observability.md#run-the-small-monitoring-example)
 uses Evidently 0.7.20. Notebook 04 runs a synthetic unchanged/shifted comparison,
-then optionally publishes the results. Replace those frames with supplied
+then optionally runs one monitoring Processing job using the same approved image
+as training and inference. Replace those frames with supplied
 reference/current batches and agree the monitored columns and thresholds.
 
 ```mermaid
@@ -116,10 +115,10 @@ flowchart LR
 | Work | Included pattern | BMO input / extension |
 | --- | --- | --- |
 | Batch comparison | Explicit numerical/categorical columns, PSI scores and configurable drift share | Appropriate reference windows, inputs and thresholds |
-| Quality metrics | Accept scalar results from existing prediction analysis; absent/null metrics remain unavailable | Labels, alignment, units, model-specific metrics and any segment analysis |
+| Model quality | Native binary-classification/regression reports and current-minus-reference metric differences; absent labels remain unavailable | Aligned predictions/labels, model-specific metrics and segment analysis |
 | Report visibility | HTML/JSON/summary/metrics in S3 and optionally MLflow | Approved destinations, service access and retention |
 | Alert signal | Optional CloudWatch metric, one alarm example or a direct SNS breach message | Response policy, subscribers, ongoing report lookup and operating process |
-| Execution | Callable helper and notebook | Schedule/orchestrator and an approved report environment |
+| Execution | Callable helper and one monitoring Processing job using the shared image | Schedule/orchestrator and approved job-role access |
 
 Feature drift is a review signal. It does not establish model-quality degradation.
 Training's `prepared_input_smoke_check` also remains a workflow check; real

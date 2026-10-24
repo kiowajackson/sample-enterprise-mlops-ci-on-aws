@@ -1,5 +1,0 @@
-# Optional notebook/report environment; not required by training or inference.
-evidently==0.7.20
-pandas==2.3.3
-boto3==1.43.98
-# Add requirements-tracking.txt only when publishing reports to MLflow.

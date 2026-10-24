@@ -1,5 +1,0 @@
-# Tested client set for a managed MLflow 3.0.x tracking server.
-# Install in the notebook and tracking-job image, through the approved image build.
-mlflow==3.0.0
-sagemaker-mlflow==0.2.0
-boto3==1.43.98

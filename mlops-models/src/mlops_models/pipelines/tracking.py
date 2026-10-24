@@ -1,20 +1,12 @@
-"""Copy details of an existing SageMaker pipeline execution into an MLflow run.
+"""Log from the jobs that do the work; the caller finalizes pipeline status.
 
-source.configure_tracking() declares the tracking Processing jobs. When a pipeline
-executes, those jobs run this module's main() with that execution's ARN:
-
-    main() -> sync_execution() -> collect_execution() -> publish_execution()
-
-collect_execution reads SageMaker job details and S3 output files into a report.
-publish_execution creates or updates the corresponding MLflow run from that report.
-Neither starts the training/inference pipeline. Notebook 02 can also import
-sync_execution() and supply an existing execution ARN to refresh its MLflow record.
-
-A SageMaker pipeline execution and an MLflow run are separate records. The S3
-run.json receipt stores their association so repeated updates reuse the same run.
+job_tracking() supplies one shared run ID inside each executing container.
+log_job_outputs() publishes local reports directly. sync_execution() is called
+by the notebook/Airflow after completion, including cache-only and failed runs.
+This module declares or launches no SageMaker jobs.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import math
@@ -26,19 +18,47 @@ import time
 from uuid import uuid4
 
 from botocore.config import Config
-from mlops_models.pipelines.inspect import read_parameters
-from mlops_models.storage import s3_location
+from urllib.parse import urlparse
+
+MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 
 READ_CONFIG = Config(connect_timeout=5, read_timeout=15,
                      retries={"mode": "standard", "total_max_attempts": 2})
-MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
-MAX_OBJECTS = 1000
-TRACKING_STEPS = {"StartTracking", "TrackTraining", "TrackTunedTraining",
-                  "TrackInference", "TrackTransform"}
 TERMINAL = {"Succeeded": "FINISHED", "Failed": "FAILED", "Stopped": "KILLED"}
-REPORT_STEPS = {"FeatureSelection", "Evaluate", "EvaluateTuned", "Postprocess",
-                "PostprocessTransform", "Monitor"}
 COPY_SUFFIXES = {".csv", ".png", ".pdf", ".txt", ".html", ".json"}
+
+def s3_location(uri):
+    location = urlparse(uri)
+    if location.scheme != "s3" or not location.netloc:
+        raise ValueError("Expected an s3://bucket/key URI.")
+    return location.netloc, location.path.lstrip("/")
+
+
+def _json(value):
+    return json.dumps(value, sort_keys=True, default=str, allow_nan=False)
+
+
+def _read_json(s3, uri, *, optional=False):
+    bucket, key = s3_location(uri)
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+    except s3.exceptions.ClientError as error:
+        if optional and error.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
+            return None
+        raise
+    with response["Body"] as stream:
+        content = stream.read(MAX_ARTIFACT_BYTES + 1)
+    if len(content) > MAX_ARTIFACT_BYTES:
+        raise ValueError(f"Tracking JSON exceeds {MAX_ARTIFACT_BYTES} bytes: {uri}")
+    return json.loads(content)
+
+
+def _put_json(s3, uri, value, kms_key="", **conditions):
+    bucket, key = s3_location(uri)
+    encryption = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": kms_key} if kms_key else {}
+    return s3.put_object(Bucket=bucket, Key=key, Body=(_json(value) + "\n").encode(),
+                         ContentType="application/json", **encryption, **conditions)
+
 
 
 def validate_tracking(settings):
@@ -71,32 +91,6 @@ def managed_client(uri):
         mlflow.set_tracking_uri(previous)
 
 
-def _json(value):
-    return json.dumps(value, sort_keys=True, default=str, allow_nan=False)
-
-
-def _read_json(s3, uri, *, optional=False):
-    bucket, key = s3_location(uri)
-    try:
-        response = s3.get_object(Bucket=bucket, Key=key)
-    except s3.exceptions.ClientError as error:
-        if optional and error.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}:
-            return None
-        raise
-    with response["Body"] as stream:
-        content = stream.read(MAX_ARTIFACT_BYTES + 1)
-    if len(content) > MAX_ARTIFACT_BYTES:
-        raise ValueError(f"Tracking JSON exceeds {MAX_ARTIFACT_BYTES} bytes: {uri}")
-    return json.loads(content)
-
-
-def _put_json(s3, uri, value, kms_key="", **conditions):
-    bucket, key = s3_location(uri)
-    encryption = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": kms_key} if kms_key else {}
-    return s3.put_object(Bucket=bucket, Key=key, Body=(_json(value) + "\n").encode(),
-                         ContentType="application/json", **encryption, **conditions)
-
-
 @contextmanager
 def _lease(s3, uri, kms_key):
     """Allow one writer at a time using a temporary S3 lock file.
@@ -127,178 +121,6 @@ def _lease(s3, uri, kms_key):
         except s3.exceptions.ClientError as error:
             if error.response["Error"]["Code"] not in {"PreconditionFailed", "412", "NoSuchKey", "404"}:
                 raise
-
-
-def _steps(sm, arn):
-    return [step for page in sm.get_paginator("list_pipeline_execution_steps").paginate(
-        PipelineExecutionArn=arn) for step in page["PipelineExecutionSteps"]]
-
-
-def collect_execution(session, execution_arn):
-    """Read an existing execution and return a report dictionary; make no writes.
-
-    1. Read the execution's status, parameters and step list from SageMaker.
-    2. Resolve each step to its actual job, following cached producers when needed.
-    3. Read saved output records, Registry references and reports from S3.
-    """
-    # 1. Read the execution selected by the caller and prepare an empty report.
-    sm = session.client("sagemaker", region_name=execution_arn.split(":")[3], config=READ_CONFIG)
-    s3 = session.client("s3", config=READ_CONFIG)
-    execution = sm.describe_pipeline_execution(PipelineExecutionArn=execution_arn)
-    execution.pop("ResponseMetadata", None)
-    parameters = read_parameters(sm, execution_arn)
-    by_execution = {execution_arn: _steps(sm, execution_arn)}
-    result = {"execution": execution, "parameters": parameters, "steps": [],
-              "reports": {}, "artifacts": [], "registry": [], "datasets": []}
-
-    # Map each recorded job type to the SageMaker API used to describe that job.
-    operations = {
-        "ProcessingJob": ("describe_processing_job", "ProcessingJobName"),
-        "TrainingJob": ("describe_training_job", "TrainingJobName"),
-        "TransformJob": ("describe_transform_job", "TransformJobName"),
-    }
-
-    # 2. Inspect model steps. Tracking jobs themselves are excluded from the report.
-    for step in by_execution[execution_arn]:
-        name = step["StepName"]
-        if name in TRACKING_STEPS:
-            continue
-
-        # A cache hit points to an earlier execution. Follow it to the job that
-        # actually produced the files, while retaining this execution's step status.
-        producer, original, seen = execution_arn, step, set()
-        while source := original.get("CacheHitResult", {}).get("SourcePipelineExecutionArn"):
-            if source in seen or len(seen) >= 20:
-                raise ValueError("Invalid or excessive cached-producer chain.")
-            seen.add(source)
-            if source not in by_execution:
-                by_execution[source] = _steps(sm, source)
-            matches = [item for item in by_execution[source] if item["StepName"] == name]
-            if len(matches) != 1:
-                raise ValueError(f"Cannot resolve cached producer for {name} in {source}.")
-            original, producer = matches[0], source
-        entry = {"name": name, "status": step["StepStatus"], "cached": producer != execution_arn,
-                 "producer_execution_arn": producer, "failure": step.get("FailureReason", ""),
-                 "start": step.get("StartTime"), "end": step.get("EndTime"),
-                 "attempt": step.get("AttemptCount", 0)}
-        result["steps"].append(entry)
-
-        # Fetch that producer job's image, source revision and output locations.
-        metadata = original.get("Metadata", {})
-        for kind, (operation, argument) in operations.items():
-            if kind not in metadata:
-                continue
-            arn = metadata[kind]["Arn"]
-            job = getattr(sm, operation)(**{argument: arn.rsplit("/", 1)[-1]})
-            job.pop("ResponseMetadata", None)
-            entry.update(job_arn=arn, job_type=kind, job=job)
-            env = job.get("Environment", {})
-            entry["source_revision"] = env.get("MLOPS_STEP_REVISION", env.get("MLOPS_PREPARATION_REVISION", ""))
-            outputs = []
-            if kind == "ProcessingJob":
-                outputs = [(item["OutputName"], item["S3Output"]["S3Uri"])
-                           for item in job.get("ProcessingOutputConfig", {}).get("Outputs", [])]
-                if name in {"RegisterModel", "RegisterTunedModel"}:
-                    registration = env["REGISTRATION_OUTPUT_URI"]
-                    if not any(uri.rstrip("/") == registration.rstrip("/") for _, uri in outputs):
-                        outputs.append(("registry", registration))
-            elif kind == "TrainingJob":
-                entry["image"] = job["AlgorithmSpecification"]["TrainingImage"]
-                entry["model_artifact"] = (job["OutputDataConfig"]["S3OutputPath"].rstrip("/") +
-                                          "/application/model.tar.gz" if
-                                          env.get("MLOPS_TRAINING_OUTPUT_UPLOAD") == "application"
-                                          else job.get("ModelArtifacts", {}).get("S3ModelArtifacts", ""))
-            else:
-                entry["model_name"] = job["ModelName"]
-                entry["transform_output"] = job["TransformOutput"]["S3OutputPath"]
-            if kind == "ProcessingJob":
-                entry["image"] = job["AppSpecification"]["ImageUri"]
-
-            # 3. Read the files from successful outputs. Failed jobs may leave
-            # partial files, so their job/failure details are retained without these.
-
-            entry["outputs"] = {output_name: prefix.rstrip("/") + "/" for output_name, prefix in outputs}
-            if step["StepStatus"] != "Succeeded":
-                continue
-            for output_name, prefix in outputs:
-                prefix = prefix.rstrip("/") + "/"
-                entry.setdefault("outputs", {})[output_name] = prefix
-                # This loader-written file says which code/settings produced the output.
-                provenance = _read_json(s3, prefix + "_execution.json", optional=True)
-                if provenance:
-                    entry["source_identity"] = provenance
-
-                # GetData separately records the input dataset's origin.
-                if name == "GetData":
-                    data = _read_json(s3, prefix + "provenance.json", optional=True)
-                    if data:
-                        result["datasets"].append({"uri": prefix + "data.csv", "provenance": data,
-                                                   "producer_execution_arn": producer})
-
-                # Read the exact registered model version from the step's receipt.
-                if name in {"RegisterModel", "RegisterTunedModel", "ResolveModel"}:
-                    receipt = _read_json(s3, prefix + "package.json")
-                    package = sm.describe_model_package(ModelPackageName=receipt["package"])
-                    package.pop("ResponseMetadata", None)
-                    result["registry"].append({"receipt": receipt, "package": package})
-
-                # Inventory report/analysis files and read the known JSON reports.
-                # CSVs and plots are listed here; publish_execution copies them later.
-                if name in REPORT_STEPS:
-                    bucket, key = s3_location(prefix)
-                    count = 0
-                    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=key):
-                        for item in page.get("Contents", []):
-                            count += 1
-                            if count > MAX_OBJECTS:
-                                raise ValueError(f"Tracking output inventory exceeds {MAX_OBJECTS} objects: {prefix}")
-                            relative = item["Key"][len(key):]
-                            if not relative or relative.endswith("/"):
-                                continue
-                            artifact = {"step": name, "uri": f"s3://{bucket}/{item['Key']}",
-                                        "relative_path": relative, "size": item["Size"],
-                                        "etag": item["ETag"], "producer_execution_arn": producer}
-                            result["artifacts"].append(artifact)
-                            if relative in {"evaluation.json", "parameters.json", "model_metadata.json",
-                                            "summary.json", "training_execution.json", "metrics.json"}:
-                                result["reports"][f"{name}/{relative}"] = _read_json(s3, artifact["uri"])
-    return result
-
-
-def write_run_index(session, report, *, receipt=None, kms_key=""):
-    """Save a small navigation index beside this run's outputs; leave producer files in place."""
-    execution, parameters = report["execution"], report["parameters"]
-    arn = execution["PipelineExecutionArn"]
-    root = parameters.get("OutputDataRoot")
-    if not root:
-        raise ValueError("The execution needs OutputDataRoot to locate its run index.")
-    uri = (root.rstrip("/") + "/" + parameters["ModelId"] + "/runs/" +
-           arn.rsplit("/", 1)[-1] + "/run.json")
-    s3 = session.client("s3", config=READ_CONFIG)
-    previous = _read_json(s3, uri, optional=True) or {}
-    if receipt is None:
-        receipt = previous.get("mlflow")
-    index = {
-        "execution_arn": arn, "status": execution["PipelineExecutionStatus"],
-        "failure": execution.get("FailureReason", ""), "parameters": parameters,
-        "steps": [{key: value for key, value in step.items() if key != "job"}
-                  for step in report["steps"]],
-        "datasets": report["datasets"],
-        "artifacts": report["artifacts"],
-        "registry": [reference["receipt"] for reference in report["registry"]],
-        "mlflow": receipt,
-    }
-    lineage_uri = uri.removesuffix("run.json") + "lineage.json"
-    if _read_json(s3, lineage_uri, optional=True):
-        index["native_lineage_uri"] = lineage_uri
-    _put_json(s3, uri, index, kms_key)
-    return uri
-
-
-def index_execution(session, execution_arn, *, kms_key=""):
-    """Index an existing execution without requiring MLflow or running model code."""
-    report = collect_execution(session, execution_arn)
-    return write_run_index(session, report, kms_key=kms_key)
 
 
 def analysis_metrics(reports):
@@ -344,279 +166,284 @@ def _milliseconds(value):
     return int(value.timestamp() * 1000) if hasattr(value, "timestamp") else int(time.time() * 1000)
 
 
-def publish_execution(client, session, report, settings, *, phase="sync", receipt_uri):
-    """Write collect_execution's report to MLflow and return its S3 receipt.
-
-    1. Find or create the MLflow run associated with this pipeline execution.
-    2. Assemble its status, parameters, metrics and model/job links.
-    3. Write changed values, dataset references and output artifacts to MLflow.
-    4. Update run status and save the receipt used by subsequent syncs.
-    """
-    from mlflow.entities import Dataset, DatasetInput, InputTag, Metric, Param, RunTag
-
-    # 1. Find the experiment for this model/environment, then its execution's run.
-    execution, parameters = report["execution"], report["parameters"]
-    arn = execution["PipelineExecutionArn"]
-    model = parameters["ModelId"]
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", model):
-        raise ValueError("The execution must have an ordinary ModelId.")
-    environment = parameters.get("Environment", settings.get("environment", "dev"))
-    experiment_id = _experiment(client, f"{settings['experiment_prefix']}/{environment}/{model}")
-    kind = settings["kind"]
+def ensure_run(client, session, execution_arn, model, settings, *, created=None):
+    """Find/create the execution's run; serialize creation only, not job logging."""
+    key = hashlib.sha256((settings["uri"] + "/" + execution_arn).encode()).hexdigest()
+    receipt_uri = settings["s3_root"].rstrip("/") + "/tracking/" + key + "/run.json"
     s3 = session.client("s3", config=READ_CONFIG)
-    # The receipt contains the MLflow run ID from a previous update, if one exists.
     receipt = _read_json(s3, receipt_uri, optional=True)
     if receipt:
-        if receipt["execution_arn"] != arn or receipt["tracking_uri"] != settings["uri"]:
+        if receipt["execution_arn"] != execution_arn or receipt["tracking_uri"] != settings["uri"]:
             raise ValueError("Tracking receipt belongs to another execution or service.")
-        run = client.get_run(receipt["run_id"])
-        if run.info.experiment_id != experiment_id or run.data.tags.get("pipeline.execution_arn") != arn:
-            raise ValueError("Tracking receipt and MLflow run identity differ.")
-    else:
-        # Recover a CreateRun response lost after the server committed it.
-        run = _find_run(client, experiment_id, arn)
+        return receipt
+    # A Studio execution can initialize its run in its first uncached job. A
+    # concurrent notebook inspection must not create a second run for it.
+    with _lease(s3, receipt_uri.removesuffix("run.json") + "lock.json", settings.get("kms_key", "")):
+        receipt = _read_json(s3, receipt_uri, optional=True)
+        if receipt:
+            return receipt
+        experiment_id = _experiment(
+            client, f"{settings['experiment_prefix']}/{settings.get('environment', 'dev')}/{model}")
+        run = _find_run(client, experiment_id, execution_arn)
         if run is None:
-            run = client.create_run(experiment_id, start_time=_milliseconds(execution["CreationTime"]),
-                                    run_name=f"{kind}-{arn.rsplit('/', 1)[-1]}",
-                                    tags={"pipeline.execution_arn": arn, "model.id": model,
-                                          "environment": environment, "workflow": kind})
-        receipt = {"execution_arn": arn, "tracking_uri": settings["uri"],
-                   "experiment_id": experiment_id, "run_id": run.info.run_id}
+            run = client.create_run(
+                experiment_id, start_time=_milliseconds(created),
+                run_name=f"{settings['kind']}-{execution_arn.rsplit('/', 1)[-1]}",
+                tags={"pipeline.execution_arn": execution_arn, "model.id": model,
+                      "environment": settings.get("environment", "dev"),
+                      "workflow": settings["kind"], "tracking.mode": "direct"})
+        receipt = {"execution_arn": execution_arn, "tracking_uri": settings["uri"],
+                   "experiment_id": experiment_id, "run_id": run.info.run_id,
+                   "receipt_uri": receipt_uri}
         _put_json(s3, receipt_uri, receipt, settings.get("kms_key", ""))
-    run_id = run.info.run_id
+        return receipt
 
-    # 2. Assemble values from the collected report before sending them to MLflow.
-    # A final tracking job can observe completed model steps while its own pipeline
-    # is still Executing; preserve that distinction in the tags below.
-    status = execution["PipelineExecutionStatus"]
-    business_complete = bool(report["steps"]) and all(
-        step["status"] in {"Succeeded", "Skipped"} for step in report["steps"])
-    failed = any(step["status"] == "Failed" for step in report["steps"])
-    mlflow_status = TERMINAL.get(status, "FAILED" if failed else
-                                 "FINISHED" if phase == "finish" and business_complete else "RUNNING")
-    tags = {"pipeline.status": status, "pipeline.failure": execution.get("FailureReason", ""),
-            "tracking.phase": phase, "tracking.receipt_uri": receipt_uri,
-            "tracking.finalized_before_pipeline_terminal": str(
-                mlflow_status == "FINISHED" and status not in TERMINAL).lower()}
 
-    # Identify each actual producer, including reused jobs and their code versions.
-    for step in report["steps"]:
-        prefix = "step." + step["name"]
-        tags[prefix + ".producer_execution_arn"] = step["producer_execution_arn"]
-        tags[prefix + ".cached"] = str(step["cached"]).lower()
-        for source_key in ("job_arn", "image", "source_revision"):
-            if step.get(source_key):
-                tags[prefix + "." + source_key] = step[source_key]
-        source = step.get("source_identity", {}).get("source", {})
-        if source.get("commit"):
-            tags[prefix + ".source_commit"] = source["commit"]
-            tags[prefix + ".source_dirty"] = str(source.get("dirty", "unknown")).lower()
+@contextmanager
+def job_tracking(model, output_uri=""):
+    """Set MLflow context inside the running process; do not end the shared run."""
+    if not os.getenv("MLOPS_TRACKING_URI"):
+        yield None
+        return
+    import boto3
 
-    # Collect effective settings and the metrics already saved by model code.
-    metrics = {"steps.cached": sum(step["cached"] for step in report["steps"]),
-                "steps.failed": sum(step["status"] == "Failed" for step in report["steps"])}
-    metrics.update(analysis_metrics(report["reports"]))
-    params = {"pipeline." + key: str(value) for key, value in parameters.items()}
-    for step in report["steps"]:
-        if step["name"] in {"Score", "Postprocess", "PostprocessTransform"}:
-            identity = step.get("source_identity", {})
-            for binding in ("source_parameters", "checkpoint_parameters"):
-                params.update({step["name"] + "." + binding + "." + key:
-                               item if isinstance(item, str) else _json(item)
-                               for key, item in identity.get(binding, {}).items()})
-    for name, value in report["reports"].items():
-        if name.endswith("/evaluation.json"):
-            metrics.update({"evaluation." + key: number for key, number in value["metrics"].items()
-                            if type(number) in (int, float) and math.isfinite(number)})
-            tags.update({"evaluation.data_usage": value["data_usage"],
-                         "source.model_commit": value.get("model_source_commit", "unknown"),
-                         "source.model_dirty": value.get("model_source_dirty", "unknown")})
-        if name.endswith("/parameters.json"):
-            prefix = "training." if name.startswith("Evaluate") else "inference."
-            params.update({prefix + key: item if isinstance(item, str) else _json(item)
-                           for key, item in value.items()})
-        if name.endswith("/summary.json") and type(value.get("rows")) is int:
-            metrics["prediction.rows"] = value["rows"]
+    execution_id = os.getenv("PIPELINE_EXECUTION_ID", "")
+    if not execution_id and "/runs/" in output_uri:
+        execution_id = output_uri.rsplit("/runs/", 1)[1].split("/")[0]
+    pipeline = os.environ["MLOPS_TRACKING_PIPELINE_ARN"]
+    if not execution_id:
+        raise ValueError("Direct logging needs this job's execution ID from its output configuration.")
+    execution_arn = pipeline + "/execution/" + execution_id
+    settings = {key: os.getenv("MLOPS_TRACKING_" + name, "") for key, name in (
+        ("uri", "URI"), ("experiment_prefix", "EXPERIMENT_PREFIX"), ("s3_root", "S3_ROOT"),
+        ("environment", "ENVIRONMENT"), ("kind", "KIND"), ("kms_key", "KMS_KEY"))}
+    session = boto3.Session(region_name=pipeline.split(":")[3])
+    previous = {key: os.environ.get(key) for key in ("MLFLOW_TRACKING_URI", "MLFLOW_RUN_ID")}
+    with managed_client(settings["uri"]) as client:
+        receipt = ensure_run(client, session, execution_arn, model, settings)
+        os.environ.update(MLFLOW_TRACKING_URI=settings["uri"], MLFLOW_RUN_ID=receipt["run_id"])
+        step = os.environ["MLOPS_TRACKING_STEP"]
+        client.set_tag(receipt["run_id"], "step." + step + ".status", "Running")
+        print(json.dumps({"event": "mlflow_job_logging", "step": step,
+                          "run_id": receipt["run_id"], "execution_arn": execution_arn}), flush=True)
+        try:
+            yield {"client": client, "step": step, **receipt}
+        except Exception as error:
+            client.set_tag(receipt["run_id"], "step." + step + ".status", "Failed")
+            client.set_tag(receipt["run_id"], "step." + step + ".failure", str(error)[:4000])
+            raise
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
-    # Associate this run with its Registry version and, for inference, its training run.
-    for reference in report["registry"]:
-        package = reference["package"]
-        tags["registry.package_arn"] = package["ModelPackageArn"]
-        tags["registry.approval_at_sync"] = package["ModelApprovalStatus"]
-        container = package["InferenceSpecification"]["Containers"][0]
-        tags.update({"model.checkpoint_uri": container["ModelDataUrl"], "model.image_uri": container["Image"]})
-        training_arn = package.get("MetadataProperties", {}).get("GeneratedBy", "")
-        if kind == "inference" and training_arn:
-            tags["model.training_execution_arn"] = training_arn
-            training = _find_run(client, experiment_id, training_arn)
-            if training:
-                tags["model.training_run_id"] = training.info.run_id
 
-    # 3. Send only new/changed fields so repeated syncs do not repeat metric history.
-    # Large parameter values remain complete in the JSON artifacts.
-    new_params = []
-    for key, value in params.items():
-        if len(value) > 6000:
+def _log_values(client, run_id, *, metrics=None, params=None, tags=None):
+    """Use explicit run IDs so logging never closes another step's shared run."""
+    from mlflow.entities import Metric, Param, RunTag
+    run = client.get_run(run_id)
+    timestamp = int(time.time() * 1000)
+    client.log_batch(
+        run_id,
+        metrics=[Metric(name, float(value), timestamp, 0) for name, value in (metrics or {}).items()
+                 if run.data.metrics.get(name) != value],
+        params=[Param(name, str(value)) for name, value in (params or {}).items()
+                if name not in run.data.params],
+        tags=[RunTag(name, str(value)) for name, value in (tags or {}).items()],
+        synchronous=True)
+
+
+def report_metrics(step, reports):
+    """Log metrics produced by model code; never substitute missing metrics with zero."""
+    result = analysis_metrics({step + "/" + name: value for name, value in reports.items()})
+    rows = reports.get("summary.json", {}).get("rows")
+    if step in {"Postprocess", "PostprocessTransform"} and type(rows) is int and rows >= 0:
+        result["prediction.rows"] = rows
+    evaluation = reports.get("evaluation.json", {}).get("metrics", {})
+    for name, value in evaluation.items():
+        if value is None:
             continue
-        if key in run.data.params and run.data.params[key] != value:
-            raise ValueError(f"Recorded parameter changed for the same execution: {key}")
-        if key not in run.data.params:
-            new_params.append(Param(key, value))
-    timestamp = _milliseconds(execution.get("LastModifiedTime", execution["CreationTime"]))
-    new_metrics = [Metric(key, value, timestamp, 0) for key, value in metrics.items()
-                   if run.data.metrics.get(key) != value]
-    new_tags = [RunTag(key, str(value)) for key, value in tags.items() if run.data.tags.get(key) != str(value)]
-    for offset in range(0, max(len(new_params), len(new_metrics), len(new_tags)), 100):
-        client.log_batch(run_id, params=new_params[offset:offset+100],
-                         metrics=new_metrics[offset:offset+100], tags=new_tags[offset:offset+100],
-                         synchronous=True)
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError(f"Evaluation metric {name!r} must be finite or null.")
+        result[("training." if step == "Train" else "evaluation.") + name] = value
+    for name, value in reports.get("monitoring/metrics.json", {}).items():
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError(f"Monitoring metric {name!r} must be finite.")
+        result["monitoring." + name] = value
+    return result
 
-    # Add references to the input datasets; the data itself stays in S3.
-    for dataset in report["datasets"]:
-        provenance = dataset["provenance"]
-        # Digest of the provenance record is explicit; do not claim a full-data hash.
-        digest = hashlib.sha256(_json(provenance).encode()).hexdigest()[:32]
-        context = "training" if kind == "training" else "inference"
-        logged = getattr(getattr(run, "inputs", None), "dataset_inputs", []) or []
-        if not any(item.dataset.digest == digest and json.loads(item.dataset.source).get("uri") == dataset["uri"]
-                   for item in logged):
-            entity = Dataset(name=f"{model}-{context}", digest=digest, source_type="s3",
-                             source=_json({"uri": dataset["uri"]}))
-            client.log_inputs(run_id, datasets=[DatasetInput(entity, [
-                InputTag("mlflow.data.context", context),
-                InputTag("digest.kind", "provenance_sha256"),
-                InputTag("producer.execution_arn", dataset["producer_execution_arn"]),
-            ])])
 
-    # Store the complete report, then copy eligible small output files to MLflow.
-    # JSON normalization converts datetime objects while retaining their values.
-    snapshot = json.loads(_json(report))
-    digest = hashlib.sha256(_json(snapshot).encode()).hexdigest()
-    if receipt.get("snapshot_sha256") != digest:
-        client.log_dict(run_id, snapshot, "lineage/execution.json")
-        for name, value in report["reports"].items():
-            client.log_dict(run_id, value, "reports/" + name)
-        with tempfile.TemporaryDirectory(prefix="mlops-tracking-") as folder:
-            for artifact in report["artifacts"]:
-                relative = Path(artifact["relative_path"])
-                if relative.is_absolute() or ".." in relative.parts:
-                    raise ValueError("Artifact path escapes its declared output.")
-                if (artifact["size"] > MAX_ARTIFACT_BYTES or relative.suffix.lower() not in COPY_SUFFIXES
-                        or relative.name == "_execution.json"):
+def monitoring_tags(summary):
+    """Link the comparison and both model/data identities without another MLflow run."""
+    if not summary:
+        return {}
+    tags = {"monitoring." + key: value if isinstance(value, str) else _json(value)
+            for key, value in summary["context"].items()}
+    tags.update({"monitoring.drift_status": summary["drift_status"],
+                 "monitoring.quality_status": summary["quality_status"]})
+    return tags
+
+
+def log_job_outputs(tracking, directories, record):
+    """Upload this job's local reports directly, preserving their folder structure."""
+    if tracking is None:
+        return
+    client, run_id, step = tracking["client"], tracking["run_id"], tracking["step"]
+    reports = {}
+    # Data and model binaries stay in their declared S3 outputs. Report-producing
+    # steps publish their small CSVs/plots; other steps publish their metadata only.
+    report_step = os.getenv("MLOPS_LOG_ARTIFACTS") == "1"
+    for directory in dict.fromkeys(Path(value) for value in directories):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.rglob("*")):
+            if not path.is_file() or path.is_symlink() or path.name == "_execution.json":
+                continue
+            relative = path.relative_to(directory)
+            if relative.as_posix() in {"monitoring/metrics.json", "monitoring/summary.json"}:
+                value = json.loads(path.read_text())
+                reports[relative.as_posix()] = value
+                client.log_dict(run_id, value, f"reports/{step}/{relative.as_posix()}")
+            elif path.name in {"evaluation.json", "metrics.json", "parameters.json",
+                             "model_metadata.json", "summary.json", "package.json",
+                             "provenance.json"} and len(relative.parts) == 1:
+                value = json.loads(path.read_text())
+                reports[path.name] = value
+                client.log_dict(run_id, value, f"reports/{step}/{path.name}")
+            elif report_step and path.suffix.lower() in COPY_SUFFIXES and path.stat().st_size <= MAX_ARTIFACT_BYTES:
+                # Training includes a saved model/code tree. Only its top-level
+                # reports are relevant here; do not copy framework internals.
+                if os.getenv("MLOPS_TRAINING_MODEL_URI") and len(relative.parts) > 1:
                     continue
-                if artifact["step"] + "/" + relative.as_posix() in report["reports"]:
-                    continue  # Known JSON already has a reports/ copy.
-                bucket, key = s3_location(artifact["uri"])
-                response = s3.get_object(Bucket=bucket, Key=key, IfMatch=artifact["etag"])
-                with response["Body"] as stream:
-                    content = stream.read(MAX_ARTIFACT_BYTES + 1)
-                if len(content) > MAX_ARTIFACT_BYTES:
-                    raise ValueError("Artifact grew after collection; retry with a stable output.")
-                local = Path(folder) / artifact["step"] / relative
-                local.parent.mkdir(parents=True, exist_ok=True)
-                local.write_bytes(content)
-                client.log_artifact(run_id, str(local), "outputs/" + artifact["step"] +
-                                    ("/" + relative.parent.as_posix() if relative.parent != Path(".") else ""))
-
-    # 4. Update run status and retain its ID/snapshot in S3 for the next sync.
-    if mlflow_status == "RUNNING":
-        if run.info.status != "RUNNING":
-            client.update_run(run_id, status="RUNNING")
-    else:
-        client.set_terminated(run_id, status=mlflow_status,
-                              end_time=timestamp if status in TERMINAL else int(time.time() * 1000))
-    receipt.update(receipt_uri=receipt_uri, snapshot_sha256=digest, status=mlflow_status, pipeline_status=status)
-    receipt["index_uri"] = write_run_index(session, report, receipt={
-        key: receipt[key] for key in ("tracking_uri", "experiment_id", "run_id", "receipt_uri")
-    }, kms_key=settings.get("kms_key", ""))
-    _put_json(s3, receipt_uri, receipt, settings.get("kms_key", ""))
-    return receipt
+                parent = relative.parent.as_posix()
+                artifact_path = "outputs/" + step + ("/" + parent if parent != "." else "")
+                client.log_artifact(run_id, str(path), artifact_path)
+    tags = {"step." + step + ".status": "Succeeded",
+            "step." + step + ".producer_execution_arn": tracking["execution_arn"],
+            "step." + step + ".cached": "false"}
+    tags.update(monitoring_tags(reports.get("monitoring/summary.json")))
+    package = reports.get("package.json")
+    if package:
+        tags.update({"model.package_arn": package["package"],
+                     "model.artifact_uri": package["checkpoint"], "model.image_uri": package["image"]})
+    if os.getenv("MLOPS_TRAINING_MODEL_URI"):
+        tags["model.artifact_uri"] = os.environ["MLOPS_TRAINING_MODEL_URI"]
+    training = record.get("model_training", {}).get("mlflow")
+    if training:
+        tags["model.training_run_id"] = training["run_id"]
+    if "provenance.json" in reports and record.get("outputs"):
+        uri = next(iter(record["outputs"].values())).rstrip("/") + "/data.csv"
+        log_dataset(client, run_id, uri, reports["provenance.json"], tracking["execution_arn"])
+    _log_values(client, run_id, metrics=report_metrics(step, reports), tags=tags,
+                params={f"step.{step}.{key}": _json(value)
+                        for key, value in record.get("source_parameters", {}).items()})
+    client.log_dict(run_id, record, "execution/" + step + ".json")
 
 
-def sync_execution(session, execution_arn, settings, *, phase="sync", client=None):
-    """Refresh the MLflow record for one SageMaker execution that already exists.
+def log_dataset(client, run_id, uri, provenance, producer):
+    """Retain the existing dataset reference without creating a new identity scheme."""
+    from mlflow.entities import Dataset, DatasetInput, InputTag
+    digest = hashlib.sha256(_json(provenance).encode()).hexdigest()[:36]
+    run = client.get_run(run_id)
+    existing = getattr(getattr(run, "inputs", None), "dataset_inputs", []) or []
+    if any(item.dataset.digest == digest and json.loads(item.dataset.source).get("uri") == uri
+           for item in existing):
+        return
+    entity = Dataset(name="input-batch", digest=digest, source_type="s3", source=_json({"uri": uri}))
+    client.log_inputs(run_id, datasets=[DatasetInput(entity, [
+        InputTag("mlflow.data.context", "input"), InputTag("producer.execution_arn", producer)])])
 
-    execution_arn comes from the tracking job's environment or a notebook caller.
-    settings identifies the tracking service, experiment prefix and S3 output root.
 
-    1. Check these inputs and choose the receipt/lock paths for this execution.
-    2. Reserve the writer lock and collect the existing jobs and saved outputs.
-    3. Connect to MLflow, write the collected report and return the saved receipt.
+def sync_execution(session, execution_arn, settings, *, client=None):
+    """Finalize from the caller; copy cached reports and link the original producers.
+
+    Jobs already publish live metrics/artifacts. This reads native final status,
+    handles steps that never ran, and completes cached-output/Registry navigation.
+    Call after waiting for completion, including failed/stopped executions.
     """
-    # 1. Validate the supplied execution and destinations; do not start any jobs.
+    from mlops_models.pipelines.inspect import collect_execution, write_run_index
+
     settings = validate_tracking(settings)
     if settings is None:
         raise ValueError("Supply tracking settings to synchronize an execution.")
-    if phase not in {"start", "finish", "sync"} or settings.get("kind") not in {"training", "inference"}:
-        raise ValueError("Choose a tracking phase and workflow kind.")
-    if not re.fullmatch(r"arn:aws(?:-us-gov|-cn)?:sagemaker:[a-z0-9-]+:\d{12}:pipeline/[A-Za-z0-9-]+/execution/[A-Za-z0-9-]+", execution_arn):
-        raise ValueError("Supply the full SageMaker pipeline execution ARN.")
-    root = settings["s3_root"].rstrip("/")
-    _, prefix = s3_location(root)
-    if not prefix or ".." in prefix.split("/"):
-        raise ValueError("Tracking needs an application S3 prefix, not the bucket root.")
-
-    # Give the execution one stable receipt path for repeated job/notebook updates.
-    key = hashlib.sha256((settings["uri"] + "/" + execution_arn).encode()).hexdigest()
-    receipt_uri = root + "/tracking/" + key + "/run.json"
-    s3 = session.client("s3", config=READ_CONFIG)
-
-    # 2. Prevent overlapping writers, then READ the execution into a report dictionary.
-    with _lease(s3, receipt_uri.removesuffix("run.json") + "lock.json", settings.get("kms_key", "")):
-        report = collect_execution(session, execution_arn)
-        if phase == "finish":
-            # A dependency can complete before the execution-step API reflects it.
-            for attempt in range(6):
-                if report["execution"]["PipelineExecutionStatus"] in TERMINAL or (
-                    report["steps"] and all(step["status"] in {"Succeeded", "Skipped"}
-                                            for step in report["steps"])
-                ):
-                    break
-                if attempt == 5:
-                    raise RuntimeError("Final tracking cannot confirm completed model steps; synchronize again.")
-                time.sleep(2)
-                report = collect_execution(session, execution_arn)
-
-        # Keep S3 navigation available even if the subsequent tracking service call fails.
-        previous = _read_json(s3, receipt_uri, optional=True)
-        reference = ({key: previous[key] for key in ("tracking_uri", "experiment_id", "run_id", "receipt_uri")
-                      if key in previous} if previous else None)
-        write_run_index(session, report, receipt=reference, kms_key=settings.get("kms_key", ""))
-        # 3. WRITE that report into its MLflow run. Tests can supply a local client;
-        # normal jobs connect to the configured managed tracking service.
-        if client is not None:
-            return publish_execution(client, session, report, settings, phase=phase, receipt_uri=receipt_uri)
-        with managed_client(settings["uri"]) as connected:
-            return publish_execution(connected, session, report, settings, phase=phase, receipt_uri=receipt_uri)
-
-
-def main():
-    """Command-line entry point executed by the tracking Processing jobs.
-
-    Read the phase and environment supplied by source.configure_tracking(), update
-    the MLflow run for that existing pipeline execution, then print the receipt.
-    """
-    import argparse
-    import boto3
-
-    # Read the job's requested phase; it is start, finish or a later explicit sync.
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=["start", "finish", "sync"], required=True)
-    args = parser.parse_args()
-
-    # The pipeline definition supplies these values, including the current
-    # execution ARN. The ARN identifies the execution whose details we will read.
-    settings = {
-        name: os.environ["MLOPS_TRACKING_" + name.upper()]
-        for name in ("uri", "experiment_prefix", "s3_root", "environment", "kind")
-    }
-    # Managed jobs may omit empty environment values; an output KMS key is optional.
-    settings["kms_key"] = os.environ.get("MLOPS_TRACKING_KMS_KEY", "")
-
-    # Delegate the read -> collect -> MLflow write work, then print its result.
-    result = sync_execution(boto3.Session(), os.environ["PIPELINE_EXECUTION_ARN"], settings, phase=args.phase)
-    print(_json({"event": "execution_tracked", **result}), flush=True)
-
-
-if __name__ == "__main__":
-    main()
+    report = collect_execution(session, execution_arn)
+    parameters, execution = report["parameters"], report["execution"]
+    settings = {**settings, "environment": parameters.get("Environment", settings.get("environment", "dev"))}
+    connection = nullcontext(client) if client is not None else managed_client(settings["uri"])
+    with connection as connected:
+        receipt = ensure_run(connected, session, execution_arn, parameters["ModelId"],
+                             settings, created=execution["CreationTime"])
+        run_id = receipt["run_id"]
+        tags = {"pipeline.status": execution["PipelineExecutionStatus"],
+                "pipeline.failure": execution.get("FailureReason", ""),
+                "tracking.receipt_uri": receipt["receipt_uri"]}
+        metrics = {"steps.cached": sum(step["cached"] for step in report["steps"]),
+                   "steps.failed": sum(step["status"] == "Failed" for step in report["steps"])}
+        for step in report["steps"]:
+            prefix = "step." + step["name"]
+            tags.update({prefix + ".cached": str(step["cached"]).lower(),
+                         prefix + ".producer_execution_arn": step["producer_execution_arn"],
+                         prefix + ".status": step["status"]})
+            for key in ("job_arn", "image", "source_revision"):
+                if step.get(key):
+                    tags[prefix + "." + key] = step[key]
+            producer_tracking = step.get("source_identity", {}).get("mlflow")
+            if producer_tracking:
+                tags[prefix + ".producer_run_id"] = producer_tracking["run_id"]
+            trained = step.get("source_identity", {}).get("model_training", {}).get("mlflow")
+            if trained:
+                tags["model.training_run_id"] = trained["run_id"]
+        for path, value in report["reports"].items():
+            step, name = path.split("/", 1)
+            metrics.update(report_metrics(step, {name: value}))
+            if name == "monitoring/summary.json":
+                tags.update(monitoring_tags(value))
+            connected.log_dict(run_id, value, "reports/" + path)
+        for reference in report["registry"]:
+            package, description = reference["receipt"], reference["package"]
+            container = description["InferenceSpecification"]["Containers"][0]
+            tags.update({"model.package_arn": package["package"],
+                         "model.artifact_uri": container["ModelDataUrl"], "model.image_uri": container["Image"]})
+            if settings["kind"] == "inference" and "model.training_run_id" not in tags:
+                producer = description.get("MetadataProperties", {}).get("GeneratedBy")
+                trained = _find_run(connected, receipt["experiment_id"], producer) if producer else None
+                if trained:
+                    tags["model.training_run_id"] = trained.info.run_id
+        for dataset in report["datasets"]:
+            log_dataset(connected, run_id, dataset["uri"], dataset["provenance"],
+                        dataset["producer_execution_arn"])
+        _log_values(connected, run_id, metrics=metrics, tags=tags,
+                    params={"pipeline." + key: str(value) for key, value in parameters.items()})
+        # A cached job does not execute its logger. Make its small report files
+        # available in this run, while preserving explicit original-producer tags.
+        cached = {step["name"] for step in report["steps"] if step["cached"]}
+        with tempfile.TemporaryDirectory(prefix="cached-reports-") as folder:
+            for artifact in report["artifacts"]:
+                relative = Path(artifact["relative_path"])
+                if (not artifact.get("publish_to_mlflow") or artifact["step"] not in cached
+                        or artifact["size"] > MAX_ARTIFACT_BYTES
+                        or relative.suffix.lower() not in COPY_SUFFIXES or relative.name == "_execution.json"):
+                    continue
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("Artifact path escapes its output.")
+                local = Path(folder) / artifact["step"] / relative
+                local.parent.mkdir(parents=True, exist_ok=True)
+                bucket, key = s3_location(artifact["uri"])
+                session.client("s3").download_file(bucket, key, str(local))
+                parent = relative.parent.as_posix()
+                connected.log_artifact(run_id, str(local), "outputs/" + artifact["step"] +
+                                       ("/" + parent if parent != "." else ""))
+        connected.log_dict(run_id, json.loads(_json(report)), "execution.json")
+        status = TERMINAL.get(execution["PipelineExecutionStatus"], "RUNNING")
+        if status != "RUNNING":
+            connected.set_terminated(run_id, status=status, end_time=_milliseconds(execution.get("LastModifiedTime")))
+        elif connected.get_run(run_id).info.status != "RUNNING":
+            connected.update_run(run_id, status="RUNNING")
+        receipt.update(status=status, pipeline_status=execution["PipelineExecutionStatus"])
+        receipt["index_uri"] = write_run_index(session, report, receipt={
+            key: receipt[key] for key in ("tracking_uri", "experiment_id", "run_id", "receipt_uri")},
+            kms_key=settings.get("kms_key", ""))
+        _put_json(session.client("s3"), receipt["receipt_uri"], receipt, settings.get("kms_key", ""))
+        return receipt

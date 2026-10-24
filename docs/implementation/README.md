@@ -998,106 +998,25 @@ incompatible encodings on a scoring batch.
 
 ## MLflow execution tracking
 
-Tracking is optional. Leave `tracking_uri` empty in `notebooks/config.json` to
-retain the existing pipeline graph. To enable it, supply the ARN of an existing
-SageMaker MLflow tracking server or MLflow App, then rerun Notebook 02. The
-notebooks do not create a tracking service, EC2 instance, or lifecycle schedule.
-The [App integration guide](../integration/mlflow-app.md) maps the App-specific
-permissions and configuration to the notebook, managed jobs and UI users.
+Tracking is optional: leave tracking_uri empty in notebooks/config.json to run
+without MLflow. When configured, existing jobs log directly using the approved
+image. There are no tracking-only Processing steps or completion Lambda.
 
-Install `requirements-tracking.txt` in the notebook environment and the image
-used by tracking jobs through the approved dependency/image process. Its client
-set is pinned for a **managed MLflow 3.0.x server**: MLflow 3.0.0,
-sagemaker-mlflow 0.2.0, and boto3 1.43.98. Validate this client set against the
-selected App/server version and the required operations before changing
-dependencies. The tracking module uses the standard
-AWS credential chain; configure the notebook's SDK and MLflow plugin to use the
-same intended identity.
+Each pipeline execution gets one run in <experiment-prefix>/<environment>/<ModelId>.
+Training, selection and evaluation share that run. Inference gets its own run linked
+to the model and its original training run. Reports are artifacts; evaluation and
+prediction metrics belong to their respective execution runs.
 
-Notebook 02 keeps these optional defaults in its defaults cell:
+The loader resolves the execution context at runtime and exposes MLFLOW_TRACKING_URI
+and MLFLOW_RUN_ID. It records the ID with the output's _execution.json. New IDs are
+not placed in the cached job's configured Environment. Cached outputs retain their
+original producers. After execution reaches a terminal state, the notebook or
+Airflow caller invokes sync_execution to finalize status, link cached results and
+write the run-folder index. Studio-triggered runs need that final notebook call.
 
-- `tracking_experiment_prefix = "models"` groups experiments by application.
-- `tracking_image_uri = ""` uses the existing job image. Supply a separate approved
-  image here if the model image does not contain the tracking dependencies.
-- `tracking_instance_type = "ml.m5.large"` controls the tracking job instance.
-
-Notebook preflight checks the notebook caller's service access. With tracking
-enabled, the pipeline has an uncached `StartTracking` Processing job before model
-work and a final tracking job after registration or postprocessing. The two jobs
-add instance startup time and compute cost. They can use a small dedicated image;
-training and prediction continue using their existing image. Network isolation
-cannot be enabled for this route; private networking must provide access to the
-MLflow service, SageMaker APIs and S3.
-
-| MLflow record | Source and interpretation |
-|---|---|
-| Experiment | `<experiment-prefix>/<environment>/<ModelId>` |
-| Run | One per SageMaker pipeline execution, with training/inference identified in its name and tags |
-| Parameters | Pipeline parameters; effective training settings copied from the checkpoint; source and checkpoint parameter snapshots for inference where supplied by the current loader |
-| Metrics | Actual saved evaluation scores and data-usage label, prediction row count when available, and cached/failed step counts |
-| Model | SageMaker model-package ARN, approval state at synchronization, image and checkpoint URI; inference links to the tracked producing training run when available in the same experiment |
-| Data | GetData's snapshot/provenance record, input dataset URI, and original producer execution. The MLflow dataset digest hashes the provenance record; it is not presented as a newly computed full-data hash |
-| Code and jobs | Actual job ARNs/images, step fingerprints, available source commit/dirty state, and original producer identity for reused outputs |
-| Artifacts | `lineage/execution.json`, saved evaluation/postprocessing reports, metadata/settings, and eligible CSV/PNG/PDF/TXT files from those collected outputs up to 10 MiB per file. FeatureSelection CSV/PDF files, raw input datasets and model weights remain in S3 |
-
-The runtime writes `_execution.json` beside real outputs; Evaluate also exposes
-`parameters.json` and `training_execution.json` when present in the checkpoint.
-These records preserve job-time identity when a later execution reuses cached
-outputs. They do not change the model functions' inputs or return values. Old
-artifacts without these records retain their native job/Registry links; missing
-historical settings are not reconstructed from today's files.
-
-Tracking follows `CacheHitResult` to the original producing execution and records
-that link explicitly. It does not rerun cached model code to obtain metrics.
-Tracking jobs remain uncached. An execution-specific S3 receipt and conditional
-lock prevent simultaneous publishers from creating duplicate runs; repeated syncs
-reuse the run and do not append an unchanged metric again. A crashed publisher's
-lock expires after 15 minutes. The first deployment of this increment changes the
-loader/source layout and therefore refreshes affected compute caches. Tracking-only
-modules are excluded from model-step fingerprints, but changing any packaged source
-file now changes the immutable source URI and can still refresh compute caches.
-
-The closing tracking job runs **inside** the pipeline. It can mark model work
-`FINISHED` while SageMaker still reports the pipeline as `Executing`; the run
-retains both `pipeline.status` and `tracking.finalized_before_pipeline_terminal`
-so this distinction remains visible. A failed/stopped pipeline can skip the final
-job altogether. **Run Notebook 02's final synchronization cell after completion,
-failure, stop, or retry** to record the exact terminal state. It defaults to the
-latest execution of each published pipeline; set its execution-ARN overrides when
-reconciling an older execution or another model's run. A retry within the same
-execution updates the same MLflow run; a new execution gets a new run.
-
-The [optional completion adapter](../integration/observability.md#complete-tracking-automatically)
-provides terminal-event reconciliation. Platform deploys and accepts its resources
-separately; copying source or running Notebook 02 does not provision a watcher. Native HPO
-trial-level runs and parent/child links are also a later increment. Enabling the
-existing HPO branch does not imply trial-level tracking acceptance.
-
-The tracking caller needs the following access, scoped by the platform:
-
-- MLflow App: `sagemaker:CallMlflowAppApi` on the selected App ARN.
-- MLflow Tracking Server: `CreateExperiment`, `SearchExperiments`, `GetExperiment`,
-  `GetExperimentByName`, `CreateRun`, `GetRun`, `SearchRuns`, `LogBatch`,
-  `LogInputs`, `UpdateRun`, and `ListArtifacts` in the `sagemaker-mlflow` service.
-- SageMaker: describe the pipeline execution and its jobs, list execution steps
-  and parameters, and describe the referenced model package.
-- S3/KMS: read job outputs and Registry receipts, list the relevant output prefixes,
-  write run receipts/artifacts, and delete only the execution-lock objects.
-  The tracking artifact store and its encryption key need their own scoped grants.
-- The pipeline role must be able to launch the tracking Processing jobs and pass
-  their job role; any separate tracking image also needs ECR pull access.
-
-Notebook synchronization makes the same tracking writes using the notebook
-identity. It does not approve models, start training/inference, create a duplicate
-model registry, or require tracking-server creation/deletion privileges.
-
-For local tracking checks, install the tracking requirements and run
-`python -m unittest discover -s tests -p 'test_execution_tracking.py' -v` with the
-repository's model Python paths configured. The MLflow record tests use a real
-local MLflow store and simulated AWS execution evidence; managed training and
-cached-repeat evidence are recorded separately under Validation. Receiving-environment
-acceptance remains required. The definition checks run without the optional
-MLflow client installed.
+See [direct logging and monitoring](../integration/observability.md) for the optional
+metrics.json contract, report folders and actual batch-monitoring example.
+The graph helper is editable inside notebook 03; MLflow does not require it.
 
 ## Features and status
 
@@ -1119,36 +1038,19 @@ MLflow client installed.
 | MLflow tracking and lineage | Optional execution runs, effective settings, saved metrics, Registry links, artifacts and cached-producer identity | Sandbox managed training and cached-repeat logging verified; receiving-environment and managed inference-tracking acceptance remain open. An optional terminal callback is implemented; target delivery/failure/stop acceptance remains separate, with explicit sync available |
 | Monitoring and production integration | Optional Notebook 04 demonstrates an Evidently report and small CloudWatch/SNS alert pattern | Platform supplies actual data, thresholds, scheduling and operational integration |
 
-## Container versions and the tracking image
+## One pinned container
 
-The approved model image supplies Python, AutoGluon, SHAP, XGBoost, NumPy and other
-runtime dependencies. Pin its base image digest and full resolved dependency set.
-Platform supplies a candidate image, dependency changes and rollback digest to the
-ML team before promotion. ML accepts training, saved-model loading, prediction and
-SHAP/report outputs against that candidate. Preserve the previous digest until the
-new image is accepted; an image upgrade does not silently update existing pipelines.
+The root requirements.txt and requirements.lock.txt define the shared Linux image.
+Model jobs, direct MLflow logging and Evidently reporting use that same image.
+AutoGluon 1.2, SHAP 0.49.1, XGBoost 3.4.1, pandas 2.2.3, NumPy 1.26.4,
+scikit-learn 1.5.2 and boto3/botocore 1.38.36 are retained. The explicit additional
+clients are mlflow-skinny 3.10.1, sagemaker-mlflow 0.5.0 and Evidently 0.7.20.
+Evidently requires updating requests 2.31.0 to 2.34.2 in the approved image.
 
-`tracking_image_uri` is the image for short-lived tracking Processing jobs. It
-contains the MLflow client and AWS plugin from `requirements-tracking.txt`, reads
-execution outputs, and writes to the configured App/server. It does not host the
-tracking service. A separate image isolates those dependencies; leaving the setting
-empty uses the model image, which must then contain a compatible client/plugin set.
-
-Use the model requirements and hash lock for the approved runtime. Train and load
-each model with its recorded image digest. The example uses normal AutoGluon
-save/load calls and the public XGBoost contribution API below; there are no
-version-check bypasses, SHAP decoder patches or package replacements at job startup.
-Test training, saved-model loading, predictions and explanations before promoting
-a dependency upgrade.
-
-The shared model requirements and both example-model locks use AutoGluon **1.2**,
-SHAP **0.49.1**, XGBoost **3.4.1**, NumPy **1.26.4**, pandas **2.2.3** and
-scikit-learn **1.5.2**. `model_base/requirements.constraints.txt` pins the supplied
-runtime versions used by those dependencies, including **setuptools 74.1.3** for
-AutoGluon's model save/load metadata. The model image uses boto3/botocore
-**1.38.36**; notebook and MLflow client dependencies are installed in their separate
-environments. Flask/Gunicorn and their serving dependencies remain explicit
-additions for this template's optional HTTP adapter.
+Promote dependency/image changes through the platform build and test training,
+saved-model loading, prediction and reports before changing production bindings.
+No package is installed or patched when a job starts. Local release/export/build
+utilities are separate from the BMO copy-over code.
 
 ### XGBoost contribution values without a decoder patch
 
@@ -1234,24 +1136,15 @@ The receiving team reports working training and batch inference. Record the
 accepted model cases, pipeline versions, source/image identities and outputs
 inside that environment. This report does not establish every optional mode.
 
-The retained October 18 sandbox classification execution completed all nine
-steps, including tracking, one Training job and pending model registration.
-Inspection matched Pipeline, Registry, S3 and MLflow identities, saved metrics,
-metadata/checksums and published/archived source. Explicit terminal synchronization
-updated the final MLflow status. Its synthetic 160-row input and
-`prepared_input_smoke_check` metrics establish workflow execution, not model quality.
+Validation must cover a fresh training run, inference against its approved
+model, a cached repeat and caller finalization after native failure. Confirm that
+all jobs use the approved image and that MLflow artifacts match their S3 originals.
+For monitoring, compare supplied batches and check the native HTML reports plus
+reference/current quality metrics when aligned labels are available.
 
-The October 19 Studio repeat succeeded on the same published version. Five
-compute steps reused the original producer; a new Registry version and MLflow
-run were created. The saved pipeline-status tag remained Executing because the
-closing tracking job preceded pipeline completion. Automatic terminal
-reconciliation and a discoverable per-run artifact index remain open.
-
-The unchanged runtime source passed nine tracking and 39 model/runtime checks
-in the corresponding Linux images as a non-root user, without network access
-and with read-only source. Earlier real local regression/classification fits,
-file prediction and HTTP-serving checks have separate source-specific evidence.
-They do not establish the receiving image's optional Transform/HPO acceptance.
+The training example's `prepared_input_smoke_check` is a workflow check. Use
+held-out predictions and labels to assess model quality. Optional Transform and
+HPO need their own acceptance before use.
 
 For local source checks, use the declared infrastructure/test/model dependencies:
 

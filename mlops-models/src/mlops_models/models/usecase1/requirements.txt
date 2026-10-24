@@ -1,3 +1,0 @@
--c ../../model_base/requirements.constraints.txt
-autogluon.tabular==1.2
-typing_extensions==4.16.0
