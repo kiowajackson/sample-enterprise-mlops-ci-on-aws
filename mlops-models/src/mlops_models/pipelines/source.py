@@ -373,6 +373,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             raise ValueError("Shared HPO requires the same search space and fixed parameters. "
                              "Select a compatible model subset when publishing.")
     model = {"Get": "Parameters.ModelId"}
+    pipeline_source = {"Get": "Parameters.PipelineSourceUri"}
     output = join({"Get": "Parameters.OutputDataRoot"}, model, "runs")
     group = model_package_group or join(model, "sm", environment, on="-")
     if registry_group_prefix:
@@ -400,6 +401,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                 parameter["Name"], parameter["Name"])
         body["Parameters"].insert(0, {"Name": "ModelId", "Type": "String",
                                       "DefaultValue": models[0], "EnumValues": models})
+        body["Parameters"].insert(1, {"Name": "PipelineSourceUri", "Type": "String",
+                                      "DefaultValue": source_uri})
         body["Metadata"].update(SourceUri=source_uri, DeployMode=identity["mode"],
                                 Release=identity["name"], BatchRuntime=batch_runtime, DataSource=data_sources[kind],
                                 RegistryMode="model_registry", Environment=environment,
@@ -419,22 +422,22 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                     for item in arguments[index:index + 2]]
                 if not args["AppSpecification"]["ContainerArguments"]:
                     del args["AppSpecification"]["ContainerArguments"]
-                args.setdefault("ProcessingInputs", []).append(source_input(source_uri))
+                args.setdefault("ProcessingInputs", []).append(source_input(pipeline_source))
             elif step["Type"] == "Training":
                 args["AlgorithmSpecification"]["ContainerEntrypoint"] = [
                     "python", "/opt/ml/input/data/source/load_source.py", "train"]
                 args["InputDataConfig"].append({"ChannelName": "source", "DataSource": {
-                    "S3DataSource": {"S3Uri": source_uri, "S3DataType": "S3Prefix",
+                    "S3DataSource": {"S3Uri": pipeline_source, "S3DataType": "S3Prefix",
                                      "S3DataDistributionType": "FullyReplicated"}}})
             elif step["Type"] == "Tuning":
                 # HPO cannot override image ENTRYPOINT. A compatible image launches
                 # `python -m mlops_models.entrypoints train` using this mounted source.
                 job = args["TrainingJobDefinition"]
                 job["InputDataConfig"].append({"ChannelName": "source", "DataSource": {
-                    "S3DataSource": {"S3Uri": source_uri, "S3DataType": "S3Prefix",
+                    "S3DataSource": {"S3Uri": pipeline_source, "S3DataType": "S3Prefix",
                                      "S3DataDistributionType": "FullyReplicated"}}})
                 job["Environment"].update(PYTHONPATH="/opt/ml/input/data/source", PYTHONSAFEPATH="1")
-                config_uri = join(source_uri, "mlops_models/models", model, "parameters.json")
+                config_uri = join(pipeline_source, "mlops_models/models", model, "parameters.json")
                 def setting(path):
                     return {"Std:JsonGet": {"S3Uri": config_uri, "Path": "tuning.objective." + path}}
                 args["HyperParameterTuningJobConfig"]["HyperParameterTuningJobObjective"] = {
@@ -445,13 +448,13 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             elif step["Type"] == "RegisterModel":
                 args["InferenceSpecification"]["Containers"][0]["Environment"].update(
                     PYTHONPATH="/opt/ml/model/code", PYTHONSAFEPATH="1")
-                args["CustomerMetadataProperties"].update(SourceUri=source_uri,
+                args["CustomerMetadataProperties"].update(SourceUri=pipeline_source,
                                                           DeployMode=identity["mode"])
         if kind == "training":
             from .training_files import configure_file_training
             configure_file_training(body)
         if kind == "inference":
-            configure_approved_inference(body, group, source_uri, batch_runtime, region,
+            configure_approved_inference(body, group, pipeline_source, batch_runtime, region,
                                          model_code_source=model_code_source)
         if data_sources[kind] == "feature_store":
             configure_feature_store(body, feature_store_config_uri, universe_data_root, region)
@@ -511,7 +514,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                     step["Arguments"]["Environment"]["MLOPS_ANALYSIS_MODE"] = {
                         "Get": "Parameters.PredictionAnalysis"}
         if kind == "training":
-            configure_registration(body, source_uri, region)
+            configure_registration(body, pipeline_source, region)
         configure_execution_records(body, kind, namespace, job_role, region, environment, batch_runtime)
         if step_cache_revisions:
             configure_step_cache(body, step_cache_revisions, kind, data_sources[kind])
