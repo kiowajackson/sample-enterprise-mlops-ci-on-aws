@@ -141,15 +141,15 @@ def validate_approved_model_package(package_arn, group, image_uri, checkpoint_ur
 
 
 def resolve_latest_approved_model(group, output_dir, *, namespace, model_id, environment,
-                                  package_arn="", client=None):
-    """Resolve an exact version, or the newest approved Development model in this namespace."""
+                                 package_arn="", client=None):
+    """Resolve an ARN, or latest-approved (also an omitted ARN in older pipelines)."""
     if client is None:
         import boto3
         client = boto3.client("sagemaker")
     # List summaries omit the namespace metadata. Describe candidates before
     # selecting; a newer model from another user's deployment must not win.
     package = None
-    if package_arn:
+    if package_arn and package_arn != "latest-approved":
         package = client.describe_model_package(ModelPackageName=package_arn)
     else:
         packages = []

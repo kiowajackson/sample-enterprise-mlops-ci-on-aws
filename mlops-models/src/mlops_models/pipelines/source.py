@@ -541,7 +541,7 @@ def configure_execution_records(body, kind, namespace, job_role, region, environ
 
 
 def configure_monitoring(body, settings, namespace, job_role, region, environment, batch_runtime):
-    """Run a separate comparison job only when ReferenceExecutionArn is supplied."""
+    """Skip comparison when ReferenceExecutionArn is none; otherwise pass it to Drift."""
     if not settings or not settings.get("enabled", False):
         return
     if batch_runtime != "processing":
@@ -556,7 +556,8 @@ def configure_monitoring(body, settings, namespace, job_role, region, environmen
     args = comparison["Arguments"]
     if args.get("NetworkConfig", {}).get("EnableNetworkIsolation", False):
         raise ValueError("Reference monitoring needs connectivity to SageMaker and S3.")
-    body["Parameters"].append({"Name": "ReferenceExecutionArn", "Type": "String", "DefaultValue": ""})
+    # Nonempty defaults also work when Studio submits every parameter explicitly.
+    body["Parameters"].append({"Name": "ReferenceExecutionArn", "Type": "String", "DefaultValue": "none"})
     args["ProcessingJobName"] = args["ProcessingJobName"].removesuffix("-post") + "-drift"
     args["AppSpecification"]["ContainerEntrypoint"][-1] = "drift"
     args["AppSpecification"].pop("ContainerArguments", None)
@@ -575,7 +576,7 @@ def configure_monitoring(body, settings, namespace, job_role, region, environmen
         "Name": "HasReference", "Type": "Condition", "DependsOn": ["Postprocess"],
         "Arguments": {
             "Conditions": [{"Type": "Not", "Condition": {
-                "Type": "Equals", "LeftValue": {"Get": "Parameters.ReferenceExecutionArn"}, "RightValue": ""}}],
+                "Type": "Equals", "LeftValue": {"Get": "Parameters.ReferenceExecutionArn"}, "RightValue": "none"}}],
             "IfSteps": [comparison], "ElseSteps": [],
         },
     })
@@ -789,7 +790,7 @@ def configure_approved_inference(body, group, source_uri, batch_runtime, region,
     ])
     body["Parameters"] = [p for p in body["Parameters"]
                            if p["Name"] not in {"ModelDataUri", "InferenceImageUri", "ModelPackageArn"}]
-    body["Parameters"].append({"Name": "ModelPackageArn", "Type": "String", "DefaultValue": ""})
+    body["Parameters"].append({"Name": "ModelPackageArn", "Type": "String", "DefaultValue": "latest-approved"})
     steps = {step["Name"]: step for step in body["Steps"]}
     for name in ("GetData", "Preprocess", "CreateModel", "Postprocess"):
         dependencies = steps[name].setdefault("DependsOn", [])
