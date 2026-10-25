@@ -7,6 +7,9 @@ import json
 
 
 def execute(model_id, input_path, selection_path, output_dir, *, model_dir):
+    raise RuntimeError(
+        f"PREPROCESS_PROBE: edited execute() was reached. File: {__file__}"
+    )
     # Temporary diagnostic: show the container's source before importing it.
     script = Path(__file__).resolve().parents[1] / "model_base/inference/preprocess.py"
     with script.open() as source:
