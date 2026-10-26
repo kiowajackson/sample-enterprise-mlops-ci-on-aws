@@ -1,41 +1,41 @@
-MLflow tracking update — October 26, 2026
+MLflow installed-client fix only — October 26, 2026
 
-This review contains only the tracking update. The earlier training, inference,
-routing and execution-input changes have been implemented and are excluded.
-These are complete changed files to apply to the existing application.
+The earlier Tracking Server integration is already implemented. This review
+contains only the subsequent correction for platform-provided MLflow clients.
+Apply these complete replacement files to the existing application.
 
 IMPLEMENTATION FILES (3)
 mlops-models/src/mlops_models/pipelines/tracking.py
+  Remove the exact client/server version rejection. Use the installed client.
+  Verify dataset references and run search as part of the existing connection
+  check, and include client/server versions in failure diagnostics.
 mlops-models/src/mlops_models/pipelines/source.py
+  Remove the required client version from job environments. Record the notebook
+  version as diagnostic metadata only.
 notebooks/02_deploy_pipelines.ipynb
+  Remove matching-version instructions; use and report the provided clients.
 
-GUIDE, TEST AND CHECKLIST (3)
+SUPPORTING FILES (3)
 README.md
+  Describe the installed-client behavior and actual-operation checks.
 tests/test_execution_tracking.py
+  Cover differing versions, dataset failures and removal of the job version pin.
 CHANGED_FILES.txt
+  This checklist describes only the installed-client correction.
 
 CONFIGURATION
-Set tracking_uri in the existing notebooks/config.json to the approved MLflow
-Tracking Server or App ARN. Keep the other config values. No new keys are needed.
-An empty tracking_uri disables tracking.
-
-Notebook 02 uses the installed MLflow client to verify a labelled connection-check
-run, parameters, metrics, tags, dataset reference, run search and artifact
-upload/download in each model experiment. Experiment names and artifact locations
-are derived without extra inputs. Client/server versions are diagnostic values.
-
-The notebook and jobs use their provided clients; this update removes the exact
-version rejection and notebook-to-job version requirement. It does not install
-packages, change requirements or rebuild images. Actual API or access errors
-remain visible. Inference uses its selected Registry package's existing image.
+Keep the existing tracking_uri and other configuration values.
+No new config inputs, requirements installation, image rebuild or server change
+is part of this correction.
 
 VALIDATION
-A real MLflow 3.16.1 client passed the connection and job-output checks against a
-local MLflow 3.0.0 HTTP server, including dataset references and artifact readback.
-SageMaker describe calls were simulated. BMO API gateway, IAM, S3, job-image and
-human UI access still need verification in the receiving environment.
+The previously tested runtime, notebook and test contents are unchanged.
+62 focused checks passed with client 3.10.1; 17 tracking checks passed with 3.0.0.
+The actual notebook build cell passed enabled/disabled in both versions.
+A real 3.16.1 client passed tracking and artifact operations against a local
+3.0.0 HTTP server. AWS access was simulated; the receiving SageMaker gateway,
+IAM, S3 and job-image behavior still need the real connection/execution checks.
 
 AFTER APPLYING
-Restart the notebook kernel and run notebook 02 to publish the updated binding.
-Existing pipeline versions retain their previous settings. The existing optional
-completion service remains responsible for final pipeline-level MLflow status.
+Restart the notebook kernel and rerun notebook 02 to publish a new pipeline
+version. Select that version for the next execution.
