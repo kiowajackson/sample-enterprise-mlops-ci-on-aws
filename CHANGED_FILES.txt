@@ -19,22 +19,21 @@ Set tracking_uri in the existing notebooks/config.json to the approved MLflow
 Tracking Server or App ARN. Keep the other config values. No new keys are needed.
 An empty tracking_uri disables tracking.
 
-Notebook 02 checks Tracking Server/client compatibility and verifies a small
-labelled connection-check run, parameter, metric and artifact upload/download in
-each model experiment. The published jobs require the checked client version.
-Experiment names and artifact locations are derived without extra user inputs.
+Notebook 02 uses the installed MLflow client to verify a labelled connection-check
+run, parameters, metrics, tags, dataset reference, run search and artifact
+upload/download in each model experiment. Experiment names and artifact locations
+are derived without extra inputs. Client/server versions are diagnostic values.
 
-The notebook does not install packages or rebuild images. If it reports a client
-version mismatch, update the notebook environment and approved model image through
-the existing dependency/build process. Requirements/lock remain at the previously
-tested App client 3.10.1. Inference also needs a compatible registered model image.
+The notebook and jobs use their provided clients; this update removes the exact
+version rejection and notebook-to-job version requirement. It does not install
+packages, change requirements or rebuild images. Actual API or access errors
+remain visible. Inference uses its selected Registry package's existing image.
 
 VALIDATION
-61 focused checks passed with client 3.10.1, and 16 tracking checks passed with
-client 3.0.0. The actual notebook build cell passed with local MLflow storage in
-both versions, with tracking enabled and disabled. AWS calls were simulated and
-container networking was disabled. BMO notebook/job/UI access and connectivity
-still require verification in the receiving environment.
+A real MLflow 3.16.1 client passed the connection and job-output checks against a
+local MLflow 3.0.0 HTTP server, including dataset references and artifact readback.
+SageMaker describe calls were simulated. BMO API gateway, IAM, S3, job-image and
+human UI access still need verification in the receiving environment.
 
 AFTER APPLYING
 Restart the notebook kernel and run notebook 02 to publish the updated binding.

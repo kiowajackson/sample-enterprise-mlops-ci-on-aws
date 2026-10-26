@@ -78,23 +78,16 @@ def validate_tracking(settings):
 
 
 @contextmanager
-def managed_client(uri, *, client_version=""):
+def managed_client(uri):
     """Use the current AWS credential chain, restoring the caller's MLflow URI."""
     try:
         import mlflow
         import sagemaker_mlflow  # noqa: F401; installs SigV4/client plugins
     except ImportError as error:
-        requirement = f"mlflow-skinny=={client_version}" if client_version else "mlflow-skinny"
         raise RuntimeError(
-            f"MLflow logging requires {requirement} and sagemaker-mlflow in this environment. "
-            "Install compatible clients through the approved notebook/image build."
+            "MLflow logging requires an installed MLflow client and sagemaker-mlflow "
+            "in this environment."
         ) from error
-    if client_version and mlflow.__version__ != client_version:
-        raise RuntimeError(
-            f"MLflow client is {mlflow.__version__}; this tracking binding requires "
-            f"mlflow-skinny=={client_version}. Update the notebook environment and model image "
-            "through the approved build, then restart the kernel and republish."
-        )
 
     previous = mlflow.get_tracking_uri()
     try:
@@ -115,7 +108,6 @@ def check_tracking(session, settings, experiment_names):
     region, resource = uri.split(":")[3], uri.split(":", 5)[5]
     service, name = resource.split("/", 1)
     result = {"uri": uri, "service": service, "server_version": None, "experiments": []}
-    expected_version = ""
     if service == "mlflow-tracking-server":
         # Use the ARN's Region; the notebook default can point elsewhere.
         sm = session.client("sagemaker", region_name=region, config=READ_CONFIG)
@@ -128,18 +120,11 @@ def check_tracking(session, settings, experiment_names):
                 f"({server.get('TrackingServerStatus', 'unknown')}). Ask its owner to start it."
             )
         result["server_version"] = server["MlflowVersion"]
-        # AWS's documented Tracking Server/client combinations.
-        expected_version = {"2.13": "2.13.2", "2.16": "2.16.2", "3.0": "3.0.0"}.get(
-            ".".join(server["MlflowVersion"].split(".")[:2]), ""
-        )
-        if not expected_version:
-            raise ValueError(
-                f"Tracking Server version {server['MlflowVersion']} has no reviewed client mapping. "
-                "Verify AWS's compatibility guidance before updating check_tracking."
-            )
+        # Record versions for diagnostics. Different version numbers do not
+        # establish whether the operations below work in the supplied environment.
     # Apps use the existing plugin connection. This avoids requiring App management
     # APIs that are absent from the pinned Boto3 SDK; the write/read check still runs.
-    with managed_client(uri, client_version=expected_version) as client:
+    with managed_client(uri) as client:
         import mlflow
         result["client_version"] = mlflow.__version__
         client.search_experiments(max_results=1)
@@ -155,7 +140,7 @@ def check_tracking(session, settings, experiment_names):
             try:
                 _log_values(client, run_id, metrics={"connection_check": 1},
                             params={"purpose": "connection-check"},
-                            tags={"mlops.purpose": "connection-check"})
+                            tags={"mlops.purpose": "connection-check", "mlops.check_id": run_id})
                 client.set_tag(run_id, "mlops.check", "notebook")
                 stage = "upload artifact"
                 payload = {"run_id": run_id, "purpose": "connection-check"}
@@ -165,13 +150,22 @@ def check_tracking(session, settings, experiment_names):
                     downloaded = client.download_artifacts(run_id, "connection-check.json", directory)
                     if json.loads(Path(downloaded).read_text()) != payload:
                         raise ValueError("Downloaded artifact differs from the uploaded check.")
+                stage = "log dataset reference"
+                log_dataset(client, run_id, run.info.artifact_uri.rstrip("/") + "/connection-check.json",
+                            payload, "connection-check")
                 stage = "finish and read run"
                 client.set_terminated(run_id, status="FINISHED")
                 saved = client.get_run(run_id)
                 if (saved.info.status != "FINISHED"
                         or saved.data.metrics.get("connection_check") != 1
-                        or saved.data.params.get("purpose") != "connection-check"):
-                    raise ValueError("Run status, metric or parameter was not retained.")
+                        or saved.data.params.get("purpose") != "connection-check"
+                        or not getattr(getattr(saved, "inputs", None), "dataset_inputs", [])):
+                    raise ValueError("Run status, metric, parameter or dataset reference was not retained.")
+                stage = "search for run"
+                found = client.search_runs(
+                    [experiment_id], f"tags.`mlops.check_id` = '{run_id}'", max_results=1)
+                if not found or found[0].info.run_id != run_id:
+                    raise ValueError("The check run could not be found through run search.")
             except Exception as error:
                 try:
                     client.set_terminated(run_id, status="FAILED")
@@ -179,7 +173,8 @@ def check_tracking(session, settings, experiment_names):
                     pass  # Preserve the original write/read failure.
                 raise RuntimeError(
                     f"MLflow notebook check could not {stage} in {experiment_name} "
-                    f"(run {run_id}): {error}"
+                    f"(run {run_id}, client {result['client_version']}, "
+                    f"server {result['server_version'] or 'not reported'}): {error}"
                 ) from error
             result["experiments"].append({
                 "name": experiment_name, "experiment_id": experiment_id, "run_id": run_id,
@@ -316,13 +311,15 @@ def job_tracking(model, output_uri=""):
         ("environment", "ENVIRONMENT"), ("kind", "KIND"), ("kms_key", "KMS_KEY"))}
     session = boto3.Session(region_name=pipeline.split(":")[3])
     previous = {key: os.environ.get(key) for key in ("MLFLOW_TRACKING_URI", "MLFLOW_RUN_ID")}
-    with managed_client(settings["uri"], client_version=os.getenv("MLOPS_TRACKING_CLIENT_VERSION", "")) as client:
+    with managed_client(settings["uri"]) as client:
+        import mlflow
         receipt = ensure_run(client, session, execution_arn, model, settings)
         os.environ.update(MLFLOW_TRACKING_URI=settings["uri"], MLFLOW_RUN_ID=receipt["run_id"])
         step = os.environ["MLOPS_TRACKING_STEP"]
         client.set_tag(receipt["run_id"], "step." + step + ".status", "Running")
         print(json.dumps({"event": "mlflow_job_logging", "step": step,
-                          "run_id": receipt["run_id"], "execution_arn": execution_arn}), flush=True)
+                          "run_id": receipt["run_id"], "execution_arn": execution_arn,
+                          "client_version": mlflow.__version__}), flush=True)
         try:
             yield {"client": client, "step": step, **receipt}
         except Exception as error:

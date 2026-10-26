@@ -142,15 +142,16 @@ class ExecutionTracking(unittest.TestCase):
             self.assertEqual(run.data.metrics["connection_check"], 1)
             self.assertEqual(run.data.params["purpose"], "connection-check")
             self.assertEqual(run.data.tags["mlops.purpose"], "connection-check")
+            self.assertEqual(len(run.inputs.dataset_inputs), 1)
             path = self.mlflow.download_artifacts(item["run_id"], "connection-check.json")
             self.assertEqual(json.loads(Path(path).read_text())["run_id"], item["run_id"])
             self.assertEqual(item["artifact_location"],
                              self.mlflow.get_experiment(item["experiment_id"]).artifact_location)
 
-    def test_tracking_server_uses_arn_region_and_documented_client_version(self):
+    def test_tracking_server_reports_versions_without_requiring_a_match(self):
         uri = TRACKING_URI.replace("us-east-1", "us-west-2")
         for server_version, client_version in [
-            ("2.13.0", "2.13.2"), ("2.16.1", "2.16.2"), ("3.0.0", "3.0.0"),
+            ("2.16.1", "3.10.1"), ("3.0.0", "3.16.1"), ("99.0.0", "3.16.1"),
         ]:
             with self.subTest(server_version=server_version):
                 session = Mock()
@@ -168,7 +169,7 @@ class ExecutionTracking(unittest.TestCase):
                 self.assertEqual(session.client.call_args.kwargs["region_name"], "us-west-2")
                 session.client.return_value.describe_mlflow_tracking_server.assert_called_once_with(
                     TrackingServerName="test")
-                managed.assert_called_once_with(uri, client_version=client_version)
+                managed.assert_called_once_with(uri)
 
     def test_failed_artifact_access_stops_check_and_marks_run_failed(self):
         with patch.object(tracking, "managed_client", return_value=nullcontext(self.mlflow)), \
@@ -192,15 +193,24 @@ class ExecutionTracking(unittest.TestCase):
         experiment = self.mlflow.get_experiment_by_name("review/corrupt")
         self.assertEqual(self.mlflow.search_runs([experiment.experiment_id])[0].info.status, "FAILED")
 
-    def test_client_mismatch_fails_before_connecting_or_changing_active_uri(self):
+    def test_existing_client_is_used_and_tracking_uri_is_restored(self):
         import mlflow
         previous = mlflow.get_tracking_uri()
-        with patch("mlflow.__version__", "3.10.1"), patch("mlflow.MlflowClient") as client:
-            with self.assertRaisesRegex(RuntimeError, "requires mlflow-skinny==3.0.0"):
-                with tracking.managed_client(TRACKING_URI, client_version="3.0.0"):
-                    self.fail("An incompatible client must not connect.")
-        client.assert_not_called()
+        with patch("mlflow.__version__", "3.16.1"), patch("mlflow.MlflowClient") as client:
+            with tracking.managed_client(TRACKING_URI) as actual:
+                self.assertIs(actual, client.return_value)
+                self.assertEqual(mlflow.get_tracking_uri(), TRACKING_URI)
+        client.assert_called_once_with(tracking_uri=TRACKING_URI)
         self.assertEqual(mlflow.get_tracking_uri(), previous)
+
+    def test_dataset_api_failure_is_reported_instead_of_silently_skipped(self):
+        with patch.object(tracking, "managed_client", return_value=nullcontext(self.mlflow)), \
+                patch.object(self.mlflow, "log_inputs", side_effect=RuntimeError("unsupported API")):
+            with self.assertRaisesRegex(RuntimeError, "log dataset reference.*unsupported API"):
+                tracking.check_tracking(
+                    Mock(), {"uri": BASE + ":mlflow-app/test"}, ["review/dataset-api"])
+        experiment = self.mlflow.get_experiment_by_name("review/dataset-api")
+        self.assertEqual(self.mlflow.search_runs([experiment.experiment_id])[0].info.status, "FAILED")
 
     def execution(self, kind, model="usecase1", name="one", status="Succeeded"):
         arn = BASE + f":pipeline/test-{kind}/execution/{name}"
@@ -385,12 +395,11 @@ class TrackingDefinition(unittest.TestCase):
             self.assertIsNone(tracking.check_tracking(session, None, []))
         session.client.assert_not_called()
 
-    def test_unready_or_unrecognized_server_stops_before_mlflow_writes(self):
+    def test_inactive_or_wrong_server_stops_before_mlflow_writes(self):
         original = {"TrackingServerArn": TRACKING_URI, "MlflowVersion": "3.0.0",
                     "IsActive": "Active", "TrackingServerStatus": "Created"}
         for update, error in [
             ({"IsActive": "Inactive", "TrackingServerStatus": "Stopped"}, "not active"),
-            ({"MlflowVersion": "99.0.0"}, "no reviewed client mapping"),
             ({"TrackingServerArn": TRACKING_URI + "-other"}, "does not match"),
         ]:
             with self.subTest(update=update):
@@ -412,8 +421,10 @@ class TrackingDefinition(unittest.TestCase):
                        "Preprocess", "Train", "Evaluate", "BatchGetData", "BatchPreprocess", "Score", "Postprocess")})
         before = source.build_definitions(*args, **options)
         after = source.build_definitions(
-            *args, **options, tracking={"uri": TRACKING_URI, "client_version": "3.0.0"})
+            *args, **options, tracking={"uri": TRACKING_URI, "client_version": "3.16.1"})
         for kind in before:
+            self.assertEqual(
+                json.loads(after[kind]["Metadata"]["Tracking"])["notebook_client_version"], "3.16.1")
             old = {s["Name"]: s for s in walk_steps(before[kind]["Steps"])}
             new = {s["Name"]: s for s in walk_steps(after[kind]["Steps"])}
             self.assertEqual(old.keys(), new.keys())
@@ -423,7 +434,7 @@ class TrackingDefinition(unittest.TestCase):
                     env = actual["Environment"]
                     tracking_values = {key: env.pop(key) for key in list(env) if key.startswith("MLOPS_TRACKING_")}
                     self.assertEqual(tracking_values["MLOPS_TRACKING_URI"], TRACKING_URI)
-                    self.assertEqual(tracking_values["MLOPS_TRACKING_CLIENT_VERSION"], "3.0.0")
+                    self.assertNotIn("MLOPS_TRACKING_CLIENT_VERSION", tracking_values)
                     self.assertTrue(all(isinstance(v, str) for v in tracking_values.values()))
                     self.assertEqual(actual, step["Arguments"])
                     self.assertEqual(step.get("CacheConfig"), new[name].get("CacheConfig"))

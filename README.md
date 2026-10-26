@@ -308,21 +308,21 @@ existing `notebooks/config.json` (keep its other values):
 An App ARN uses `mlflow-app/NAME` instead. Notebook 02 derives experiment names
 from the existing namespace and obtains artifact locations from the service.
 For a Tracking Server, it describes the server in the ARN's Region and checks
-its version against AWS's documented client versions. For either service, it
-writes and downloads a tiny artifact and verifies a parameter, metric and
-finished `connection-check` run in each model experiment before publication.
-The labelled checks remain visible, and `publication.json` records their IDs.
-An empty `tracking_uri` skips all MLflow checks and connections.
+that it is active. For either service, it uses the installed client to verify
+parameters, metrics, tags, dataset references, run search and artifact
+upload/download in a labelled `connection-check` run in each model experiment.
+The checks remain visible, and `publication.json` records their IDs and observed
+client/server versions. An empty `tracking_uri` skips all MLflow connections.
 
-Notebook and model image clients must match the checked version. A mismatch
-stops with the required `mlflow-skinny` version; this does not install packages
-or change a running image. The current requirements/lock target client 3.10.1
-for the tested App; a Tracking Server may require a different client and a
-rebuilt approved image. Published jobs check their actual client version before
-logging. Notebook success does not prove job-role, network or UI access.
+Use the MLflow client and `sagemaker-mlflow` plugin already supplied by the
+notebook and job images. The integration does not require equal notebook, job
+and server versions, install packages or change those images. An actual API or
+access failure stops the check with the failed operation and original error.
+Notebook success does not prove job-image compatibility, job-role, network or
+UI access; verify an actual execution in the supplied image.
 
 Use the [managed MLflow integration guide](docs/integration/mlflow-app.md) for
-version requirements, caller permissions and activation with notebook 02.
+caller permissions and activation with notebook 02.
 
 The [logging and monitoring guide](docs/integration/observability.md) explains the
 run ID, finalization call and report locations. The image build uses the root
