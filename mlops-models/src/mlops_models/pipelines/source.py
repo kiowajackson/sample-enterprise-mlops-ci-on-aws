@@ -473,7 +473,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                     args.setdefault("Environment", {})["MLOPS_MODEL_METADATA_URI"] = {
                         "Get": "Parameters.ModelMetadataUri"}
                 if step["Name"] in {"Train", "Tune"}:
-                    args["Environment"]["MLOPS_TRAINING_MODE"] = {"Get": "Parameters.TrainingMode"}
+                    args["Environment"]["MLOPS_TRAINING_SELECTION"] = {"Get": "Parameters.TrainingMode"}
         if kind == "inference":
             configure_approved_inference(body, group, pipeline_source, batch_runtime, region,
                                          model_code_source=model_code_source)

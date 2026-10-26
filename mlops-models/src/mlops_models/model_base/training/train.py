@@ -24,13 +24,10 @@ def train_model(data_directory, selection_file, model_dir, output_directory, par
     parameters["model_id"] = parameter_path.parent.name
     # Keep metadata loading here, before the model's own training implementation.
     config = training_metadata(parameter_path)
-    mode = os.getenv("MLOPS_TRAINING_MODE")
-    if mode is not None:
-        choices = {"Preliminary models with validation": "1", "Final model with all data": "2"}
-        if mode not in choices:
-            raise ValueError(f"Unknown TrainingMode: {mode!r}. Choose one of {list(choices)}.")
-        parameters["user_final_model"] = choices[mode]
-        print(f"TrainingMode: {mode}; user_final_model={parameters['user_final_model']}", flush=True)
+    mode = os.getenv("MLOPS_TRAINING_MODE", "1")
+    if mode not in {"1", "2"}:
+        raise ValueError(f"Unknown TrainingMode code: {mode!r}. Expected '1' or '2'.")
+    print(f"Training mode: {mode}", flush=True)
     if hyperparameters:
         parameters = resolve_trial_parameters(parameters, hyperparameters)
     output = Path(output_directory)
@@ -111,7 +108,7 @@ class ModelTraining:
     def train_model(self, checkpoint_path, output):
         """Demo fit; replace this method with the model's training implementation."""
         parameters = self.parameters
-        final_model = str(parameters.get("user_final_model", "1")) == "2"
+        final_model = os.getenv("MLOPS_TRAINING_MODE", "1") == "2"
         df = pd.concat([pd.read_csv(path, dtype={parameters["primary_key"]: str},
                                     keep_default_na=False, na_values=["", r"\N"])
                         for path in sorted(self.data_path.glob("*.csv"))], ignore_index=True)
@@ -164,8 +161,7 @@ class ModelTraining:
         metadata = {"selected_model": predictor.model_best, "rows": {"input": len(df)},
                     "feature_mapping": {name: name for name in selected},
                     "predictor_path": "predictor",
-                    "evaluation": {"usage": "prepared_input_smoke_check"},
-                    "user_final_model": "2" if final_model else "1"}
+                    "evaluation": {"usage": "prepared_input_smoke_check"}}
         if os.getenv("TUNING_OBJECTIVE"):
             score = predictor.leaderboard().set_index("model").loc[validation_model, "score_val"]
             value = float(predictor.eval_metric.convert_score_to_original(score))

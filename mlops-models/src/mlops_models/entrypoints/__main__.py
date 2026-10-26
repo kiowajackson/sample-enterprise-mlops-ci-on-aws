@@ -87,6 +87,13 @@ def dispatch_pipeline_step(args):
         from . import preprocess_training
         return preprocess_training.execute(args.model, args.input, args.selection, args.output)
     if args.step == "train":
+        # Keep the readable pipeline selection separate from the model's mode code.
+        selection = os.getenv("MLOPS_TRAINING_SELECTION", os.getenv("MLOPS_TRAINING_MODE", "1"))
+        mode = {"Preliminary models with validation": "1",
+                "Final model with all data": "2"}.get(selection, selection)
+        if mode not in {"1", "2"}:
+            raise ValueError(f"Unknown TrainingMode: {selection!r}.")
+        os.environ["MLOPS_TRAINING_MODE"] = mode
         from . import train
         hyperparameters = None
         if os.getenv("TUNING_OBJECTIVE"):

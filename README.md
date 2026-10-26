@@ -70,13 +70,15 @@ batch does not require another training run.
 
 | TrainingMode | ModelMetadataUri | Trainer input |
 | --- | --- | --- |
-| `Preliminary models with validation` (default) | `none` (default) | `user_final_model="1"`, `config={}` |
-| `Preliminary models with validation` | `s3://bucket/path/model_metadata.json` | `user_final_model="1"`, supplied JSON as `config` |
-| `Final model with all data` | `none` | `user_final_model="2"`, `config={}` |
-| `Final model with all data` | `s3://bucket/path/model_metadata.json` | `user_final_model="2"`, supplied JSON as `config` |
+| `Preliminary models with validation` (default) | `none` (default) | `MLOPS_TRAINING_MODE="1"`, `config={}` |
+| `Preliminary models with validation` | `s3://bucket/path/model_metadata.json` | `MLOPS_TRAINING_MODE="1"`, supplied JSON as `config` |
+| `Final model with all data` | `none` | `MLOPS_TRAINING_MODE="2"`, `config={}` |
+| `Final model with all data` | `s3://bucket/path/model_metadata.json` | `MLOPS_TRAINING_MODE="2"`, supplied JSON as `config` |
 
-The shared trainer passes the string-valued `user_final_model` in its parameters
-dictionary to the model's training class. The demo's preliminary mode fits with
+The entrypoint converts the readable selection before calling model code.
+Inside the trainer, `mode = os.getenv("MLOPS_TRAINING_MODE", "1")` returns `"1"`
+or `"2"`. Mode stays separate from the parameters and hyperparameters dictionaries.
+The demo's preliminary mode fits with
 validation; final mode refits the selected model on all training and validation
 rows. Custom trainers own their implementation of those two choices and their
 interpretation of supplied metadata. Metadata remains optional in both modes.
