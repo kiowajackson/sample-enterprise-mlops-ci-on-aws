@@ -298,9 +298,31 @@ compatible clients, connectivity and caller permissions are ready. With tracking
 off, the jobs make no MLflow connection. The pipeline graph is the same with tracking on or off. Existing
 published pipelines retain their own configuration until deliberately republished.
 
-For an MLflow App, use the [App integration guide](docs/integration/mlflow-app.md):
-it maps the App API, UI and S3 permissions to the actual callers and explains
-how to publish and verify the binding using the existing notebook.
+To use an existing MLflow Tracking Server or App, set just this field in your
+existing `notebooks/config.json` (keep its other values):
+
+```json
+{"tracking_uri": "arn:aws:sagemaker:REGION:ACCOUNT:mlflow-tracking-server/NAME"}
+```
+
+An App ARN uses `mlflow-app/NAME` instead. Notebook 02 derives experiment names
+from the existing namespace and obtains artifact locations from the service.
+For a Tracking Server, it describes the server in the ARN's Region and checks
+its version against AWS's documented client versions. For either service, it
+writes and downloads a tiny artifact and verifies a parameter, metric and
+finished `connection-check` run in each model experiment before publication.
+The labelled checks remain visible, and `publication.json` records their IDs.
+An empty `tracking_uri` skips all MLflow checks and connections.
+
+Notebook and model image clients must match the checked version. A mismatch
+stops with the required `mlflow-skinny` version; this does not install packages
+or change a running image. The current requirements/lock target client 3.10.1
+for the tested App; a Tracking Server may require a different client and a
+rebuilt approved image. Published jobs check their actual client version before
+logging. Notebook success does not prove job-role, network or UI access.
+
+Use the [managed MLflow integration guide](docs/integration/mlflow-app.md) for
+version requirements, caller permissions and activation with notebook 02.
 
 The [logging and monitoring guide](docs/integration/observability.md) explains the
 run ID, finalization call and report locations. The image build uses the root

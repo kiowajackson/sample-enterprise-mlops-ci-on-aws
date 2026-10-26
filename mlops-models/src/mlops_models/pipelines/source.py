@@ -628,6 +628,7 @@ def configure_tracking(definitions, tracking, namespace, job_role, image, source
             # execution ID at runtime, so tracking does not invalidate step caching.
             step["Arguments"].setdefault("Environment", {}).update({
                 "MLOPS_TRACKING_URI": tracking["uri"],
+                "MLOPS_TRACKING_CLIENT_VERSION": tracking.get("client_version", ""),
                 "MLOPS_TRACKING_EXPERIMENT_PREFIX": tracking["experiment_prefix"],
                 "MLOPS_TRACKING_S3_ROOT": s3_root,
                 "MLOPS_TRACKING_ENVIRONMENT": environment,
@@ -638,6 +639,7 @@ def configure_tracking(definitions, tracking, namespace, job_role, image, source
             })
         body["Metadata"]["Tracking"] = json.dumps({
             "uri": tracking["uri"], "experiment_prefix": tracking["experiment_prefix"],
+            "client_version": tracking.get("client_version", ""),
             "logging": "direct from model jobs", "final_status_owner": "EventBridge completion Lambda",
         }, sort_keys=True)
 
