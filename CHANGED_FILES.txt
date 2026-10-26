@@ -1,96 +1,42 @@
-Cumulative copy-over review — October 26, 2026
+MLflow tracking update — October 26, 2026
 
-This review includes all changes since source baseline
-2fd289927b7a1f34b3f0f1999bd9c23932175f88. The preceding routing and optional-metadata
-work, execution-input changes and MLflow activation are presented together for confirmation.
+This review contains only the tracking update. The earlier training, inference,
+routing and execution-input changes have been implemented and are excluded.
+These are complete changed files to apply to the existing application.
 
-This branch contains complete changed files, not a standalone application.
-Merge the changes into the receiving checkout while preserving custom model
-implementations, configuration and files not listed here. The included tests
-belong in the full development checkout, which supplies their other dependencies.
-
-MLFLOW ACTIVATION INCREMENT (6 FILES)
+IMPLEMENTATION FILES (3)
 mlops-models/src/mlops_models/pipelines/tracking.py
 mlops-models/src/mlops_models/pipelines/source.py
 notebooks/02_deploy_pipelines.ipynb
+
+GUIDE, TEST AND CHECKLIST (3)
 README.md
 tests/test_execution_tracking.py
 CHANGED_FILES.txt
 
-Set only tracking_uri in the existing notebooks/config.json to the Tracking
-Server or App ARN. Keep all existing inputs. No new config keys are needed.
-Notebook 02 checks the Tracking Server/client version, then writes and reads a
-small labelled connection-check run and artifact in each model experiment.
-The published jobs require the checked client version. The notebook does not
-install packages or rebuild images. If the version differs, update the notebook
-and approved model image through the existing dependency/build process first.
-The current requirements/lock remain pinned to the tested App client 3.10.1.
-Actual BMO notebook/job/UI permissions and connectivity remain to be verified.
+CONFIGURATION
+Set tracking_uri in the existing notebooks/config.json to the approved MLflow
+Tracking Server or App ARN. Keep the other config values. No new keys are needed.
+An empty tracking_uri disables tracking.
 
-WHAT TO REVIEW
-- Shared inference preprocessing/postprocessing routing with use-case overrides.
-- Optional initial training metadata and the matching training call signatures.
-- Registered-model parameters for postprocessing.
-- Development Processing inference using the selected pipeline source.
-- TrainingMode readable choices mapped to MLOPS_TRAINING_MODE strings "1" and "2".
-- Optional ModelMetadataUri inputs for training and inference.
-- MLflow activation through one existing tracking_uri input and automatic preflight.
+Notebook 02 checks Tracking Server/client compatibility and verifies a small
+labelled connection-check run, parameter, metric and artifact upload/download in
+each model experiment. The published jobs require the checked client version.
+Experiment names and artifact locations are derived without extra user inputs.
 
-OPEN REVIEW ISSUE
-The current metadata-input implementation adds read_model_metadata and
-training_metadata to storage.py. Moving that I/O back into the responsible
-step files remains an open review issue. This cumulative publication preserves
-the current implementation; it does not claim that issue is fixed or accepted.
-
-RUNTIME FILES (18)
-mlops-models/src/mlops_models/entrypoints/__main__.py
-mlops-models/src/mlops_models/entrypoints/postprocess.py
-mlops-models/src/mlops_models/entrypoints/preprocess_inference.py
-mlops-models/src/mlops_models/entrypoints/preprocess_training.py
-mlops-models/src/mlops_models/entrypoints/train.py
-mlops-models/src/mlops_models/model_base/inference/postprocess.py
-mlops-models/src/mlops_models/model_base/inference/preprocess.py
-mlops-models/src/mlops_models/model_base/training/train.py
-mlops-models/src/mlops_models/models/usecase1/inference/postprocess.py
-mlops-models/src/mlops_models/models/usecase1/inference/preprocess.py
-mlops-models/src/mlops_models/models/usecase1/training/train.py
-mlops-models/src/mlops_models/models/usecase2/inference/postprocess.py
-mlops-models/src/mlops_models/models/usecase2/inference/preprocess.py
-mlops-models/src/mlops_models/models/usecase2/training/train.py
-mlops-models/src/mlops_models/pipelines/source.py
-mlops-models/src/mlops_models/pipelines/tracking.py
-mlops-models/src/mlops_models/registry/model_package.py
-mlops-models/src/mlops_models/storage.py
-
-DEPLOYMENT NOTEBOOK
-notebooks/02_deploy_pipelines.ipynb
-
-APPLICATION GUIDE
-README.md
-
-TEST FILES (8)
-tests/test_execution_inputs.py
-tests/test_execution_reports.py
-tests/test_execution_tracking.py
-tests/test_inference_stages.py
-tests/test_model_contracts.py
-tests/test_source_deployment.py
-tests/test_step_io.py
-tests/test_training_files.py
-
-REVIEW CHECKLIST
-CHANGED_FILES.txt
+The notebook does not install packages or rebuild images. If it reports a client
+version mismatch, update the notebook environment and approved model image through
+the existing dependency/build process. Requirements/lock remain at the previously
+tested App client 3.10.1. Inference also needs a compatible registered model image.
 
 VALIDATION
-The MLflow increment passed 61 focused checks with client 3.10.1 and 16 tracking
-checks with client 3.0.0. The actual notebook build cell was exercised with local
-MLflow storage in both versions, with tracking enabled and disabled. AWS calls
-were simulated and container networking was disabled. No live BMO validation
-or deployment is implied. The earlier mode-code increment's eight local demo
-fit/reload results remain separate evidence; those fits were not rerun here.
+61 focused checks passed with client 3.10.1, and 16 tracking checks passed with
+client 3.0.0. The actual notebook build cell passed with local MLflow storage in
+both versions, with tracking enabled and disabled. AWS calls were simulated and
+container networking was disabled. BMO notebook/job/UI access and connectivity
+still require verification in the receiving environment.
 
-AFTER REVIEW
-Keep custom process/prediction/training implementations when applying shared
-plumbing. To expose new execution inputs, republish the pipeline definitions
-from a fresh notebook 02 kernel and select the resulting pipeline version.
-Confirm the files integrated before treating this cumulative review as accepted.
+AFTER APPLYING
+Restart the notebook kernel and run notebook 02 to publish the updated binding.
+Existing pipeline versions retain their previous settings. The existing optional
+completion service remains responsible for final pipeline-level MLflow status.
