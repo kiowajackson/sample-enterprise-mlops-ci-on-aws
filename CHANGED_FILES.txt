@@ -1,0 +1,70 @@
+Cumulative copy-over review — October 26, 2026
+
+This review includes all changes since source baseline
+2fd289927b7a1f34b3f0f1999bd9c23932175f88. The preceding routing and optional-metadata
+work and the newer execution-input changes are presented together for confirmation.
+
+This branch contains complete changed files, not a standalone application.
+Merge the changes into the receiving checkout while preserving custom model
+implementations, configuration and files not listed here. The included tests
+belong in the full development checkout, which supplies their other dependencies.
+
+WHAT TO REVIEW
+- Shared inference preprocessing/postprocessing routing with use-case overrides.
+- Optional initial training metadata and the matching training call signatures.
+- Registered-model parameters for postprocessing.
+- Development Processing inference using the selected pipeline source.
+- TrainingMode readable choices mapped to MLOPS_TRAINING_MODE strings "1" and "2".
+- Optional ModelMetadataUri inputs for training and inference.
+
+OPEN REVIEW ISSUE
+The current metadata-input implementation adds read_model_metadata and
+training_metadata to storage.py. Moving that I/O back into the responsible
+step files remains an open review issue. This cumulative publication preserves
+the current implementation; it does not claim that issue is fixed or accepted.
+
+RUNTIME FILES (17)
+mlops-models/src/mlops_models/entrypoints/__main__.py
+mlops-models/src/mlops_models/entrypoints/postprocess.py
+mlops-models/src/mlops_models/entrypoints/preprocess_inference.py
+mlops-models/src/mlops_models/entrypoints/preprocess_training.py
+mlops-models/src/mlops_models/entrypoints/train.py
+mlops-models/src/mlops_models/model_base/inference/postprocess.py
+mlops-models/src/mlops_models/model_base/inference/preprocess.py
+mlops-models/src/mlops_models/model_base/training/train.py
+mlops-models/src/mlops_models/models/usecase1/inference/postprocess.py
+mlops-models/src/mlops_models/models/usecase1/inference/preprocess.py
+mlops-models/src/mlops_models/models/usecase1/training/train.py
+mlops-models/src/mlops_models/models/usecase2/inference/postprocess.py
+mlops-models/src/mlops_models/models/usecase2/inference/preprocess.py
+mlops-models/src/mlops_models/models/usecase2/training/train.py
+mlops-models/src/mlops_models/pipelines/source.py
+mlops-models/src/mlops_models/registry/model_package.py
+mlops-models/src/mlops_models/storage.py
+
+APPLICATION GUIDE
+README.md
+
+TEST FILES (7)
+tests/test_execution_inputs.py
+tests/test_execution_reports.py
+tests/test_inference_stages.py
+tests/test_model_contracts.py
+tests/test_source_deployment.py
+tests/test_step_io.py
+tests/test_training_files.py
+
+REVIEW CHECKLIST
+CHANGED_FILES.txt
+
+VALIDATION
+This publication changes review packaging only. Runtime and test bytes match
+the already reviewed working source. The preceding mode-code correction records
+61 focused checks and eight local demo fit/reload combinations passing.
+Receiving-environment integration and runtime acceptance still need confirmation.
+
+AFTER REVIEW
+Keep custom process/prediction/training implementations when applying shared
+plumbing. To expose new execution inputs, republish the pipeline definitions
+from a fresh notebook 02 kernel and select the resulting pipeline version.
+Confirm the files integrated before treating this cumulative review as accepted.
