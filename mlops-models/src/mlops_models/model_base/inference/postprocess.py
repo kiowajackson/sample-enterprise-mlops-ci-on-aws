@@ -15,18 +15,20 @@ parameters = {}
 
 
 def postprocess_predictions(data_directory, selection_file, prediction_directory, output_directory,
-                            model_directory, *, analysis_mode="prediction_inference", chunk_rows=10000):
+                            model_directory, *, analysis_mode="prediction_inference", chunk_rows=10000,
+                            inference_fn=None, test_fn=None):
     """Read inputs, initialize parameters, run the chosen analysis, and write outputs."""
-    if analysis_mode not in {"prediction_inference", "prediction_test"}:
+    if analysis_mode == "prediction_inference":
+        analyze = prediction_inference if inference_fn is None else inference_fn
+    elif analysis_mode == "prediction_test":
+        analyze = prediction_test if test_fn is None else test_fn
+    else:
         raise ValueError("analysis_mode must be prediction_inference or prediction_test.")
     with TemporaryDirectory(prefix="postprocess-inputs-") as converted_directory:
         data_path, selection_path, predictions, output, _ = get_container_input(
             data_directory, selection_file, prediction_directory, output_directory, model_directory,
             converted_directory=converted_directory, chunk_rows=chunk_rows)
-        if analysis_mode == "prediction_inference":
-            prediction_inference(data_path, selection_path, predictions, output)
-        else:
-            prediction_test(data_path, selection_path, predictions, output)
+        analyze(data_path, selection_path, predictions, output)
         return write_container_output(
             output, data_path=data_path, selection_file=selection_path,
             predictions=predictions, parameters=parameters)

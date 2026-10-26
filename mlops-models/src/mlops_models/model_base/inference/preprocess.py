@@ -7,14 +7,16 @@ import pandas as pd
 
 
 def preprocess_data(data_directory, selection_file, output_directory, config, parameter_path,
-                    *, analysis_mode="prediction_inference"):
-    """Route the requested mode to this model's preprocessing implementation."""
+                    *, analysis_mode="prediction_inference", inference_fn=None, test_fn=None):
+    """Route the requested mode, using supplied model functions or the base defaults."""
     print(f"Preprocess: {analysis_mode}", flush=True)
     if analysis_mode == "prediction_inference":
-        return process_inference(data_directory, selection_file, output_directory, config, parameter_path)
-    if analysis_mode == "prediction_test":
-        return process_test(data_directory, selection_file, output_directory, config, parameter_path)
-    raise ValueError("analysis_mode must be prediction_inference or prediction_test.")
+        process = process_inference if inference_fn is None else inference_fn
+    elif analysis_mode == "prediction_test":
+        process = process_test if test_fn is None else test_fn
+    else:
+        raise ValueError("analysis_mode must be prediction_inference or prediction_test.")
+    return process(data_directory, selection_file, output_directory, config, parameter_path)
 
 
 def process_inference(data_directory, selection_file, output_directory, config, parameter_path):

@@ -1,28 +1,20 @@
-"""Resolve inputs, run this use case's analysis, and write its outputs."""
+"""Use shared input/output and routing with this use case's replaceable analysis."""
 
-from tempfile import TemporaryDirectory
-
-from mlops_models.model_base.inference.postprocess import get_container_input, write_container_output, parameters
+from mlops_models.model_base.inference.postprocess import (
+    postprocess_predictions as base_postprocess_predictions, parameters,
+)
 from mlops_models.model_base.inference.postprocess import prediction_inference as example_inference
 from mlops_models.model_base.inference.postprocess import prediction_test as example_test
 
 
 def postprocess_predictions(data_directory, selection_file, prediction_directory, output_directory,
                             model_directory, *, analysis_mode="prediction_inference", chunk_rows=10000):
-    """Read inputs, initialize parameters, run the chosen analysis, and write outputs."""
-    if analysis_mode not in {"prediction_inference", "prediction_test"}:
-        raise ValueError("analysis_mode must be prediction_inference or prediction_test.")
-    with TemporaryDirectory(prefix="postprocess-inputs-") as converted_directory:
-        data_path, selection_path, predictions, output, _ = get_container_input(
-            data_directory, selection_file, prediction_directory, output_directory, model_directory,
-            converted_directory=converted_directory, chunk_rows=chunk_rows)
-        if analysis_mode == "prediction_inference":
-            prediction_inference(data_path, selection_path, predictions, output)
-        else:
-            prediction_test(data_path, selection_path, predictions, output)
-        return write_container_output(
-            output, data_path=data_path, selection_file=selection_path,
-            predictions=predictions, parameters=parameters)
+    """Delegate shared behavior to the base with this use case's analysis functions."""
+    return base_postprocess_predictions(
+        data_directory, selection_file, prediction_directory, output_directory, model_directory,
+        analysis_mode=analysis_mode, chunk_rows=chunk_rows,
+        inference_fn=prediction_inference, test_fn=prediction_test,
+    )
 
 
 def prediction_inference(data_path, selection_file, predictions, output_directory):
