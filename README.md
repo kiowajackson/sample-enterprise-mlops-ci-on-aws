@@ -19,6 +19,22 @@ activation. The [remaining integration plan](docs/integration/README.md) covers
 service setup, tracking completion, Evidently reports, alerts and the wider
 platform work.
 
+Set `tracking_uri` in `notebooks/config.json` to the existing SageMaker MLflow
+tracking-server or App ARN. Notebook 02 prints each connection-check stage and
+stops its worker after 120 seconds. This check creates small retained
+`connection-check` runs and verifies metadata, dataset references and artifact
+write/read access; it does not create a server or register models in MLflow.
+Use the last printed stage and error to distinguish the SageMaker server lookup,
+MLflow API access and artifact-store access. An interrupted check can leave its
+printed test run in RUNNING state.
+
+After publishing with tracking enabled, executing jobs log metrics and reports
+to MLflow using their own roles and image-supplied clients. SageMaker Model
+Registry still owns model versions and approval. The optional completion service
+finalizes the shared MLflow run status; without it a run can remain RUNNING after
+the pipeline ends. Notebook-only access checks do not prove job-role connectivity.
+
+
 | I want to… | Start here |
 | --- | --- |
 | Inspect or run the existing deployment | [Use the existing pipelines](#use-the-existing-pipelines) |

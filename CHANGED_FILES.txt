@@ -1,9 +1,18 @@
-Development inference code choice and metadata verification — October 27, 2026
+Development inference and bounded MLflow connection check — October 27, 2026
 
 The preceding cache-source update is implemented. This review contains only
-this new inference increment.
+this inference increment and the MLflow notebook check update.
 
-IMPLEMENTATION FILES (4)
+LATEST UPDATE
+The new MLflow changes are pipelines/tracking.py, notebook 02, the two tracking/
+completion tests, README and this checklist. The preceding inference changes
+and the two scratch diagnostics are retained for review.
+
+IMPLEMENTATION FILES (5)
+mlops-models/src/mlops_models/pipelines/tracking.py
+  Print each notebook check stage. Run the check in a separate process with
+  a 120-second total limit and bounded HTTP retries. Stop a stalled worker.
+  Keep the existing job logging behavior and installed dependency versions.
 mlops-models/src/mlops_models/pipelines/source.py
   Expose ModelCodeSource (artifact/pipeline) for each Development Processing
   execution. Keep a published development loader and pass the selected package,
@@ -19,8 +28,9 @@ mlops-models/src/mlops_models/registry/model_package.py
 notebooks/02_deploy_pipelines.ipynb
   Default ModelCodeSource to artifact and explain the per-execution pipeline
   override for testing published edits without retraining.
+  Use the bounded MLflow notebook check and explain its test runs and purpose.
 
-SUPPORTING FILES (10)
+SUPPORTING FILES (12)
 mlops-models/scratch/inspect_booster.py
   Paste before trained_model.save_config() in the same process and scope.
   Print the actual model class, library version/location and method support.
@@ -31,6 +41,8 @@ mlops-models/scratch/compare_metadata.py
   receiving notebook. It saves local comparison files without changing AWS.
 README.md
 CHANGED_FILES.txt
+tests/test_execution_tracking.py
+tests/test_automatic_completion.py
 tests/test_source_deployment.py
 tests/test_pipeline_cache.py
 tests/test_development_registry.py
@@ -39,6 +51,13 @@ tests/test_notebook_config.py
 tests/test_inference_code_choice.py
 
 APPLYING
+For the MLflow check update, replace pipelines/tracking.py and notebook 02.
+Keep the existing image and its dependencies. Set tracking_uri in config.json
+to the supplied tracking-server/App ARN, restart the kernel and rerun notebook 02.
+Progress identifies server lookup, client initialization, MLflow API or artifact
+access. Failure stops publication; it does not silently disable tracking.
+
+For the preceding inference update:
 Replace the four implementation files. Restart the notebook kernel and rerun
 notebook 02 to publish the new inference parameter. Start the resulting pipeline
 version with ModelCodeSource=pipeline and ModelMetadataUri=registry. Use an
@@ -60,3 +79,11 @@ module is imported. Prediction edits select new Score source while preserving
 unaffected inference cache keys. CI and native Transform keep archived code.
 The actual notebook build/upload/publication cells are also checked against
 simulated AWS. No receiving-environment pipeline execution is claimed.
+
+MLFLOW CHECK VALIDATION
+The original and updated checks both completed with a real MLflow 3.16.1 HTTP
+client and local 3.0.0 server, including runs, metrics, parameters, dataset
+references and artifact upload/download. A deliberately stalled HTTP endpoint
+was stopped at the configured deadline and reported the last operation. AWS
+server description was simulated; BMO connectivity and permissions are unverified.
+The completion test setup now includes the existing notebook cache bindings.
