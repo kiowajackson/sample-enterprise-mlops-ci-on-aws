@@ -20,7 +20,12 @@ notebooks/02_deploy_pipelines.ipynb
   Default ModelCodeSource to artifact and explain the per-execution pipeline
   override for testing published edits without retraining.
 
-SUPPORTING FILES (8)
+SUPPORTING FILES (9)
+mlops-models/scratch/compare_metadata.py
+  Optional read-only notebook cell: compare the Registry metadata report,
+  registered model archive and the Score job's actual model archive.
+  Set SCORE_JOB_NAME and MODEL_PACKAGE_ARN; run the whole cell in the
+  receiving notebook. It saves local comparison files without changing AWS.
 README.md
 CHANGED_FILES.txt
 tests/test_source_deployment.py
