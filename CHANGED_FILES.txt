@@ -1,23 +1,47 @@
-Registry script import fix — October 27, 2026
+Pipeline cache source-binding fix — October 27, 2026
 
-The earlier tracking updates are implemented. This review contains only the
-registration import correction and its regression check.
+The registry import correction is already implemented. This review contains only
+the correction that preserves compute caching across unrelated source edits.
 
-IMPLEMENTATION FILE (1)
-mlops-models/src/mlops_models/registry/model_package.py
-  Change the storage import to its absolute mlops_models.storage path.
-  Registration runs this file directly, without a parent-package context.
-  The same import also works when inference imports it as a package module.
+IMPLEMENTATION FILES (2)
+mlops-models/src/mlops_models/pipelines/source.py
+  Bind each cached step to an immutable complete source snapshot selected by its
+  relevant code fingerprint. Keep that source URI stable across unrelated edits.
+  Include the runtime logger in fingerprints and retain inference GetData code
+  as a training dependency because trained artifacts save inference source.
+notebooks/02_deploy_pipelines.ipynb
+  Configure the bindings, publish/read-check them after the source upload,
+  print the actual source selected per step and record it in publication.json.
 
-SUPPORTING FILES (2)
-tests/test_source_deployment.py
-  Exercise loading the registration script without a parent package in a fresh
-  Python process, from outside the checkout with the source on PYTHONPATH.
+SUPPORTING FILES (3)
+README.md
+  Explain source bindings, cache limits, retained-source access and migration.
+tests/test_pipeline_cache.py
+  Compare resolved cache inputs across registry, training, evaluation, logger
+  and commit-only changes; check immutable writes, races and broken bindings.
 CHANGED_FILES.txt
   This current-fix checklist.
 
+BEHAVIOR
+A registry-only edit retains the source URI and cache key of GetData,
+FeatureSelection, Preprocess, Train and Evaluate. Registration gets the current
+publication. Changed step code or upstream outputs still require affected work.
+Full source packages and original producer provenance are preserved.
+
 APPLYING
-Replace the one implementation file. Restart the notebook kernel and rerun
-notebook 02 to upload the corrected source and publish new pipeline versions.
-Use the new training pipeline version for the next run. No configuration,
-dependency, image or storage-helper change is required.
+Replace the two implementation files, restart the notebook kernel and rerun
+notebook 02. Keep cache_steps enabled. No new config inputs or packages are needed.
+The first publication establishes the new source bindings and cache baseline.
+Later unrelated edits can reuse successful matching steps in the same pipeline,
+within the 24-hour cache window. Changed model, data, image or job settings can
+still cause a rerun. Retain source snapshots and binding JSON objects.
+The pipeline role must be able to read binding JSON under the source prefix.
+
+VALIDATION
+85 focused checks passed. The actual notebook build, upload and publication
+cells passed three local publications: initial, registry-only edit and training
+edit. The old setup changed all five resolved training cache keys after the
+registry edit; the correction changed none of those five keys. The training
+edit changed Train's own key, and a new model output invalidated Evaluate.
+AWS APIs were simulated and networking disabled. Native cache hits and IAM
+access remain to be confirmed in the receiving environment.
