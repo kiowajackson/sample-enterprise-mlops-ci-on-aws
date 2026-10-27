@@ -20,7 +20,10 @@ notebooks/02_deploy_pipelines.ipynb
   Default ModelCodeSource to artifact and explain the per-execution pipeline
   override for testing published edits without retraining.
 
-SUPPORTING FILES (9)
+SUPPORTING FILES (10)
+mlops-models/scratch/inspect_booster.py
+  Paste before trained_model.save_config() in the same process and scope.
+  Print the actual model class, library version/location and method support.
 mlops-models/scratch/compare_metadata.py
   Optional read-only notebook cell: compare the Registry metadata report,
   registered model archive and the Score job's actual model archive.
