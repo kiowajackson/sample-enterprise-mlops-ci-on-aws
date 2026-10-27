@@ -1,41 +1,23 @@
-MLflow installed-client fix only — October 26, 2026
+Registry script import fix — October 27, 2026
 
-The earlier Tracking Server integration is already implemented. This review
-contains only the subsequent correction for platform-provided MLflow clients.
-Apply these complete replacement files to the existing application.
+The earlier tracking updates are implemented. This review contains only the
+registration import correction and its regression check.
 
-IMPLEMENTATION FILES (3)
-mlops-models/src/mlops_models/pipelines/tracking.py
-  Remove the exact client/server version rejection. Use the installed client.
-  Verify dataset references and run search as part of the existing connection
-  check, and include client/server versions in failure diagnostics.
-mlops-models/src/mlops_models/pipelines/source.py
-  Remove the required client version from job environments. Record the notebook
-  version as diagnostic metadata only.
-notebooks/02_deploy_pipelines.ipynb
-  Remove matching-version instructions; use and report the provided clients.
+IMPLEMENTATION FILE (1)
+mlops-models/src/mlops_models/registry/model_package.py
+  Change the storage import to its absolute mlops_models.storage path.
+  Registration runs this file directly, without a parent-package context.
+  The same import also works when inference imports it as a package module.
 
-SUPPORTING FILES (3)
-README.md
-  Describe the installed-client behavior and actual-operation checks.
-tests/test_execution_tracking.py
-  Cover differing versions, dataset failures and removal of the job version pin.
+SUPPORTING FILES (2)
+tests/test_source_deployment.py
+  Exercise loading the registration script without a parent package in a fresh
+  Python process, from outside the checkout with the source on PYTHONPATH.
 CHANGED_FILES.txt
-  This checklist describes only the installed-client correction.
+  This current-fix checklist.
 
-CONFIGURATION
-Keep the existing tracking_uri and other configuration values.
-No new config inputs, requirements installation, image rebuild or server change
-is part of this correction.
-
-VALIDATION
-The previously tested runtime, notebook and test contents are unchanged.
-62 focused checks passed with client 3.10.1; 17 tracking checks passed with 3.0.0.
-The actual notebook build cell passed enabled/disabled in both versions.
-A real 3.16.1 client passed tracking and artifact operations against a local
-3.0.0 HTTP server. AWS access was simulated; the receiving SageMaker gateway,
-IAM, S3 and job-image behavior still need the real connection/execution checks.
-
-AFTER APPLYING
-Restart the notebook kernel and rerun notebook 02 to publish a new pipeline
-version. Select that version for the next execution.
+APPLYING
+Replace the one implementation file. Restart the notebook kernel and rerun
+notebook 02 to upload the corrected source and publish new pipeline versions.
+Use the new training pipeline version for the next run. No configuration,
+dependency, image or storage-helper change is required.
