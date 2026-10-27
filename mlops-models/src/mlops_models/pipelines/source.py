@@ -622,7 +622,10 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                 # All Processing inference code follows the selected mode,
                 # including GetData. Fitted model files still come from Registry.
                 step["Arguments"]["Environment"]["MLOPS_MODEL_CODE_SOURCE"] = (
-                    "pipeline" if kind == "training" else model_code_source)
+                    "pipeline" if kind == "training" else
+                    {"Get": "Parameters.ModelCodeSource"} if any(
+                        parameter["Name"] == "ModelCodeSource" for parameter in body["Parameters"])
+                    else model_code_source)
         if kind == "inference":
             configure_monitoring(body, monitoring, namespace, job_role, region, environment, batch_runtime)
             body["Parameters"].append({
@@ -890,8 +893,14 @@ def configure_feature_store(body, config_uri, universe_root, region):
 
 
 def configure_approved_inference(body, group, source_uri, batch_runtime, region, *,
-                                 model_code_source="artifact"):
+                                  model_code_source="artifact"):
     """Resolve one approved package, then feed its exact image and checkpoint to all scoring steps."""
+    code_override = body["Metadata"]["DeployMode"] == "direct-deploy" and batch_runtime == "processing"
+    if code_override:
+        body["Parameters"].append({
+            "Name": "ModelCodeSource", "Type": "String",
+            "DefaultValue": model_code_source, "EnumValues": ["artifact", "pipeline"],
+        })
     steps = {step["Name"]: step for step in body["Steps"]}
     resolver = steps["ValidatePackage"]
     resolver["Name"] = "ResolveModel"
@@ -930,12 +939,20 @@ def configure_approved_inference(body, group, source_uri, batch_runtime, region,
         args = steps[name]["Arguments"]
         if steps[name]["Type"] == "Processing":
             args["AppSpecification"]["ImageUri"] = selected("image")
-            if model_code_source == "artifact":
+            args.setdefault("Environment", {}).update(
+                MLOPS_MODEL_PACKAGE=selected("package"),
+                MLOPS_MODEL_ARTIFACT_URI=selected("checkpoint"),
+                MLOPS_MODEL_METADATA_URI=selected("model_metadata"),
+                MLOPS_MODEL_METADATA_SHA256=selected("model_metadata_sha256"))
+            if model_code_source == "artifact" and not code_override:
                 # Use the saved release even for the loader and reporting code.
                 # The Registry resolver itself remains current deployment policy.
                 for item in args["ProcessingInputs"]:
                     if item["InputName"] == "source":
                         item["S3Input"]["S3Uri"] = selected("source_uri")
+            # Development keeps a source-delivered loader so the execution can
+            # choose either archived model code or that step's published code.
+            # CI and native Transform keep their fixed registered-code route.
     steps["CreateModel"]["Arguments"]["PrimaryContainer"]["Environment"].update(
         PYTHONPATH="/opt/ml/model/code", PYTHONSAFEPATH="1")
     if batch_runtime == "transform":

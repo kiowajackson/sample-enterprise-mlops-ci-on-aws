@@ -71,10 +71,10 @@ class PipelineCache(unittest.TestCase):
                 # Registry JsonGet expressions contain the current decision
                 # file URI, but resolve to the selected image/checkpoint value.
                 self.assertNotIn("PIPELINE_EXECUTION_ID", environment)
-                self.assertEqual(environment["MLOPS_MODEL_CODE_SOURCE"], code)
+                self.assertEqual(environment["MLOPS_MODEL_CODE_SOURCE"], {"Get": "Parameters.ModelCodeSource"})
             self.assertNotIn("CacheConfig", steps["ResolveModel"])
             self.assertNotIn("CacheConfig", steps["Postprocess"])
-            self.assertEqual(steps["Postprocess"]["Arguments"]["Environment"]["MLOPS_MODEL_CODE_SOURCE"], code)
+            self.assertEqual(steps["Postprocess"]["Arguments"]["Environment"]["MLOPS_MODEL_CODE_SOURCE"], {"Get": "Parameters.ModelCodeSource"})
 
     def test_evaluation_edits_preserve_training_and_postprocess_edits_preserve_scoring(self):
         with TemporaryDirectory() as work:
@@ -366,10 +366,12 @@ class CachedSourceBindings(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing or has an inconsistent"):
             self.publish()
 
-    def test_disabled_cache_and_archived_inference_keep_existing_source_selection(self):
+    def test_development_loader_gets_cache_binding_even_with_artifact_default(self):
         from copy import deepcopy
         first = self.publish(model_code_source="artifact")
-        self.assertEqual(first["definitions"]["inference"], first["original"]["inference"])
+        self.assertNotEqual(first["definitions"]["inference"], first["original"]["inference"])
+        self.assertEqual(next(p for p in first["definitions"]["inference"]["Parameters"]
+                              if p["Name"] == "ModelCodeSource")["DefaultValue"], "artifact")
         disabled = deepcopy(first["original"])
         for body in disabled.values():
             for step in walk_steps(body["Steps"]):
@@ -380,6 +382,32 @@ class CachedSourceBindings(unittest.TestCase):
         self.session.reset_mock()
         self.assertEqual(source.publish_cache_sources(self.session, self.s3_root, first["uri"], []), [])
         self.session.client.assert_not_called()
+
+    def test_execution_code_choice_changes_inference_keys_without_changing_the_model(self):
+        from copy import deepcopy
+        first = self.publish(model_code_source="artifact")
+        body = deepcopy(first["definitions"]["inference"])
+        before = self.cache_keys(body)
+        next(p for p in body["Parameters"] if p["Name"] == "ModelCodeSource")["DefaultValue"] = "pipeline"
+        after = self.cache_keys(body)
+        self.assertEqual(set(before), {"GetData", "Preprocess", "Score"})
+        for name in before:
+            self.assertNotEqual(before[name]["Environment"], after[name]["Environment"])
+            self.assertEqual(before[name]["ProcessingInputs"], after[name]["ProcessingInputs"])
+
+    def test_predict_edits_refresh_score_source_without_retraining(self):
+        for relative in ("entrypoints/predict.py", "model_base/inference/predict.py",
+                         "models/usecase1/inference/predict.py"):
+            with self.subTest(relative=relative):
+                first = self.publish(model_code_source="pipeline")
+                self.edit(relative)
+                second = self.publish(model_code_source="pipeline")
+                before = self.cache_keys(first["definitions"]["inference"])
+                after = self.cache_keys(second["definitions"]["inference"])
+                self.assertEqual({name for name in before if before[name] != after[name]}, {"Score"})
+                selected = next(item for item in second["published"]
+                                if item["kind"] == "inference" and item["step"] == "Score")
+                self.assertEqual(selected["source_uri"], second["uri"])
 
 
 if __name__ == "__main__":

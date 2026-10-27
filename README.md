@@ -62,6 +62,9 @@ batch does not require another training run.
    versions are excluded. Leave `ModelMetadataUri=registry` to use that model's
    metadata, or supply an S3 JSON URI to override metadata for this execution. Scoring
    inputs need model features and identifiers; a target is not required.
+   For Development Processing, select `ModelCodeSource=pipeline` to test newly
+   published inference code against that approved model without retraining.
+   The notebook's default, `artifact`, runs the model's saved code.
 4. **Inspect results.** Open the producing Postprocess job's S3 output. Check the
    final analysis, row identifiers/counts and expected result columns. Retain
    the execution ARN, model-package ARN and output URI with the test result.
@@ -92,6 +95,30 @@ its output prefix, changing only `model_metadata.json`; it leaves the Registry
 version and original artifact unchanged. `package.json` records the original
 artifact, override URI and checksum. The override must match the fitted model's
 features and preprocessing. This works with Processing and native Transform.
+
+The prediction entrypoint reads `model_metadata.json` from the local directory
+where the selected **S3 model archive was unpacked**. It is not a lookup in the
+notebook working directory. Evaluation's metadata report is a byte-for-byte copy
+of that file. Processing passes the selected metadata checksum to the loader,
+which compares it before importing model code. A mismatch fails with the archive
+URI, metadata URI and both checksums. Older packages without a recorded checksum
+are explicitly reported as unverified.
+
+Development Processing has two independent choices:
+
+| Execution input | Meaning |
+| --- | --- |
+| `ModelCodeSource=artifact` | Use code saved inside the approved model archive. Default in notebook 02. |
+| `ModelCodeSource=pipeline` | Use the published source selected for each step. Edit, publish with notebook 02, then run inference; no training required. |
+| `ModelMetadataUri=registry` | Use the selected model's metadata. |
+| `ModelMetadataUri=s3://.../model_metadata.json` | Replace only metadata for this execution; it must remain compatible with the selected fitted model. |
+
+`pipeline` means the source uploaded from the notebook's checkout; a managed job
+cannot read files directly from your notebook filesystem. Publish after editing,
+then select the new pipeline version and `ModelCodeSource=pipeline`. For a
+controlled comparison, keep the same explicit `ModelPackageArn`. The execution
+choice is available only for Development Processing. CI and native Transform
+continue to use registered model code.
 
 Use a complete S3 object URI, not a local filename or folder. The job role needs
 read access to the object and its encryption key, and the container needs S3
@@ -246,12 +273,25 @@ model versions remain in the existing shared Registry group.
 
 Training retains the source snapshot, including uncommitted model code and the
 existing metadata input. The registered version links its source URI/digest,
-commit, image digest and trained artifacts. All Processing inference steps,
-including GetData, Postprocess and optional DriftComparison, use that model's saved release. Train and
-approve a new version to test changed inference code. Retain its S3 source/model
-objects and ECR image for replay; code pinning does not make randomized training
-deterministic. Older versions without namespace and source metadata stay untouched
-and require new training before these new pipelines can select them.
+commit, image digest and trained artifacts. Development Processing uses a
+published loader that applies the execution's `ModelCodeSource` choice to GetData,
+Preprocess, Score, Postprocess and optional DriftComparison. This also lets the
+current loader report and check an older model's metadata. CI keeps the loader
+and model code bound to the registered release.
+
+Source snapshots are published before execution and can serve several runs, so
+they remain under `source/` rather than being copied into each run folder.
+`source_loaded` logs the actual source identity, execution ID, model package and
+metadata binding. Successful jobs save the same bindings in their run output's
+`_execution.json`; cached outputs keep the original producer's identity.
+`SourceDigest` identifies the registered source snapshot, while
+`ModelMetadataSha256` identifies the metadata file. Compare each digest with its
+own referenced object, not with a different publication's digest.
+
+Retain the S3 source/model objects and ECR image for replay; code pinning does not
+make randomized training deterministic. Older versions without namespace and
+source metadata stay untouched and require new training before these new
+pipelines can select them.
 
 | Deployment route | Registration stage | Current scope |
 | --- | --- | --- |
