@@ -4,9 +4,10 @@ The preceding cache-source update is implemented. This review contains the
 inference increment, MLflow notebook check update and scratch inspection cells.
 
 LATEST UPDATE
-Added scratch/inspect_model_package.py: set MODEL_PACKAGE_ARN and run the whole
-cell in the notebook to print readiness, approvals and recorded model scope.
-It only describes the selected package; it does not modify AWS or start jobs.
+Updated scratch/inspect_model_package.py: set RESOLVE_JOB (the failed Processing
+job name or ARN) and MODEL_PACKAGE_ARN. The cell reads the expected values from
+that job and prints PASS/FAIL, actual and expected for all eight eligibility
+checks. It names the failing fields first. It does not modify AWS or start jobs.
 
 PRECEDING MLFLOW UPDATE
 The new MLflow changes are pipelines/tracking.py, notebook 02, the two tracking/
@@ -37,8 +38,10 @@ notebooks/02_deploy_pipelines.ipynb
 
 SUPPORTING FILES (13)
 mlops-models/scratch/inspect_model_package.py
-  Read-only Registry inspection using the notebook credentials and ARN region.
-  Print package/group, creation status, model approval, lifecycle and scope.
+  Read-only status cell using the notebook credentials and ARN region.
+  Read expected scope from the failed ResolveModel job, including --model
+  overrides. Evaluate all eight checks independently; show missing fields,
+  exact case/whitespace differences and both values for every check.
 mlops-models/scratch/inspect_booster.py
   Paste before trained_model.save_config() in the same process and scope.
   Print the actual model class, library version/location and method support.
@@ -95,3 +98,8 @@ references and artifact upload/download. A deliberately stalled HTTP endpoint
 was stopped at the configured deadline and reported the last operation. AWS
 server description was simulated; BMO connectivity and permissions are unverified.
 The completion test setup now includes the existing notebook cache bindings.
+
+REGISTRY STATUS CELL VALIDATION
+21 simulated cases passed against the current application eligibility predicate,
+including each mismatched/missing field, CLI model override and absent job scope.
+No BMO API call or pipeline execution was performed.
