@@ -1,8 +1,0 @@
-{
-  "namespace": "enterprise-ci",
-  "region": "us-east-1",
-  "record_id": "customer_id",
-  "prefix": "mlops/enterprise-ci",
-  "event_time": "feature_asof_dt",
-  "mapping_csv": "mlops-features/feature-mapping.csv"
-}
