@@ -1,9 +1,14 @@
-Development inference and bounded MLflow connection check — October 27, 2026
+Development inference, MLflow check and Registry inspection — October 28, 2026
 
-The preceding cache-source update is implemented. This review contains only
-this inference increment and the MLflow notebook check update.
+The preceding cache-source update is implemented. This review contains the
+inference increment, MLflow notebook check update and scratch inspection cells.
 
 LATEST UPDATE
+Added scratch/inspect_model_package.py: set MODEL_PACKAGE_ARN and run the whole
+cell in the notebook to print readiness, approvals and recorded model scope.
+It only describes the selected package; it does not modify AWS or start jobs.
+
+PRECEDING MLFLOW UPDATE
 The new MLflow changes are pipelines/tracking.py, notebook 02, the two tracking/
 completion tests, README and this checklist. The preceding inference changes
 and the two scratch diagnostics are retained for review.
@@ -30,7 +35,10 @@ notebooks/02_deploy_pipelines.ipynb
   override for testing published edits without retraining.
   Use the bounded MLflow notebook check and explain its test runs and purpose.
 
-SUPPORTING FILES (12)
+SUPPORTING FILES (13)
+mlops-models/scratch/inspect_model_package.py
+  Read-only Registry inspection using the notebook credentials and ARN region.
+  Print package/group, creation status, model approval, lifecycle and scope.
 mlops-models/scratch/inspect_booster.py
   Paste before trained_model.save_config() in the same process and scope.
   Print the actual model class, library version/location and method support.
