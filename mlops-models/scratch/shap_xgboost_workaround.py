@@ -1,6 +1,7 @@
 # TEMPORARY workaround for SHAP 0.49.1 with XGBoost's vector base_score format.
 # Paste this entire block immediately before the existing TreeExplainer call.
 # Keep the existing TreeExplainer and shap_values calls below it.
+# Only an actual XGBoost Booster activates this fix; other models are skipped.
 #
 # This changes SHAP's in-memory decoder only. It does not change the Booster,
 # model files, installed packages, or input data. No root access is needed.
@@ -8,7 +9,12 @@
 # Remove this block once the platform supplies a compatible, tested image.
 # Upstream fix: https://github.com/shap/shap/pull/4187 (released in 0.50.0).
 
-def enable_shap_xgboost_scalar_base_score_workaround():
+def enable_shap_xgboost_scalar_base_score_workaround(model):
+    from xgboost import Booster
+
+    if not isinstance(model, Booster):
+        return
+
     import json
     import math
     from importlib.metadata import version
@@ -63,4 +69,4 @@ def enable_shap_xgboost_scalar_base_score_workaround():
     print("Enabled temporary SHAP 0.49.1/XGBoost scalar-intercept workaround.", flush=True)
 
 
-enable_shap_xgboost_scalar_base_score_workaround()
+enable_shap_xgboost_scalar_base_score_workaround(trained_model)
