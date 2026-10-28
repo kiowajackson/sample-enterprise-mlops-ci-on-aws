@@ -11,6 +11,8 @@ from unittest.mock import Mock, patch
 import unittest
 import zipfile
 
+from botocore.exceptions import ClientError
+
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from operations.completion import handler as completion
 from operations.completion.deploy import deploy_completion
@@ -107,6 +109,54 @@ class AutomaticCompletion(unittest.TestCase):
 
 
 class CompletionDeployment(unittest.TestCase):
+    def test_nested_storage_root_scopes_writes_without_changing_pipeline_identity(self):
+        root = Path(__file__).parents[1]
+        content = io.BytesIO()
+        with zipfile.ZipFile(content, "w") as archive:
+            archive.write(root / "operations/completion/handler.py", "handler.py")
+            for name in ("__init__.py", "storage.py", "pipelines/__init__.py",
+                         "pipelines/inspect.py", "pipelines/tracking.py"):
+                archive.write(root / "mlops-models/src/mlops_models" / name,
+                              "mlops_models/" + name)
+        for prefix in ("mlops/review", "team/project/review", "review"):
+            with self.subTest(prefix=prefix):
+                s3, cf, events, session = Mock(), Mock(), Mock(), Mock()
+                s3.get_object.return_value = {"Body": io.BytesIO(content.getvalue())}
+                cf.exceptions.ClientError = ClientError
+                cf.describe_stacks.side_effect = [
+                    ClientError({"Error": {"Code": "ValidationError",
+                                          "Message": "Stack does not exist"}}, "DescribeStacks"),
+                    {"Stacks": [{"StackStatus": "CREATE_COMPLETE", "Outputs": [
+                        {"OutputKey": key, "OutputValue": value} for key, value in {
+                            "EventRule": "review-completed", "ReconciliationRule": "review-reconcile",
+                            "FunctionArn": "review-function"}.items()]}]},
+                ]
+                events.describe_rule.return_value = {"State": "ENABLED"}
+                session.client.side_effect = {"s3": s3, "cloudformation": cf, "events": events}.__getitem__
+                result = deploy_completion(session, "review", f"s3://bucket/{prefix}/",
+                                           "s3://bucket/mlops/code/completion.zip")
+                self.assertEqual(result["stack"], "review-completion")
+                request = cf.create_stack.call_args.kwargs
+                values = {item["ParameterKey"]: item["ParameterValue"] for item in request["Parameters"]}
+                self.assertEqual(values["Namespace"], "review")
+                self.assertEqual(values["DataPrefix"], prefix)
+                self.assertEqual(values["S3Root"], f"s3://bucket/{prefix}")
+                template = json.loads(request["TemplateBody"])
+                self.assertIn("DataPrefix", template["Parameters"])
+                self.assertIn("arn:${AWS::Partition}:s3:::${DataBucket}/${DataPrefix}/*",
+                              request["TemplateBody"])
+                self.assertNotIn("arn:${AWS::Partition}:s3:::${DataBucket}/${Namespace}/*",
+                                 request["TemplateBody"])
+
+    def test_mismatched_or_invalid_storage_root_stops_before_aws_access(self):
+        for uri in ("s3://bucket/mlops/other", "s3://bucket", "s3://bucket/../review",
+                    "s3://bucket/mlops//review", "https://bucket/mlops/review",
+                    "s3://bucket/mlops/review?query"):
+            session = Mock()
+            with self.subTest(uri=uri), self.assertRaisesRegex(ValueError, "output root"):
+                deploy_completion(session, "review", uri, "s3://bucket/code.zip")
+            session.client.assert_not_called()
+
     def test_stale_package_is_rejected_before_infrastructure_changes(self):
         content = io.BytesIO()
         with zipfile.ZipFile(content, "w") as archive:

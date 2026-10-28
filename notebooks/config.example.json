@@ -1,0 +1,15 @@
+{
+  "primary_key": "",
+  "metadata_csv": "",
+  "bucket": "",
+  "s3_prefix": "mlops",
+  "role_arn": "",
+  "image_uri": "",
+  "registry_group_prefix": "",
+  "csv_input": "",
+  "feature_store_config_uri": "",
+  "tracking_uri": "",
+  "namespace": "",
+  "completion_code_uri": "",
+  "user_alias": ""
+}

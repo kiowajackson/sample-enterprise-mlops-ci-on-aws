@@ -287,6 +287,30 @@ Notebook 02 generates a namespace on first use and saves it in
 for an existing deployment. Each person uses their own config/namespace, while
 model versions remain in the existing shared Registry group.
 
+Set `s3_prefix` in `notebooks/config.json` to the parent folder for application
+outputs. It defaults to `mlops`, including when an older config omits the field.
+For `"bucket": "team-bucket"` and `"namespace": "review"`, the resulting layout is:
+
+```text
+s3://team-bucket/mlops/review/
+  source/       uploaded source and cache bindings
+  inputs/       uploaded local CSVs
+  models/       execution data, model artifacts and reports
+  features/     optional Feature Store data, receipts and query results
+  tracking/     tracking receipts
+  completion/   optional completion-service records
+```
+
+Both notebooks use the same setting. A nested value such as `team/mlops` is
+also valid; an empty value is rejected. Changing the folder does not rename
+pipelines or Registry groups. Republish to use the new output paths.
+Existing objects and externally supplied input URIs stay where they are.
+Previously created Feature Groups keep their original offline storage; notebook 01
+checks that it matches, so use newly provisioned groups or a new namespace when
+changing their destination. An enforced Athena workgroup result location and
+MLflow's configured experiment artifact locations remain platform settings.
+The application's tracking receipts use the new folder.
+
 Training retains the source snapshot, including uncommitted model code and the
 existing metadata input. The registered version links its source URI/digest,
 commit, image digest and trained artifacts. Development Processing uses a
@@ -336,6 +360,7 @@ Follow this chain for any Processing or ordinary Training step:
 | [Entrypoint dispatcher](mlops-models/src/mlops_models/entrypoints/__main__.py) | Selects the step's `execute()` function |
 | [Per-model folders](mlops-models/src/mlops_models/models) | Model-specific parameters and training/inference overrides |
 | [Model base](mlops-models/src/mlops_models/model_base) | Shared example implementations that model code replaces or extends |
+| [AutoGluon trainer](mlops-models/src/mlops_models/frameworks/autogluon.py) | `gluonTraining` owns the existing AutoGluon fit and metric conversion |
 | [Registry operations](mlops-models/src/mlops_models/registry/model_package.py) | Registers versions and resolves approved models |
 | [Optional tracking](mlops-models/src/mlops_models/pipelines/tracking.py) | Logs directly from existing jobs; the completion Lambda finalizes native status and cached-producer references |
 
@@ -344,6 +369,13 @@ orchestration supplies paths and configuration. Start with one execution's step
 and follow its entrypoint into the matching model folder; the
 [implementation reference](docs/implementation/README.md#execution-and-code-map)
 covers overrides, archived source and file contracts.
+
+Base training imports `gluonTraining as ModelTraining` from
+`frameworks/autogluon.py`. Existing use-case trainers keep inheriting
+`ModelTraining` and passing their class into the base `train_model()` function.
+The base handles input settings and output packaging; the framework class handles
+fitting. A different training implementation can supply the same class interface.
+This extraction preserves the current algorithm and does not add other frameworks.
 
 Drift follows the same chain: `entrypoints/drift.py` calls
 `models/<ModelId>/inference/drift.py`, which defaults to

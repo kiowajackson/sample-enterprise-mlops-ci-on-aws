@@ -311,6 +311,19 @@ class CachedSourceBindings(unittest.TestCase):
         new = self.cache_keys(second["definitions"]["training"])
         self.assertEqual({name for name in old if old[name] != new[name]}, {"Evaluate"})
 
+    def test_framework_edit_invalidates_training_and_preserves_inference_code(self):
+        first = self.publish()
+        self.edit("frameworks/autogluon.py")
+        second = self.publish()
+        old = self.cache_keys(first["definitions"]["training"])
+        new = self.cache_keys(second["definitions"]["training"])
+        self.assertEqual({name for name in old if old[name] != new[name]}, {"Train"})
+        self.assertEqual(self.cache_keys(first["definitions"]["inference"]),
+                         self.cache_keys(second["definitions"]["inference"]))
+        uri = second["uri"] + "/mlops_models/frameworks/autogluon.py"
+        self.assertEqual(self.s3.objects[source.s3_location(uri)],
+                         (self.package / "frameworks/autogluon.py").read_bytes())
+
     def test_logger_edit_refreshes_every_executing_step(self):
         first = self.publish()
         self.edit("pipelines/tracking.py")

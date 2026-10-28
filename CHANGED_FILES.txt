@@ -1,125 +1,91 @@
-Development inference, MLflow check and Registry diagnostics — October 28, 2026
+S3 parent folder, training framework and SHAP scratch files — October 28, 2026
 
-The preceding cache-source update is implemented. This review contains the
-inference increment, MLflow notebook check update and scratch inspection cells.
+Previous implementation is committed at:
+1aa4d242308a88843f3e1ff3a93ceeb186b81c78
 
-LATEST UPDATE
-Runtime change: registry/model_package.py now keeps the eligibility comparisons
-in check_model_package and reports each failed field with actual/expected values.
-ResolveModel reads in order: list approved versions, sort newest first, describe,
-check, report failures and continue, accept the first match. Explicit ARNs use
-the same checks. ValidatePackage reports the same detailed reasons. Approval and
-namespace requirements are unchanged. Copy this one runtime file and republish
-notebook 02 to use the new errors; no training run is needed.
+The current staged set contains 21 files: 10 code/config/notebook files, two
+SHAP scratch files, six existing test files, and three documentation files.
+Dev must contain these exact paths and file contents. Earlier implemented
+updates are committed at the baseline above and remain in Git history.
 
-Also updated: two existing Registry/source tests and this checklist. Other
-pending implementation and scratch files remain unchanged.
+S3 folder configuration
+-----------------------
+Set "s3_prefix": "mlops" in notebooks/config.json, or inherit that default from
+the updated template. New application writes use:
+    s3://<bucket>/<s3_prefix>/<namespace>/...
+Nested parent folders are supported. Namespace still identifies the pipelines
+and Registry scope. Restart the kernel and republish notebook 02 after copying
+the changed source; existing published definitions retain their old paths.
 
-PRECEDING REGISTRY STATUS CELL
-Updated scratch/inspect_model_package.py: set RESOLVE_JOB (the failed Processing
-job name or ARN) and MODEL_PACKAGE_ARN. The cell reads the expected values from
-that job and prints PASS/FAIL, actual and expected for all eight eligibility
-checks. It names the failing fields first. It does not modify AWS or start jobs.
+Changed files:
+  notebooks/config.example.json
+  notebooks/01_prepare_data.ipynb
+  notebooks/02_deploy_pipelines.ipynb
+  operations/completion/deploy.py
+  operations/completion/template.json
+  mlops-features/deployment-config.example.json
 
-PRECEDING MLFLOW UPDATE
-The new MLflow changes are pipelines/tracking.py, notebook 02, the two tracking/
-completion tests, README and this checklist. The preceding inference changes
-and the two scratch diagnostics are retained for review.
+The completion deployer passes the full namespace prefix to its existing write
+policy. This does not add a service. The standalone Feature Store config uses
+prefix="mlops/enterprise-ci"; its existing CDK code already accepts nested paths.
+Existing Feature Groups do not move: provision matching groups or choose a new
+namespace before using a changed offline destination. Existing input URIs,
+enforced Athena output settings, and MLflow experiment artifact locations remain
+as configured. Application tracking receipts use the new parent.
 
-IMPLEMENTATION FILES (5)
-mlops-models/src/mlops_models/pipelines/tracking.py
-  Print each notebook check stage. Run the check in a separate process with
-  a 120-second total limit and bounded HTTP retries. Stop a stalled worker.
-  Keep the existing job logging behavior and installed dependency versions.
-mlops-models/src/mlops_models/pipelines/source.py
-  Expose ModelCodeSource (artifact/pipeline) for each Development Processing
-  execution. Keep a published development loader and pass the selected package,
-  archive URI, metadata URI and metadata checksum to Processing jobs.
-  CI and native Transform retain the registered-code route.
-mlops-models/src/mlops_models/runtime/load_source.py
-  Verify unpacked metadata against the selected metadata checksum before model
-  imports. Print its paths, checksum and feature count. Include execution ID,
-  model package and metadata binding in source logs and output provenance.
-mlops-models/src/mlops_models/registry/model_package.py
-  Keep eligibility rules in one explicit list. Report every rejected field and
-  its actual/expected value; show candidate processing in readable steps.
-  Always emit the metadata URI/checksum fields used by the new job bindings;
-  older packages without them remain explicitly unverified.
-notebooks/02_deploy_pipelines.ipynb
-  Default ModelCodeSource to artifact and explain the per-execution pipeline
-  override for testing published edits without retraining.
-  Use the bounded MLflow notebook check and explain its test runs and purpose.
+Training framework
+------------------
+New:
+  mlops-models/src/mlops_models/frameworks/__init__.py
+  mlops-models/src/mlops_models/frameworks/autogluon.py
+Changed:
+  mlops-models/src/mlops_models/model_base/training/train.py
+  mlops-models/src/mlops_models/pipelines/source.py
 
-SUPPORTING FILES (13)
-mlops-models/scratch/inspect_model_package.py
-  Read-only status cell using the notebook credentials and ARN region.
-  Read expected scope from the failed ResolveModel job, including --model
-  overrides. Evaluate all eight checks independently; show missing fields,
-  exact case/whitespace differences and both values for every check.
-mlops-models/scratch/inspect_booster.py
-  Paste before trained_model.save_config() in the same process and scope.
-  Print the actual model class, library version/location and method support.
-mlops-models/scratch/compare_metadata.py
-  Optional read-only notebook cell: compare the Registry metadata report,
-  registered model archive and the Score job's actual model archive.
-  Set SCORE_JOB_NAME and MODEL_PACKAGE_ARN; run the whole cell in the
-  receiving notebook. It saves local comparison files without changing AWS.
-README.md
-CHANGED_FILES.txt
-tests/test_execution_tracking.py
-tests/test_automatic_completion.py
-tests/test_source_deployment.py
-tests/test_pipeline_cache.py
-tests/test_development_registry.py
-tests/test_inference_monitoring.py
-tests/test_notebook_config.py
-tests/test_inference_code_choice.py
+The current trainer and its metric helper move to frameworks/autogluon.py.
+Base training imports gluonTraining as ModelTraining. Both existing use-case
+trainers inherit that alias unchanged. Input loading and output/source packaging
+remain in base training. No algorithm, dependency or inference implementation
+is changed. Subsequent edits to the framework module invalidate Train's source
+fingerprint without invalidating unrelated preparation or inference source.
+Copy the new framework package together with the changed base training file.
 
-APPLYING
-For the MLflow check update, replace pipelines/tracking.py and notebook 02.
-Keep the existing image and its dependencies. Set tracking_uri in config.json
-to the supplied tracking-server/App ARN, restart the kernel and rerun notebook 02.
-Progress identifies server lookup, client initialization, MLflow API or artifact
-access. Failure stops publication; it does not silently disable tracking.
+SHAP diagnostics and temporary workaround
+-----------------------------------------
+  mlops-models/scratch/inspect_shap_base_score.py
+  mlops-models/scratch/shap_xgboost_workaround.py
 
-For the preceding inference update:
-Replace the four implementation files. Restart the notebook kernel and rerun
-notebook 02 to publish the new inference parameter. Start the resulting pipeline
-version with ModelCodeSource=pipeline and ModelMetadataUri=registry. Use an
-explicit ModelPackageArn when comparing against a particular approved version.
-No training run is needed to apply subsequent inference edits: edit, publish,
-then execute inference with pipeline selected. artifact uses saved model code.
+The diagnostic prints versions, the actual model class and raw XGBoost base_score.
+The temporary workaround runs only for an actual XGBoost Booster. It converts
+one finite vector-form intercept in SHAP's decoded dictionary, preserving the
+Booster and its predictions. It is restricted to SHAP 0.49.1 and single-output
+models. Paste the whole block before the existing TreeExplainer call. Remove it
+when the platform provides a compatible, validated image. LightGBM keeps its
+existing explanation path.
 
-The metadata JSON is read from the local extraction of the selected S3 model
-archive, not from a notebook-local config. It must match the registered checksum
-(or an explicit metadata override's checksum). This does not prove that custom
-training returned metadata consistent with its fitted predictor; the actual
-feature-mismatch investigation still needs the receiving execution's output.
+Tests and documentation
+-----------------------
+  tests/test_automatic_completion.py
+  tests/test_model_contracts.py
+  tests/test_notebook_config.py
+  tests/test_pipeline_cache.py
+  tests/test_preparation_cache.py
+  tests/test_saved_training_metrics.py
+  README.md
+  mlops-features/README.md
+  CHANGED_FILES.txt
 
-VALIDATION
-130 focused tests passed with networking disabled, including real loader and
-dispatcher subprocesses. Artifact mode ignores broken current prediction code;
-pipeline mode executes it. A metadata mismatch fails before the prediction
-module is imported. Prediction edits select new Score source while preserving
-unaffected inference cache keys. CI and native Transform keep archived code.
-The actual notebook build/upload/publication cells are also checked against
-simulated AWS. No receiving-environment pipeline execution is claimed.
-
-MLFLOW CHECK VALIDATION
-The original and updated checks both completed with a real MLflow 3.16.1 HTTP
-client and local 3.0.0 server, including runs, metrics, parameters, dataset
-references and artifact upload/download. A deliberately stalled HTTP endpoint
-was stopped at the configured deadline and reported the last operation. AWS
-server description was simulated; BMO connectivity and permissions are unverified.
-The completion test setup now includes the existing notebook cache bindings.
-
-REGISTRY STATUS CELL VALIDATION
-21 simulated cases passed against the current application eligibility predicate,
-including each mismatched/missing field, CLI model override and absent job scope.
-No BMO API call or pipeline execution was performed.
-
-REGISTRY RUNTIME VALIDATION
-55 focused tests passed in the existing runtime image with networking disabled.
-Coverage includes each failed/missing field, multiple failures, newest-eligible
-selection, pending packages, exact ARNs, notebook pre-approval scope checks,
-ValidatePackage errors and metadata override behavior. No BMO execution occurred.
+Validation
+----------
+128 focused tests passed in the existing local runtime image.
+Actual notebook cells passed four simulated publications across three namespaces,
+including default/custom parent folders and updating only the chosen namespace.
+All 285 uploaded test objects were under the configured parent folders.
+The Feature Store binding and requested Athena output used the same parent.
+Four real local fits passed: regression/classification, each in preliminary and
+final modes. Each saved model loaded and predicted; its archived source imported
+successfully in a fresh process.
+The SHAP helper was checked with SHAP 0.49.1, XGBoost 3.4.1 and LightGBM 4.6.0.
+XGBoost exact/approximate contributions matched its native outputs; LightGBM
+explanations and predictions were unchanged before/after XGBoost activation.
+No managed pipeline jobs or cloud deployments were performed for validation.

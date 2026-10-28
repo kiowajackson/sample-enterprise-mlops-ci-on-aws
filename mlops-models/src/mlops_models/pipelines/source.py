@@ -121,6 +121,9 @@ def preparation_fingerprint(session, csv_uri, local_csv=None):
     training = {"feature_selection.py": "FeatureSelection", "preprocess.py": "Preprocess"}
     for path in source_files():
         relative = path.relative_to(PACKAGE)
+        # The AutoGluon training implementation is not used by preparation.
+        if relative == Path("frameworks/autogluon.py"):
+            continue
         # These modules do not run in preparation jobs. Unknown shared helpers do.
         if (relative.parts[0] in {"pipelines", "registry", "monitoring"}
                 and relative != Path("pipelines/tracking.py") or "inference" in relative.parts):
@@ -169,7 +172,9 @@ def pipeline_fingerprints(session, csv_uri="", local_csv=None):
                 or path.name == "definition.json"):
             continue
         steps = digests.keys()
-        if relative.parts[0] == "monitoring":
+        if relative == Path("frameworks/autogluon.py"):
+            steps = ("Train",)
+        elif relative.parts[0] == "monitoring":
             # Monitoring code is saved in the trained model's source archive.
             steps = ("Train", "DriftComparison")
         elif relative == Path("pipelines/inspect.py"):

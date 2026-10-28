@@ -63,6 +63,7 @@ class NotebookConfiguration(unittest.TestCase):
                     self.load(cells)
                 self.assertEqual(self.path.read_bytes(), self.template.read_bytes())
                 settings = json.loads(self.path.read_text())
+                self.assertEqual(settings.pop("s3_prefix"), "mlops")
                 self.assertEqual(settings, dict.fromkeys((
                     "primary_key", "metadata_csv", "bucket", "role_arn", "image_uri",
                     "csv_input", "feature_store_config_uri", "registry_group_prefix", "tracking_uri", "namespace", "completion_code_uri", "user_alias",
@@ -95,6 +96,25 @@ class NotebookConfiguration(unittest.TestCase):
         self.assertEqual(second["tracking_uri"],
                          "arn:aws:sagemaker:us-east-1:123456789012:mlflow-tracking-server/test")
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_storage_folder_default_and_override_are_shared_by_both_notebooks(self):
+        for options, expected in (({}, "mlops/review"),
+                                  ({"s3_prefix": "/team/project/"}, "team/project/review")):
+            for cells in (PREPARE, DEPLOY):
+                with self.subTest(options=options, notebook=cells[0][:30]):
+                    self.save(namespace="review", **options)
+                    scope = self.load(cells)
+                    self.assertEqual(scope["storage_prefix"], expected)
+                    self.assertEqual(scope["namespace"], "review")
+
+    def test_invalid_storage_folders_stop_before_publication(self):
+        for value in ("", "/", ".", "../team", "team//project", "team/./project",
+                      "s3://bucket/team", "team?query"):
+            for cells in (PREPARE, DEPLOY):
+                with self.subTest(value=value, notebook=cells[0][:30]):
+                    self.save(namespace="review", s3_prefix=value)
+                    with self.assertRaisesRegex(ValueError, "s3_prefix"):
+                        self.load(cells)
 
 
     def test_preparation_requires_an_explicit_primary_key_without_rewriting_config(self):
@@ -239,7 +259,7 @@ class NotebookConfiguration(unittest.TestCase):
         sample = self.root / "sample.csv"
         sample.write_text("id,value\n0001,2\n")
         first.update(sample={"sample": sample}, data_source="feature_store", feature_store_role_arn="writer-role",
-                     settings={"prefix": "review/features/"}, receipt={"delivery_id": "ready"},
+                     settings={"prefix": "mlops/review/features/"}, receipt={"delivery_id": "ready"},
                      session=Mock(), uuid4=uuid4)
         with patch("mlops_features.data.write_once") as write:
             exec(PREPARE[6], first)
@@ -249,7 +269,7 @@ class NotebookConfiguration(unittest.TestCase):
         self.assertEqual(second["tracking_uri"], "")
         self.assertEqual(second["inference_data_source"], "csv_direct")
         self.assertTrue(second["feature_store_config_uri"].startswith(
-            "s3://test-bucket/review/features/configurations/"))
+            "s3://test-bucket/mlops/review/features/configurations/"))
         self.assertEqual(second["role_arn"], "pipeline-role")
         self.assertNotIn("feature_store_role_arn", json.loads(self.path.read_text()))
 
