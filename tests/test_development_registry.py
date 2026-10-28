@@ -1,13 +1,18 @@
 """Exercise shared-group isolation, exact replay and Development-only registration."""
 
 from copy import deepcopy
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock
 
-from mlops_models.registry.model_package import resolve_latest_approved_model
+from mlops_models.registry.model_package import (
+    approved_development_package, development_scope, resolve_latest_approved_model,
+    validate_approved_model_package,
+)
 import test_source_deployment as existing_checks
 
 
@@ -34,7 +39,7 @@ class DevelopmentRegistry(unittest.TestCase):
         client = Mock()
         client.get_paginator.return_value.paginate.return_value = [
             {"ModelPackageSummaryList": [
-                {k: v[k] for k in ("ModelPackageArn", "ModelPackageVersion", "ModelPackageStatus")}
+                {k: v[k] for k in ("ModelPackageArn", "ModelPackageVersion", "ModelPackageStatus") if k in v}
                 for v in versions
             ]}
         ]
@@ -93,6 +98,90 @@ class DevelopmentRegistry(unittest.TestCase):
         for selection in ("", "latest-approved"):
             with self.subTest(selection=selection), self.assertRaisesRegex(ValueError, "No eligible"):
                 self.resolve([package(10, namespace="another-person")], exact=selection)
+
+    def test_each_failed_or_missing_field_names_actual_and_expected_values(self):
+        fields = [
+            (("ModelPackageGroupName",), "ModelPackageGroupName", "shared"),
+            (("ModelPackageStatus",), "ModelPackageStatus", "Completed"),
+            (("ModelLifeCycle", "Stage"), "ModelLifeCycle.Stage", "Development"),
+            (("CustomerMetadataProperties", "DeploymentNamespace"), "DeploymentNamespace", "parul"),
+            (("CustomerMetadataProperties", "ModelId"), "ModelId", "usecase2"),
+            (("CustomerMetadataProperties", "Environment"), "Environment", "dev"),
+            (("ModelApprovalStatus",), "ModelApprovalStatus", "Approved"),
+            (("ModelLifeCycle", "StageStatus"), "ModelLifeCycle.StageStatus", "Approved"),
+        ]
+        for path, label, expected in fields:
+            for missing in (False, True):
+                candidate = package(1)
+                target = candidate[path[0]] if len(path) == 2 else candidate
+                actual = None if missing else expected + " "
+                if missing:
+                    del target[path[-1]]
+                else:
+                    target[path[-1]] = actual
+                with self.subTest(field=label, missing=missing):
+                    with self.assertRaises(ValueError) as error:
+                        self.resolve([candidate], exact=candidate["ModelPackageArn"])
+                    self.assertIn(candidate["ModelPackageArn"], str(error.exception))
+                    self.assertIn(f"{label}: actual={actual!r}, expected={expected!r}", str(error.exception))
+
+    def test_one_error_reports_all_failed_checks(self):
+        candidate = package(1, namespace="previous", stage="Production", stage_status="PendingApproval")
+        candidate["ModelApprovalStatus"] = "Rejected"
+        del candidate["CustomerMetadataProperties"]["ModelId"]
+        with self.assertRaises(ValueError) as error:
+            self.resolve([candidate], exact=candidate["ModelPackageArn"])
+        message = str(error.exception)
+        for fragment in (
+            "DeploymentNamespace: actual='previous', expected='parul'",
+            "ModelLifeCycle.Stage: actual='Production', expected='Development'",
+            "ModelLifeCycle.StageStatus: actual='PendingApproval', expected='Approved'",
+            "ModelApprovalStatus: actual='Rejected', expected='Approved'",
+            "ModelId: actual=None, expected='usecase2'",
+        ):
+            self.assertIn(fragment, message)
+
+    def test_latest_logs_reasons_and_stops_at_the_highest_eligible_version(self):
+        pending = package(30)
+        pending["ModelPackageStatus"] = "InProgress"
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result, client = self.resolve([package(2), package(20, namespace="previous"), pending, package(4)])
+        self.assertEqual(result["version"], 4)
+        self.assertIn("ModelPackageStatus: actual='InProgress', expected='Completed'", output.getvalue())
+        self.assertIn("DeploymentNamespace: actual='previous', expected='parul'", output.getvalue())
+        self.assertEqual(
+            [call.kwargs["ModelPackageName"] for call in client.describe_model_package.call_args_list],
+            [package(version)["ModelPackageArn"] for version in (30, 20, 4)],
+        )
+        client.get_paginator.return_value.paginate.assert_called_once_with(
+            ModelPackageGroupName="shared", ModelApprovalStatus="Approved")
+
+    def test_empty_approved_list_explains_the_filter(self):
+        with self.assertRaisesRegex(ValueError, "No versions with ModelApprovalStatus='Approved'"):
+            self.resolve([])
+
+    def test_validate_package_reports_scope_values_without_writing_authorization(self):
+        candidate = package(1, namespace="previous")
+        client = Mock()
+        client.describe_model_package.return_value = candidate
+        container = candidate["InferenceSpecification"]["Containers"][0]
+        with TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError) as error:
+                validate_approved_model_package(
+                    candidate["ModelPackageArn"], "shared", container["Image"],
+                    container["ModelDataUrl"], directory, namespace="parul",
+                    model_id="usecase2", environment="dev", client=client)
+            self.assertIn("DeploymentNamespace: actual='previous', expected='parul'", str(error.exception))
+            self.assertFalse((Path(directory) / "package.json").exists())
+
+    def test_notebook_scope_check_still_allows_a_model_awaiting_approval(self):
+        candidate = package(1, stage_status="PendingApproval")
+        candidate["ModelApprovalStatus"] = "PendingManualApproval"
+        self.assertTrue(development_scope(candidate, "shared", "parul", "usecase2", "dev"))
+        self.assertFalse(approved_development_package(candidate, "shared", "parul", "usecase2", "dev"))
+        with self.assertRaisesRegex(ValueError, "DeploymentNamespace, ModelId"):
+            development_scope(candidate, "shared", "", None, "dev")
 
     def test_notebook_registration_stays_development_even_if_a_ci_flag_is_supplied(self):
         fixture = existing_checks.ExistingGroupRegistration()

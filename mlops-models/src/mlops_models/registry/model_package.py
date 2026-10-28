@@ -92,25 +92,40 @@ def register_existing_group(evaluation, settings, *, client, s3):
     return record
 
 
-def development_scope(package, group, namespace, model_id, environment):
-    """Check the recorded scope; Platform IAM must separately enforce who may write it."""
-    if not all((namespace, model_id, environment)):
-        raise ValueError("Supply the deployment namespace, ModelId and environment.")
+def check_model_package(package, group, namespace, model_id, environment, *, require_approval=True):
+    """Return every failed eligibility check with its actual and expected values."""
+    missing = [name for name, value in (
+        ("DeploymentNamespace", namespace), ("ModelId", model_id), ("Environment", environment)
+    ) if not value]
+    if missing:
+        raise ValueError("Missing expected Registry scope: " + ", ".join(missing))
     properties = package.get("CustomerMetadataProperties", {})
-    return (
-        package.get("ModelPackageGroupName") == group
-        and package.get("ModelPackageStatus") == "Completed"
-        and package.get("ModelLifeCycle", {}).get("Stage") == "Development"
-        and properties.get("DeploymentNamespace") == namespace
-        and properties.get("ModelId") == model_id
-        and properties.get("Environment") == environment
-    )
+    lifecycle = package.get("ModelLifeCycle", {})
+    checks = [
+        ("ModelPackageGroupName", package.get("ModelPackageGroupName"), group),
+        ("ModelPackageStatus", package.get("ModelPackageStatus"), "Completed"),
+        ("ModelLifeCycle.Stage", lifecycle.get("Stage"), "Development"),
+        ("DeploymentNamespace", properties.get("DeploymentNamespace"), namespace),
+        ("ModelId", properties.get("ModelId"), model_id),
+        ("Environment", properties.get("Environment"), environment),
+    ]
+    if require_approval:
+        checks.extend([
+            ("ModelApprovalStatus", package.get("ModelApprovalStatus"), "Approved"),
+            ("ModelLifeCycle.StageStatus", lifecycle.get("StageStatus"), "Approved"),
+        ])
+    return [f"{name}: actual={actual!r}, expected={expected!r}"
+            for name, actual, expected in checks if actual != expected]
+
+
+def development_scope(package, group, namespace, model_id, environment):
+    """Keep the notebook's pre-approval scope check independent of approval status."""
+    return not check_model_package(package, group, namespace, model_id, environment,
+                                   require_approval=False)
 
 
 def approved_development_package(package, group, namespace, model_id, environment):
-    return (development_scope(package, group, namespace, model_id, environment)
-            and package.get("ModelApprovalStatus") == "Approved"
-            and package.get("ModelLifeCycle", {}).get("StageStatus") == "Approved")
+    return not check_model_package(package, group, namespace, model_id, environment)
 
 
 def validate_approved_model_package(package_arn, group, image_uri, checkpoint_uri, output_dir, *,
@@ -125,8 +140,10 @@ def validate_approved_model_package(package_arn, group, image_uri, checkpoint_ur
         import boto3
         client = boto3.client("sagemaker", region_name=package_arn.split(":")[3])
     package = client.describe_model_package(ModelPackageName=package_arn)
-    if not approved_development_package(package, group, namespace, model_id, environment):
-        raise ValueError("The package must be an approved Development model in this deployment namespace.")
+    issues = check_model_package(package, group, namespace, model_id, environment)
+    if issues:
+        raise ValueError(f"Model package {package_arn} is not an approved Development model:\n"
+                         + "\n".join(issues))
     containers = package["InferenceSpecification"]["Containers"]
     if len(containers) != 1:
         raise ValueError("This pipeline expects a single-container package.")
@@ -152,27 +169,39 @@ def resolve_latest_approved_model(group, output_dir, *, namespace, model_id, env
     if client is None:
         import boto3
         client = boto3.client("sagemaker")
-    # List summaries omit the namespace metadata. Describe candidates before
-    # selecting; a newer model from another user's deployment must not win.
-    package = None
+    # 1. Use the requested version, or list approved versions from newest to oldest.
     if package_arn and package_arn != "latest-approved":
-        package = client.describe_model_package(ModelPackageName=package_arn)
+        candidates = [package_arn]
     else:
         packages = []
         for page in client.get_paginator("list_model_packages").paginate(
                 ModelPackageGroupName=group, ModelApprovalStatus="Approved"):
-            packages.extend(p for p in page["ModelPackageSummaryList"]
-                            if p["ModelPackageStatus"] == "Completed")
-        for candidate in sorted(packages, key=lambda p: p["ModelPackageVersion"], reverse=True):
-            described = client.describe_model_package(ModelPackageName=candidate["ModelPackageArn"])
-            if approved_development_package(described, group, namespace, model_id, environment):
-                package = described
-                break
-    if package is None or not approved_development_package(package, group, namespace, model_id, environment):
+            packages.extend(page["ModelPackageSummaryList"])
+        candidates = [p["ModelPackageArn"] for p in
+                      sorted(packages, key=lambda p: p["ModelPackageVersion"], reverse=True)]
+    package, rejected = None, []
+    for candidate_arn in candidates:
+        # 2. Describe the candidate: list summaries do not contain its recorded scope.
+        described = client.describe_model_package(ModelPackageName=candidate_arn)
+        # 3. Apply all checks; report every failure and continue to the next candidate.
+        issues = check_model_package(described, group, namespace, model_id, environment)
+        if issues:
+            reason = f"{candidate_arn}:\n  " + "\n  ".join(issues)
+            rejected.append(reason)
+            print("Rejected model package " + reason, flush=True)
+            continue
+        # 4. Accept the first eligible version.
+        package = described
+        break
+
+    # 5. Fail with the collected reasons if no candidate passed.
+    if package is None:
+        details = "\n".join(rejected) if rejected else (
+            "No versions with ModelApprovalStatus='Approved' were returned for this group."
+        )
         raise ValueError(
-            f"No eligible Development model in {group} for {namespace}/{model_id}/{environment}. "
-            "Train in this namespace and approve both the lifecycle stage and model approval. "
-            "An explicitly selected version must satisfy the same checks."
+            f"No eligible Development model in {group!r} for "
+            f"{namespace!r}/{model_id!r}/{environment!r}.\n{details}"
         )
     containers = package["InferenceSpecification"]["Containers"]
     if len(containers) != 1:

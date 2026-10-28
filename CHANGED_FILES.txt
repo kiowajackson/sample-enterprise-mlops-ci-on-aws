@@ -1,9 +1,21 @@
-Development inference, MLflow check and Registry inspection — October 28, 2026
+Development inference, MLflow check and Registry diagnostics — October 28, 2026
 
 The preceding cache-source update is implemented. This review contains the
 inference increment, MLflow notebook check update and scratch inspection cells.
 
 LATEST UPDATE
+Runtime change: registry/model_package.py now keeps the eligibility comparisons
+in check_model_package and reports each failed field with actual/expected values.
+ResolveModel reads in order: list approved versions, sort newest first, describe,
+check, report failures and continue, accept the first match. Explicit ARNs use
+the same checks. ValidatePackage reports the same detailed reasons. Approval and
+namespace requirements are unchanged. Copy this one runtime file and republish
+notebook 02 to use the new errors; no training run is needed.
+
+Also updated: two existing Registry/source tests and this checklist. Other
+pending implementation and scratch files remain unchanged.
+
+PRECEDING REGISTRY STATUS CELL
 Updated scratch/inspect_model_package.py: set RESOLVE_JOB (the failed Processing
 job name or ARN) and MODEL_PACKAGE_ARN. The cell reads the expected values from
 that job and prints PASS/FAIL, actual and expected for all eight eligibility
@@ -29,6 +41,8 @@ mlops-models/src/mlops_models/runtime/load_source.py
   imports. Print its paths, checksum and feature count. Include execution ID,
   model package and metadata binding in source logs and output provenance.
 mlops-models/src/mlops_models/registry/model_package.py
+  Keep eligibility rules in one explicit list. Report every rejected field and
+  its actual/expected value; show candidate processing in readable steps.
   Always emit the metadata URI/checksum fields used by the new job bindings;
   older packages without them remain explicitly unverified.
 notebooks/02_deploy_pipelines.ipynb
@@ -103,3 +117,9 @@ REGISTRY STATUS CELL VALIDATION
 21 simulated cases passed against the current application eligibility predicate,
 including each mismatched/missing field, CLI model override and absent job scope.
 No BMO API call or pipeline execution was performed.
+
+REGISTRY RUNTIME VALIDATION
+55 focused tests passed in the existing runtime image with networking disabled.
+Coverage includes each failed/missing field, multiple failures, newest-eligible
+selection, pending packages, exact ARNs, notebook pre-approval scope checks,
+ValidatePackage errors and metadata override behavior. No BMO execution occurred.

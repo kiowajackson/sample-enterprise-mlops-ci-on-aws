@@ -269,13 +269,18 @@ class SourceDeployment(unittest.TestCase):
                    "ModelPackageStatus": "Completed", "InferenceSpecification": {"Containers": [
                        {"Image": self.image, "ModelDataUrl": "s3://models/10/model.tar.gz"}]}}
         client = self.registry(summaries, package)
+        descriptions = {item["ModelPackageArn"]: {**package, **item} for item in summaries}
+        client.describe_model_package.side_effect = lambda **kwargs: descriptions[kwargs["ModelPackageName"]]
         with TemporaryDirectory() as directory:
             result = resolve_latest_approved_model("review-usecase1", directory, client=client, namespace="review", model_id="usecase1", environment="dev")
             self.assertEqual(result["version"], 10)
             self.assertEqual(json.loads((Path(directory) / "package.json").read_text()), result)
         client.get_paginator.return_value.paginate.assert_called_once_with(
             ModelPackageGroupName="review-usecase1", ModelApprovalStatus="Approved")
-        client.describe_model_package.assert_called_once_with(ModelPackageName="package/10")
+        self.assertEqual(
+            [call.kwargs["ModelPackageName"] for call in client.describe_model_package.call_args_list],
+            ["package/11", "package/10"],
+        )
 
     def test_no_approved_package_fails_before_model_execution(self):
         client = self.registry([], {})
