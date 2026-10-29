@@ -1,154 +1,61 @@
-# Paste this file into a new cell in notebook 02, after interrupting the stuck cell.
-# - Reuse the notebook's tracking_uri and installed Python environment.
-# - Search for one experiment without creating experiments, runs or artifacts.
-# - Print the worker's Python stack every 20 seconds while it is waiting.
-# - Stop the worker after 60 seconds and keep its output visible in the notebook.
+# Paste this entire file into one notebook cell after interrupting the stuck cell.
+# Fill in the tracking server ARN below; no earlier notebook variables are needed.
+# This only searches experiments. It does not create runs or write artifacts.
+TRACKING_URI = ""  # arn:aws:sagemaker:ca-central-1:123456789012:mlflow-tracking-server/your-server
 
+import importlib.metadata
 import os
-import queue
-import subprocess
+import re
 import sys
 import threading
 import time
-
-
-_MLFLOW_SEARCH_WORKER = r"""
-import faulthandler
-import importlib.metadata
-import json
-import os
-import sys
-import time
 import traceback
 
-request = json.loads(sys.stdin.read())
+TRACKING_URI = TRACKING_URI.strip()
+if not re.fullmatch(
+    r"arn:[a-z0-9-]+:sagemaker:[a-z0-9-]+:\d{12}:mlflow-tracking-server/[^\s/:]+",
+    TRACKING_URI,
+):
+    raise ValueError(
+        "Set TRACKING_URI to the tracking server ARN, for example "
+        "arn:aws:sagemaker:ca-central-1:123456789012:mlflow-tracking-server/your-server"
+    )
+
+# These settings remain active in this kernel. They limit HTTP waits/retries,
+# not the whole operation (for example, AWS credential lookup can wait longer).
+os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] = "10"
+os.environ["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] = "0"
+
+print("Importing MLflow and the SageMaker plugin...", flush=True)
+import mlflow
+import sagemaker_mlflow
+
+print("MLflow:", mlflow.__version__, "|", mlflow.__file__, flush=True)
+print("SageMaker plugin:", importlib.metadata.version("sagemaker-mlflow"),
+      "|", sagemaker_mlflow.__file__, flush=True)
+
+# The AWS plugin reads this GLOBAL URI for authentication and request headers.
+# Passing the ARN only to MlflowClient(tracking_uri=...) is insufficient.
+mlflow.set_tracking_uri(TRACKING_URI)
+print("Tracking URI:", mlflow.get_tracking_uri(), flush=True)
+
+# If the call waits, print the notebook thread's stack into this cell's output.
+# The timer reports where Python is waiting; it does not stop the request.
+search_thread = threading.get_ident()
+def print_waiting_stack():
+    print("\nSearch still waiting after 20 seconds. Python stack:", flush=True)
+    traceback.print_stack(sys._current_frames()[search_thread], file=sys.stdout)
+    sys.stdout.flush()
+
+stack_timer = threading.Timer(20, print_waiting_stack)
+stack_timer.daemon = True
 started = time.monotonic()
-
-def progress(message):
-    print(f"[search +{time.monotonic() - started:.1f}s] {message}", flush=True)
-
-faulthandler.enable(file=sys.stderr)
-faulthandler.dump_traceback_later(
-    request["stack_after"], repeat=True, file=sys.stderr
-)
+stack_timer.start()
 try:
-    progress(f"Python: {sys.executable}")
-    progress("Import MLflow and SageMaker plugin")
-    import mlflow
-    import sagemaker_mlflow
-    progress(f"MLflow {mlflow.__version__}: {mlflow.__file__}")
-    try:
-        plugin_version = importlib.metadata.version("sagemaker-mlflow")
-    except importlib.metadata.PackageNotFoundError:
-        plugin_version = "unknown"
-    progress(f"SageMaker plugin {plugin_version}: {sagemaker_mlflow.__file__}")
-    for name in (
-        "SAGEMAKER_MLFLOW_ASSUME_ROLE_ARN",
-        "SAGEMAKER_MLFLOW_CUSTOM_ENDPOINT",
-        "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
-    ):
-        progress(f"{name}: {'set' if os.environ.get(name) else 'not set'}")
-    progress("Initialize tracking client")
-    client = mlflow.MlflowClient(tracking_uri=request["uri"])
-    progress("START mlflow.search_experiments(max_results=1)")
-    result = client.search_experiments(max_results=1)
-    progress(f"OK search returned {len(result)} experiment(s)")
-except Exception:
-    traceback.print_exc(file=sys.stdout)
-    sys.exit(1)
+    print("START mlflow.search_experiments(max_results=1)", flush=True)
+    experiments = mlflow.search_experiments(max_results=1)
+    print(f"OK: {len(experiments)} experiment(s), {time.monotonic() - started:.1f}s", flush=True)
+    for experiment in experiments:
+        print(experiment.experiment_id, experiment.name)
 finally:
-    faulthandler.cancel_dump_traceback_later()
-"""
-
-
-def diagnose_mlflow_search(uri, *, timeout_seconds=60, stack_after=20):
-    import json
-    import math
-
-    if not isinstance(uri, str) or not uri.startswith("arn:"):
-        raise ValueError("Use the existing tracking_uri ARN from notebook 02.")
-    if not (math.isfinite(timeout_seconds) and math.isfinite(stack_after)
-            and 0 < stack_after < timeout_seconds):
-        raise ValueError("Require 0 < stack_after < timeout_seconds.")
-
-    environment = {
-        **os.environ,
-        "PYTHONUNBUFFERED": "1",
-        "MLFLOW_HTTP_REQUEST_TIMEOUT": "10",
-        "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "0",
-    }
-    print(
-        f"Read-only experiment search. Stack every {stack_after:g}s; "
-        f"worker limit {timeout_seconds:g}s. No run/artifact writes.",
-        flush=True,
-    )
-    process = subprocess.Popen(
-        [sys.executable, "-u", "-c", _MLFLOW_SEARCH_WORKER],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, env=environment,
-    )
-    messages = queue.Queue()
-    output = []
-    timed_out = False
-
-    def read_output():
-        try:
-            for line in process.stdout:
-                messages.put(line)
-        finally:
-            messages.put(None)
-
-    reader = threading.Thread(target=read_output, daemon=True)
-    reader.start()
-    started = time.monotonic()
-    next_status = started + 5
-    output_closed = False
-    try:
-        process.stdin.write(json.dumps({"uri": uri, "stack_after": stack_after}))
-        process.stdin.close()
-        while not output_closed or process.poll() is None:
-            now = time.monotonic()
-            if now - started >= timeout_seconds:
-                timed_out = True
-                print("Worker limit reached; stopping the search process.", flush=True)
-                break
-            try:
-                line = messages.get(timeout=min(0.1, timeout_seconds - (now - started)))
-            except queue.Empty:
-                if now >= next_status:
-                    print(f"[notebook +{now - started:.0f}s] Worker still running.", flush=True)
-                    next_status = now + 5
-                continue
-            if line is None:
-                output_closed = True
-            else:
-                output.append(line)
-                print(line, end="", flush=True)
-    finally:
-        if process.poll() is None:
-            process.kill()
-        process.wait(timeout=5)
-        reader.join(timeout=1)
-        while not messages.empty():
-            line = messages.get_nowait()
-            if line is not None:
-                output.append(line)
-                print(line, end="", flush=True)
-        process.stdout.close()
-        if not process.stdin.closed:
-            process.stdin.close()
-
-    print(
-        f"Finished in {time.monotonic() - started:.1f}s; "
-        f"timed_out={timed_out}; exit_code={process.returncode}.",
-        flush=True,
-    )
-    return {
-        "timed_out": timed_out,
-        "exit_code": process.returncode,
-        "output": "".join(output),
-    }
-
-
-if __name__ == "__main__":
-    mlflow_search_diagnostic = diagnose_mlflow_search(tracking_uri)
+    stack_timer.cancel()
