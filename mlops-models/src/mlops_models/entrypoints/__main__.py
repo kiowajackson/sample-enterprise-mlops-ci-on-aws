@@ -24,7 +24,7 @@ def parse_job_arguments():
     # Read the explicit command and any path overrides.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("step", choices=[
-        "get-data", "get-inference-data", "select-features", "preprocess-training", "train", "evaluate", "validate-package", "preprocess", "preprocess-test", "predict", "postprocess", "postprocess-test", "drift", "serve", "score", "resolve-model",
+        "get-data", "get-inference-data", "select-features", "preprocess-training", "train", "validate-package", "preprocess", "preprocess-test", "predict", "postprocess", "postprocess-test", "drift", "serve", "score", "resolve-model",
     ])
     parser.add_argument("--model", default=os.getenv("MODEL_ID"), required=not os.getenv("MODEL_ID"))
     parser.add_argument("--input")
@@ -103,11 +103,6 @@ def dispatch_pipeline_step(args):
             hyperparameters = json.loads(Path("/opt/ml/input/config/hyperparameters.json").read_text())
         return train.execute(args.model, args.input, args.model_dir, args.output,
                              selection_path=args.selection, hyperparameters=hyperparameters)
-    if args.step == "evaluate":
-        from . import evaluate
-        return evaluate.execute(args.model, args.model_dir, args.output,
-                                input_path=None if os.getenv("MLOPS_EVALUATION_INPUT") == "model-artifact" else args.input)
-
     # Test steps run only in training; inference commands have no mode router.
     if args.step == "preprocess-test":
         from . import preprocess_test
