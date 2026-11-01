@@ -77,7 +77,7 @@ def upload_processing_outputs(config, output_dir, scratch):
 
 
 def upload_training_outputs(work):
-    """Upload the completed model (including code) and auxiliary reports from Training scratch."""
+    """Upload Training's model and reports as archives and browsable sibling folders."""
     import boto3
 
     model = work / "model"
@@ -97,10 +97,23 @@ def upload_training_outputs(work):
         with tarfile.open(archive_path, "w:gz") as archive:
             for path in sorted(directory.iterdir()):
                 archive.add(path, arcname=path.name)
+        archive_key = location.path.lstrip("/")
+        files_prefix = archive_key.removesuffix(".tar.gz") + "/"
+        files_uri = f"s3://{location.netloc}/{files_prefix}"
+        print(json.dumps({"event": "training_files_upload", "source": str(directory),
+                          "destination": files_uri}), flush=True)
+        file_count = 0
+        for path in sorted(directory.rglob("*")):
+            if path.is_symlink():
+                raise ValueError(f"Training output must be a file inside its output directory: {path}")
+            if path.is_file():
+                key = files_prefix + path.relative_to(directory).as_posix()
+                s3.upload_file(str(path), location.netloc, key, ExtraArgs=encryption)
+                file_count += 1
         print(json.dumps({"event": "training_output_upload", "source": str(archive_path),
-                          "destination": uri, "bytes": archive_path.stat().st_size}), flush=True)
-        s3.upload_file(str(archive_path), location.netloc, location.path.lstrip("/"),
-                       ExtraArgs=encryption)
+                          "destination": uri, "bytes": archive_path.stat().st_size,
+                          "files_uri": files_uri, "files": file_count}), flush=True)
+        s3.upload_file(str(archive_path), location.netloc, archive_key, ExtraArgs=encryption)
     # The same record is readable without downloading/unpacking the trained model.
     location = urlparse(os.environ["MLOPS_TRAINING_MODEL_URI"])
     s3.upload_file(str(model / "_execution.json"), location.netloc,
