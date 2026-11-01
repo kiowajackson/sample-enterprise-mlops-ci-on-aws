@@ -121,8 +121,8 @@ def preparation_fingerprint(session, csv_uri, local_csv=None):
     training = {"feature_selection.py": "FeatureSelection", "preprocess.py": "Preprocess"}
     for path in source_files():
         relative = path.relative_to(PACKAGE)
-        # The AutoGluon training/prediction implementation is not used by preparation.
-        if relative == Path("frameworks/autogluon.py"):
+        # Framework training/prediction implementations are not used by preparation.
+        if relative.parts[0] == "frameworks":
             continue
         # These modules do not run in preparation jobs. Unknown shared helpers do.
         if (relative.parts[0] in {"pipelines", "registry", "monitoring"}
@@ -131,7 +131,8 @@ def preparation_fingerprint(session, csv_uri, local_csv=None):
         steps = digests.keys()
         if relative.parent == Path("entrypoints"):
             if path.name in {"train.py", "evaluate.py", "predict.py", "postprocess.py", "drift.py",
-                             "preprocess_inference.py", "serve.py"}:
+                             "preprocess_inference.py", "preprocess_test.py", "postprocess_inference.py",
+                             "postprocess_test.py", "serve.py"}:
                 continue
             if path.name in entrypoints:
                 steps = (entrypoints[path.name],)
@@ -158,12 +159,16 @@ def pipeline_fingerprints(session, csv_uri="", local_csv=None):
                     "get_data.py": ("Train",),
                    "preprocess_inference.py": ("Train", "BatchPreprocess"),
                    "predict.py": ("Train", "Evaluate", "Score"),
-                   "postprocess.py": ("Train", "Evaluate", "Postprocess"),
+                   "postprocess_inference.py": ("Train", "Postprocess"),
+                   "postprocess_test.py": ("Train", "Evaluate"),
+                   "preprocess_test.py": ("Train", "BatchPreprocess"),
                    "drift.py": ("Train", "DriftComparison"),
                    "serve.py": ("Train",)}
-    inference = {"preprocess.py": ("Train", "BatchPreprocess"),
+    inference = {"preprocess_inference.py": ("Train", "BatchPreprocess"),
+                 "preprocess_test.py": ("Train", "BatchPreprocess"),
                  "predict.py": ("Train", "Evaluate", "Score"),
-                 "postprocess.py": ("Train", "Evaluate", "Postprocess"),
+                 "postprocess_inference.py": ("Train", "Postprocess"),
+                 "postprocess_inference_test.py": ("Train", "Evaluate"),
                  "drift.py": ("Train", "DriftComparison")}
     for path in source_files():
         relative = path.relative_to(PACKAGE)
@@ -172,7 +177,7 @@ def pipeline_fingerprints(session, csv_uri="", local_csv=None):
                 or path.name == "definition.json"):
             continue
         steps = digests.keys()
-        if relative == Path("frameworks/autogluon.py"):
+        if relative.parts[0] == "frameworks":
             steps = ("Train", "Evaluate", "Score")
         elif relative.parts[0] == "monitoring":
             # Monitoring code is saved in the trained model's source archive.
@@ -207,8 +212,11 @@ def configure_step_cache(body, revisions, kind, data_source):
             # The final report describes this execution, including cached producers.
             step.pop("CacheConfig", None)
             continue
-        name = ({"GetData": "BatchGetData", "Preprocess": "BatchPreprocess"}.get(step["Name"], step["Name"])
-                if kind == "inference" else step["Name"])
+        names = ({"GetData": "BatchGetData", "Preprocess": "BatchPreprocess"} if kind == "inference" else
+                 {"PreprocessTest": "BatchPreprocess", "PredictTest": "Score",
+                  "PreprocessTestTuned": "BatchPreprocess", "PredictTestTuned": "Score",
+                  "PostprocessTest": "Evaluate", "PostprocessTestTuned": "Evaluate"})
+        name = names.get(step["Name"], step["Name"])
         if name not in revisions or step["Type"] not in {"Processing", "Training"}:
             continue
         # A latest-delivery query has changing external state, not a fixed input.
@@ -225,7 +233,7 @@ def configure_step_cache(body, revisions, kind, data_source):
         # producer, which can belong to an earlier execution after a cache hit.
         replacements = []
         for step in walk_steps(body["Steps"]):
-            if step["Name"] not in {"Evaluate", "EvaluateTuned"}:
+            if step["Name"] not in {"PostprocessTest", "PostprocessTestTuned"}:
                 continue
             output = step["Arguments"]["ProcessingOutputConfig"]["Outputs"][0]
             replacements.append((
@@ -571,8 +579,12 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             body["Parameters"].extend([
                 {"Name": "TrainingMode", "Type": "String",
                  "DefaultValue": "Preliminary models with validation",
+                 "Description": "Preliminary training produces model metadata. Final training requires "
+                                "that metadata in ModelMetadataUri.",
                  "EnumValues": ["Preliminary models with validation", "Final model with all data"]},
-                {"Name": "ModelMetadataUri", "Type": "String", "DefaultValue": "none"},
+                {"Name": "ModelMetadataUri", "Type": "String", "DefaultValue": "none",
+                 "Description": "Required for Final model with all data: the S3 URI of the preliminary "
+                                "run's evaluation/model_metadata.json. Ignored for preliminary training."},
             ])
             for step in walk_steps(body["Steps"]):
                 args = step["Arguments"]
@@ -581,7 +593,6 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                 if step["Name"] in {"Preprocess", "Train", "Tune"}:
                     args.setdefault("Environment", {})["MLOPS_MODEL_METADATA_URI"] = {
                         "Get": "Parameters.ModelMetadataUri"}
-                if step["Name"] in {"Train", "Tune"}:
                     args["Environment"]["MLOPS_TRAINING_SELECTION"] = {"Get": "Parameters.TrainingMode"}
         if kind == "inference":
             configure_approved_inference(body, group, pipeline_source, batch_runtime, region,
@@ -609,6 +620,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                         MLOPS_TRAINING_KMS_KEY=train["OutputDataConfig"].get("KmsKeyId", ""))
                 # Evaluate already depends on Train; registry reads its reported checkpoint_uri.
                 body = replace(body, [({"Get": "Steps.Train.ModelArtifacts.S3ModelArtifacts"}, model_uri)])
+            from .training_files import configure_test_evaluation
+            configure_test_evaluation(body)
         for step in walk_steps(body["Steps"]):
             if step["Type"] != "Processing":
                 continue
@@ -624,7 +637,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             configure_preparation_cache(body, preparation_cache_revision)
         for step in walk_steps(body["Steps"]):
             if step["Type"] == "Processing" and step["Name"] in {
-                    "Evaluate", "EvaluateTuned", "GetData", "Preprocess", "Score", "Postprocess"}:
+                    "PostprocessTest", "PostprocessTestTuned", "GetData", "Preprocess", "Score", "Postprocess"}:
                 if kind == "training" and step["Name"] in {"GetData", "Preprocess"}:
                     continue
                 # All Processing inference code follows the selected mode,
@@ -636,20 +649,19 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                     else model_code_source)
         if kind == "inference":
             configure_monitoring(body, monitoring, namespace, job_role, region, environment, batch_runtime)
-            body["Parameters"].append({
-                "Name": "PredictionAnalysis", "Type": "String",
-                "DefaultValue": "prediction_inference",
-                "EnumValues": ["prediction_inference", "prediction_test"],
-            })
             for step in walk_steps(body["Steps"]):
                 if step["Name"] in {"Preprocess", "Postprocess"}:
-                    step["Arguments"]["Environment"]["MLOPS_ANALYSIS_MODE"] = {
-                        "Get": "Parameters.PredictionAnalysis"}
+                    step["Arguments"]["Environment"]["MLOPS_ANALYSIS_MODE"] = "prediction_inference"
         if kind == "training":
             configure_registration(body, pipeline_source, region)
         configure_execution_records(body, kind, namespace, job_role, region, environment, batch_runtime)
         if step_cache_revisions:
             configure_step_cache(body, step_cache_revisions, kind, data_sources[kind])
+        # Keep the ordinary execution choices above deployment/runtime defaults.
+        first = (["ModelId", "TrainingMode", "ModelMetadataUri"] if kind == "training" else
+                  ["ModelId", "ReferenceExecutionArn", "ModelCodeSource"])
+        order = {name: index for index, name in enumerate(first)}
+        body["Parameters"].sort(key=lambda parameter: order.get(parameter["Name"], len(order)))
         definitions[kind] = flatten_joins(body)
     configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
                        s3_root, environment, infrastructure, region)
@@ -818,7 +830,7 @@ def configure_registration(body, source_uri, region):
         if step["Type"] != "RegisterModel":
             continue
         request = step["Arguments"]
-        evaluation = steps["EvaluateTuned" if step["Name"] == "RegisterTunedModel" else "Evaluate"]
+        evaluation = steps["PostprocessTestTuned" if step["Name"] == "RegisterTunedModel" else "PostprocessTest"]
         args = deepcopy(evaluation["Arguments"])
         args["ProcessingJobName"] = args["ProcessingJobName"].replace("-eval", "-reg")
         args["AppSpecification"]["ContainerEntrypoint"] = [
@@ -837,6 +849,7 @@ def configure_registration(body, source_uri, region):
                 "S3UploadMode": "EndOfJob"}}]
         args["Environment"] = {
             "MODEL_ID": {"Get": "Parameters.ModelId"},
+            "TRAINING_MODE": {"Get": "Parameters.TrainingMode"},
             "MODEL_PACKAGE_GROUP": request["ModelPackageGroupName"],
             "IMAGE_URI": request["InferenceSpecification"]["Containers"][0]["Image"],
             "EVALUATION_URI": report_uri, "REGISTRATION_OUTPUT_URI": output_uri,

@@ -6,18 +6,18 @@ import os
 from pathlib import Path
 from shutil import copyfile, copytree, rmtree, ignore_patterns
 
-from ...frameworks.autogluon import gluonTraining as ModelTraining
-
-from ...storage import training_metadata
+from mlops_models.frameworks import get_framework
+from mlops_models.storage import training_metadata
 
 
 def train_model(data_directory, selection_file, model_dir, output_directory, parameter_path,
-                *, trainer_cls, hyperparameters=None):
+                *, trainer_cls=None, hyperparameters=None):
     """Read settings and optional metadata, train, and retain the new checkpoint/metadata."""
     feature_path, data_path = get_container_input(data_directory, selection_file)
     parameter_path = Path(parameter_path)
     parameters = json.loads(parameter_path.read_text())
     parameters["model_id"] = parameter_path.parent.name
+    framework = parameters.setdefault("framework", "autogluon")
     # Keep metadata loading here, before the model's own training implementation.
     config = training_metadata(parameter_path)
     mode = os.getenv("MLOPS_TRAINING_MODE", "1")
@@ -27,8 +27,12 @@ def train_model(data_directory, selection_file, model_dir, output_directory, par
     if hyperparameters:
         parameters = resolve_trial_parameters(parameters, hyperparameters)
     output = Path(output_directory)
+    trainer_cls = trainer_cls or get_framework(framework)[0]
     trainer = trainer_cls(feature_path, data_path, config, parameters)
     checkpoint, metadata = trainer.train_model(output / "checkpoint", output)
+    metadata = {**metadata, "framework": framework}
+    # Every framework keeps the exact training selection, including customer-specific columns.
+    copyfile(feature_path, Path(checkpoint) / "selected_features.csv")
     return write_container_output(
         checkpoint, metadata, model_dir, output, parameters=parameters,
     )

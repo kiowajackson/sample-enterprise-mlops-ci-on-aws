@@ -3,17 +3,23 @@
 import json
 from pathlib import Path
 
-from ...frameworks.autogluon import gluonPredictor as ModelPredictor
+from mlops_models.frameworks import get_framework
 
 
-def predict_with_model(input_directory, checkpoint_path, output_directory, config, parameter_path):
+def predict_with_model(input_directory, checkpoint_path, output_directory, config, parameter_path,
+                       *, predictor_cls=None):
     """Pass inputs and a writable output directory to the model; retain its files."""
     parameters = json.loads(Path(parameter_path).read_text())
     user_test_data_path, feature_mapping, primary_key = get_container_input(input_directory, config, parameters)
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     # Replace these calls with the customer's prediction code and its own writes.
-    predictor = ModelPredictor(checkpoint_path, config, parameters)
+    if predictor_cls is None:
+        saved_path = Path(checkpoint_path) / "parameters.json"
+        saved = json.loads(saved_path.read_text()) if saved_path.is_file() else parameters
+        framework = config.get("framework", saved.get("framework", "autogluon"))
+        predictor_cls = get_framework(framework)[1]
+    predictor = predictor_cls(checkpoint_path, config, parameters)
     predictor.predict_file(user_test_data_path, feature_mapping, primary_key,
                            output_directory=output_directory)
     return write_container_output(output_directory)
