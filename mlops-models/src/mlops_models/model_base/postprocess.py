@@ -1,11 +1,25 @@
 """Read scoring inputs and prediction files, run analysis, and publish the result."""
 
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import tarfile
 from tempfile import TemporaryDirectory
 
 import pandas as pd
+
+
+def prediction_test(data_directory, selection_file, prediction_directory, output_directory,
+                    model_directory, *, parameter_path=None):
+    """Read test inputs, run the model's analysis and publish its output files."""
+    data_path, selection_path, predictions, output, parameters = get_container_input(
+        data_directory, selection_file, prediction_directory, output_directory, model_directory)
+    analyze_predictions(data_path, selection_path, predictions, output, parameters)
+    return write_test_output(
+        output, data_path=data_path, selection_file=selection_path, predictions=predictions,
+        parameters=parameters, model_directory=model_directory, parameter_path=parameter_path)
 
 
 def prediction_inference(data_directory, selection_file, prediction_directory, output_directory,
@@ -16,7 +30,7 @@ def prediction_inference(data_directory, selection_file, prediction_directory, o
             data_directory, selection_file, prediction_directory, output_directory, model_directory,
             converted_directory=converted_directory, chunk_rows=chunk_rows)
         analyze_predictions(data_path, selection_path, predictions, output, parameters)
-        return write_container_output(
+        return write_inference_output(
             output, data_path=data_path, selection_file=selection_path,
             predictions=predictions, parameters=parameters)
 
@@ -82,7 +96,72 @@ def convert_transform_predictions(source, destination, primary_key, chunk_rows):
     result[[primary_key]].to_csv(destination / "messaging.csv", index=False)
 
 
-def write_container_output(output, *, data_path, selection_file, predictions, parameters):
+def write_test_output(output, *, data_path, selection_file, predictions, parameters,
+                           model_directory, parameter_path=None):
+    """Publish analysis, quality-gate results and the model files required by Registry."""
+    output = Path(output)
+    files = sorted(path for path in output.rglob("*") if path.is_file())
+    if not files:
+        raise FileNotFoundError(f"Prediction analysis wrote no files under: {output}")
+    for path in files:
+        print(f"Analysis output: {path.relative_to(output).as_posix()} -> {path}", flush=True)
+    # Metrics come only from this test analysis, never from the training report.
+    report_path = output / "evaluation.json"
+    report = json.loads(report_path.read_text()) if report_path.is_file() else {}
+    policy = json.loads(Path(parameter_path).read_text()) if parameter_path else parameters
+    model_id = Path(parameter_path).parent.name if parameter_path else parameters["model_id"]
+    report.setdefault("model_id", model_id)
+    report.setdefault("task", policy["task_type"])
+    report.setdefault("metrics", {})
+    report.setdefault("data_usage", "prediction_test")
+    report["evaluation_mode"] = "prediction_test"
+    if report["model_id"] != model_id or report["task"] != policy["task_type"]:
+        raise ValueError("Test report model_id/task differs from the selected model.")
+    if not isinstance(report["metrics"], dict) or any(
+        isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+        for v in report["metrics"].values()
+    ):
+        raise ValueError("Test metrics must be a dictionary of finite numbers.")
+    if report["metrics"] and not report.get("data_usage"):
+        raise ValueError("Test metrics must identify their data_usage.")
+    checks = []
+    for metric, limits in policy.get("quality_gate", {}).items():
+        if not limits or set(limits) - {"min", "max"}:
+            raise ValueError(f"Set min and/or max for quality_gate.{metric}.")
+        value = report["metrics"].get(metric)
+        passed = value is not None and ("min" not in limits or value >= limits["min"]) and (
+            "max" not in limits or value <= limits["max"])
+        checks.append({"metric": metric, "value": value, "limits": limits, "passed": passed})
+    report["quality"] = {"configured": bool(checks), "passed": all(c["passed"] for c in checks),
+                         "checks": checks}
+
+    # Copy original model files without reformatting; Registry verifies the metadata hash.
+    metadata = read_model_file(model_directory, "model_metadata.json")
+    json.loads(metadata)
+    (output / "model_metadata.json").write_bytes(metadata)
+    for source, destination in (("parameters.json", "parameters.json"),
+                                ("_execution.json", "training_execution.json")):
+        content = read_model_file(model_directory, source, optional=True)
+        if content is not None:
+            (output / destination).write_bytes(content)
+    report["effective_parameters_available"] = (output / "parameters.json").is_file()
+    identity = json.loads(read_model_file(model_directory, "code/source.json", optional=True) or b"{}")
+    report.update(
+        checkpoint_uri=os.getenv("MLOPS_MODEL_ARTIFACT_URI", os.getenv("CHECKPOINT_URI", str(model_directory))),
+        model_metadata_sha256=hashlib.sha256(metadata).hexdigest(),
+        model_source_commit=identity.get("commit", "unknown"),
+        model_source_dirty=str(identity.get("dirty", True)).lower(),
+        model_source_uri=identity.get("uri", ""), model_source_digest=identity.get("sha256", ""),
+        evaluation_source_commit=os.getenv("SOURCE_COMMIT", "unknown"))
+    report_path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    # This records artifact locations for the execution, not customer analysis metrics.
+    from mlops_models.pipelines.inspect import write_inference_report
+    write_inference_report(output, data_path=data_path, selection_file=selection_file,
+                           predictions=predictions, config=parameters)
+    return output
+
+
+def write_inference_output(output, *, data_path, selection_file, predictions, parameters):
     """Check analysis files and write run.json; the loader uploads the files unchanged."""
     output = Path(output)
     files = sorted(path for path in output.rglob("*") if path.is_file())
@@ -97,8 +176,22 @@ def write_container_output(output, *, data_path, selection_file, predictions, pa
     return output
 
 
+def read_model_file(model_directory, name, *, optional=False):
+    """Read one packaged file, supporting the extracted directory or a local archive."""
+    model = Path(model_directory)
+    try:
+        if model.is_file():
+            with tarfile.open(model) as archive:
+                return archive.extractfile(name).read()
+        return (model / name).read_bytes()
+    except (FileNotFoundError, KeyError):
+        if not optional:
+            raise
+        return None
+
+
 def analyze_predictions(data_path, selection_file, predictions, output_directory, parameters):
-    """Replace this demo with prediction analysis using explicit input and output paths.
+    """Replace this example with customer test analysis using explicit input and output paths.
 
     predictions maps relative CSV names to Paths, for example:
     {"output/predictions.csv": Path(...), "output/messaging_final.csv": Path(...)}.
@@ -113,7 +206,7 @@ def analyze_predictions(data_path, selection_file, predictions, output_directory
     if len(matches) != 1:
         raise ValueError("Example analysis needs exactly one messaging_final.csv at any depth; "
                          f"found {len(matches)}. Available CSVs: {list(predictions)}. "
-                         "Adapt prediction_inference() to select the files required by your analysis.")
+                         "Adapt prediction_test() to select the files required by your analysis.")
     df = pd.read_csv(predictions[matches[0]], dtype={config["primary_key"]: str},
                      keep_default_na=False, na_values=["", r"\N"])
     task = config["task_type"]

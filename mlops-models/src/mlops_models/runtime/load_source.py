@@ -226,7 +226,7 @@ def main():
             # code or the separately uploaded pipeline code before importing modules.
             checkpoint = None
             metadata_binding = None
-            if selected.step in {"get-inference-data", "preprocess-test", "postprocess-test", "preprocess", "score", "predict", "postprocess", "drift"}:
+            if selected.step in {"get-test-data", "get-inference-data", "preprocess-test", "postprocess-test", "preprocess", "score", "predict", "postprocess", "drift"}:
                 archive_path = selected.model_dir or "/opt/ml/processing/model/model.tar.gz"
                 checkpoint = Path(work) / "model"
                 with tarfile.open(archive_path, "r:gz") as archive:

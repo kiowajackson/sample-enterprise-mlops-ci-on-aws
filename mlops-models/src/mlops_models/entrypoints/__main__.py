@@ -24,7 +24,7 @@ def parse_job_arguments():
     # Read the explicit command and any path overrides.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("step", choices=[
-        "get-data", "get-inference-data", "select-features", "preprocess-training", "train", "validate-package", "preprocess", "preprocess-test", "predict", "postprocess", "postprocess-test", "drift", "serve", "score", "resolve-model",
+        "get-data", "get-test-data", "get-inference-data", "select-features", "preprocess-training", "train", "validate-package", "preprocess", "preprocess-test", "predict", "postprocess", "postprocess-test", "drift", "serve", "score", "resolve-model",
     ])
     parser.add_argument("--model", default=os.getenv("MODEL_ID"), required=not os.getenv("MODEL_ID"))
     parser.add_argument("--input")
@@ -86,9 +86,10 @@ def dispatch_pipeline_step(args):
     if args.step == "get-data":
         from . import get_data
         return get_data.execute(args.model, args.input, args.output)
-    if args.step == "get-inference-data":
+    if args.step in {"get-test-data", "get-inference-data"}:
         from . import get_data
-        return get_data.execute(args.model, args.input, args.output, model_dir=args.model_dir)
+        return get_data.execute(args.model, args.input, args.output, model_dir=args.model_dir,
+                                kind="testing" if args.step == "get-test-data" else "inference")
     if args.step == "select-features":
         from . import feature_selection
         return feature_selection.execute(args.model, args.input, args.output)

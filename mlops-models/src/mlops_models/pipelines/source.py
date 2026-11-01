@@ -1,4 +1,4 @@
-"""Publish shared training and approved-model inference pipelines from supplied source."""
+"""Publish training, testing and inference pipelines from supplied source."""
 
 from copy import deepcopy
 import hashlib
@@ -129,7 +129,9 @@ def preparation_fingerprint(session, csv_uri, local_csv=None):
                 and relative != Path("pipelines/tracking.py") or "inference" in relative.parts):
             continue
         steps = digests.keys()
-        if relative.parent == Path("entrypoints"):
+        if relative.parent == Path("model_base") and path.name in {"get_data.py", "preprocess.py", "postprocess.py"}:
+            steps = {"get_data.py": ("GetData",), "preprocess.py": ("Preprocess",), "postprocess.py": ()}[path.name]
+        elif relative.parent == Path("entrypoints"):
             if path.name in {"train.py", "evaluate.py", "predict.py", "postprocess.py", "drift.py",
                              "preprocess_inference.py", "preprocess_test.py", "postprocess_inference.py",
                              "postprocess_test.py", "serve.py"}:
@@ -150,7 +152,7 @@ def preparation_fingerprint(session, csv_uri, local_csv=None):
     return {step: value.hexdigest() for step, value in digests.items()}
 
 
-def pipeline_fingerprints(session, csv_uri="", local_csv=None):
+def pipeline_fingerprints(session, csv_uri="", local_csv=None, *, test_csv_uri="", inference_csv_uri=""):
     """Identify the source consumed by each expensive step, independently."""
     revisions = preparation_fingerprint(session, csv_uri, local_csv)
     digests = {name: hashlib.sha256() for name in
@@ -185,6 +187,10 @@ def pipeline_fingerprints(session, csv_uri="", local_csv=None):
         elif relative == Path("pipelines/inspect.py"):
             # Inference reports run from the source saved in the trained model.
             steps = ("Train", "Postprocess", "DriftComparison")
+        elif relative.name == "preprocess.py" and relative.parent == Path("model_base"):
+            steps = ("Train", "BatchPreprocess")
+        elif relative.name == "postprocess.py" and relative.parent == Path("model_base"):
+            steps = ("Train", "Evaluate", "Postprocess")
         elif relative.parent == Path("entrypoints") and path.name in entrypoints:
             steps = entrypoints[path.name]
         elif relative.parent == Path("entrypoints") and path.name in {
@@ -200,7 +206,10 @@ def pipeline_fingerprints(session, csv_uri="", local_csv=None):
             digests[step].update(content)
     # The inference CSV can share the notebook's uploaded input. Changed bytes
     # must invalidate its first consumer even when its S3 URI stays the same.
-    revisions["BatchGetData"] = revisions["GetData"]
+    revisions["BatchGetData"] = (preparation_fingerprint(session, inference_csv_uri)["GetData"]
+                                  if inference_csv_uri else revisions["GetData"])
+    revisions["TestGetData"] = (preparation_fingerprint(session, test_csv_uri)["GetData"]
+                                if test_csv_uri else revisions["GetData"])
     revisions.update({step: digest.hexdigest() for step, digest in digests.items()})
     return revisions
 
@@ -212,50 +221,25 @@ def configure_step_cache(body, revisions, kind, data_source):
             # The final report describes this execution, including cached producers.
             step.pop("CacheConfig", None)
             continue
-        names = ({"GetData": "BatchGetData", "Preprocess": "BatchPreprocess"} if kind == "inference" else
+        names = ({"GetData": "BatchGetData", "Preprocess": "BatchPreprocess"} if kind in {"testing", "inference"} else
                  {"PreprocessTest": "BatchPreprocess", "PredictTest": "Score",
                   "PreprocessTestTuned": "BatchPreprocess", "PredictTestTuned": "Score",
                   "PostprocessTest": "Evaluate", "PostprocessTestTuned": "Evaluate"})
         name = names.get(step["Name"], step["Name"])
+        if kind == "testing" and name == "BatchGetData":
+            name = "TestGetData"
+        if kind == "testing" and name == "Postprocess":
+            name = "Evaluate"
         if name not in revisions or step["Type"] not in {"Processing", "Training"}:
             continue
         # A latest-delivery query has changing external state, not a fixed input.
-        if data_source == "feature_store" and name in {"GetData", "BatchGetData"}:
+        if data_source == "feature_store" and name in {"GetData", "BatchGetData", "TestGetData"}:
             continue
         environment = step["Arguments"].setdefault("Environment", {})
         for key in ("PIPELINE_EXECUTION_ID", "SOURCE_COMMIT", "SOURCE_DIRTY"):
             environment.pop(key, None)
         environment["MLOPS_STEP_REVISION"] = revisions[name]
         step["CacheConfig"] = {"Enabled": True, "ExpireAfter": "PT24H"}
-
-    if kind == "training":
-        # Both quality gates and registration must read the actual Evaluate
-        # producer, which can belong to an earlier execution after a cache hit.
-        replacements = []
-        for step in walk_steps(body["Steps"]):
-            if step["Name"] not in {"PostprocessTest", "PostprocessTestTuned"}:
-                continue
-            output = step["Arguments"]["ProcessingOutputConfig"]["Outputs"][0]
-            replacements.append((
-                join(output["S3Output"]["S3Uri"], "evaluation.json"),
-                join({"Get": f"Steps.{step['Name']}.ProcessingOutputConfig.Outputs['evaluation'].S3Output.S3Uri"},
-                     "evaluation.json"),
-            ))
-            template_uri = deepcopy(output["S3Output"]["S3Uri"])
-            template_uri["Std:Join"]["Values"][-1] += "/evaluation.json"
-            replacements.append((template_uri, replacements[-1][1]))
-        # Templates sometimes express a filename inside the last path segment.
-        body.update(replace(flatten_joins(body), [(flatten_joins(before), flatten_joins(after))
-                                                for before, after in replacements]))
-        for step in walk_steps(body["Steps"]):
-            if step["Type"] != "RegisterModel":
-                continue
-            args = step["Arguments"]
-            report_uri = args["ModelMetrics"]["ModelQuality"]["Statistics"]["S3Uri"]
-            args["MetadataProperties"]["CommitId"] = {
-                "Std:JsonGet": {"S3Uri": report_uri, "Path": "model_source_commit"}}
-            args["CustomerMetadataProperties"]["SourceDirty"] = {
-                "Std:JsonGet": {"S3Uri": report_uri, "Path": "model_source_dirty"}}
 
 
 def configure_cache_sources(definitions):
@@ -328,7 +312,7 @@ def publish_cache_sources(session, s3_root, source_uri, bindings):
     for binding in bindings:
         kind, step, revision = (binding[name] for name in ("kind", "step", "revision"))
         expected_path = f"cache-sources-v1/{kind}/{step}/{revision}.json"
-        if (kind not in {"training", "inference"} or not re.fullmatch(r"[A-Za-z0-9_-]+", step)
+        if (kind not in {"training", "testing", "inference"} or not re.fullmatch(r"[A-Za-z0-9_-]+", step)
                 or not re.fullmatch(r"[0-9a-f]{64}", revision) or binding["path"] != expected_path):
             raise ValueError("Invalid cached source binding.")
         index_uri = f"{root}/source/cache-bindings-v1/{kind}/{step}/{revision}.json"
@@ -415,8 +399,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                       data_source="feature_store", inference_data_source=None, csv_input_uri="", preparation_cache_revision="",
                       model_package_group="", environment="dev", registry_group_prefix="",
                       include_hpo=False, step_cache_revisions=None, model_code_source=None,
-                      tracking=None, monitoring=None):
-    """Render training registration and inference from an approved Registry version."""
+                      tracking=None, monitoring=None, test_csv_input_uri="", inference_csv_input_uri=""):
+    """Render training registration plus testing and inference from approved Registry versions."""
     model_code_source = model_code_source or (
         "pipeline" if identity["mode"] == "direct-deploy" and batch_runtime != "transform" else "artifact")
     if model_code_source not in {"pipeline", "artifact"}:
@@ -430,7 +414,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             region=region, models=models, infrastructure=infrastructure,
             feature_store_config_uri=feature_store_config_uri, universe_data_root=universe_data_root,
             data_source=data_source, inference_data_source=inference_data_source,
-            csv_input_uri=csv_input_uri, preparation_cache_revision=preparation_cache_revision,
+            csv_input_uri=csv_input_uri, test_csv_input_uri=test_csv_input_uri,
+            inference_csv_input_uri=inference_csv_input_uri, preparation_cache_revision=preparation_cache_revision,
             model_package_group=model_package_group, environment=environment,
             registry_group_prefix=registry_group_prefix, include_hpo=include_hpo,
             step_cache_revisions=step_cache_revisions,
@@ -446,7 +431,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
         configure_tracking(definitions, tracking, namespace, job_role, image, source_uri,
                            s3_root, environment, infrastructure, region)
         return definitions
-    data_sources = {"training": data_source, "inference": inference_data_source or data_source}
+    data_sources = {"training": data_source, "testing": inference_data_source or data_source,
+                    "inference": inference_data_source or data_source}
     if any(value not in {"feature_store", "csv_direct"} for value in data_sources.values()):
         raise ValueError("Choose feature_store or csv_direct for each pipeline data source.")
     if preparation_cache_revision and data_source != "csv_direct":
@@ -459,6 +445,11 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             raise ValueError("csv_direct needs the S3 URI of one flat .csv file.")
         if universe_data_root and "feature_store" not in data_sources.values():
             raise ValueError("csv_direct uses labels in the flat CSV; leave universe_data_root empty.")
+    for uri in (test_csv_input_uri, inference_csv_input_uri):
+        if uri:
+            s3_location(uri)
+            if not uri.endswith(".csv"):
+                raise ValueError("Separate test/inference inputs must be S3 CSV objects.")
     validate_namespace(namespace)
     validate_namespace(environment)
     data_prefix({"prefix": s3_location(s3_root)[1]})
@@ -497,7 +488,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
         group = join(registry_group_prefix, group, on="")
     template_model = models[0] if len(models) == 1 else "shared"
     definitions = {}
-    for kind in ("training", "inference"):
+    for kind in ("training", "testing", "inference"):
         body = load_definition(
             template_model, kind, namespace=namespace, role=job_role, image=image,
             model_package_group=namespace + "-" + template_model,
@@ -505,7 +496,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             output_uri=s3_root.rstrip("/") + "/models",
             source_commit=identity["commit"], source_dirty=str(identity["dirty"]).lower(),
             source_repository="", image_digest=image.split("@")[-1],
-            definition_path=PACKAGE / "model_base" / kind / "definition.json",
+            definition_path=PACKAGE / "model_base" / ("inference" if kind == "testing" else kind) / "definition.json",
             tuning_config=configs[0], include_hpo=include_hpo,
         )
         body = replace(body, [
@@ -527,7 +518,8 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             # Keep CI's deployment helpers fixed when starting an execution.
             body["Parameters"][1]["EnumValues"] = [source_uri]
         body["Metadata"].update(SourceUri=source_uri, DeployMode=identity["mode"],
-                                Release=identity["name"], BatchRuntime=batch_runtime, DataSource=data_sources[kind],
+                                Release=identity["name"], BatchRuntime="processing" if kind == "testing" else batch_runtime, DataSource=data_sources[kind],
+                                PipelineKind=kind,
                                 RegistryMode="model_registry", Environment=environment,
                                 ModelCodeSource=model_code_source,
                                 HpoEnabled=str(include_hpo).lower(),
@@ -584,7 +576,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                  "EnumValues": ["Preliminary models with validation", "Final model with all data"]},
                 {"Name": "ModelMetadataUri", "Type": "String", "DefaultValue": "none",
                  "Description": "Required for Final model with all data: the S3 URI of the preliminary "
-                                "run's evaluation/model_metadata.json. Ignored for preliminary training."},
+                                "run's reports/registry/model_metadata.json. Ignored for preliminary training."},
             ])
             for step in walk_steps(body["Steps"]):
                 args = step["Arguments"]
@@ -594,13 +586,15 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                     args.setdefault("Environment", {})["MLOPS_MODEL_METADATA_URI"] = {
                         "Get": "Parameters.ModelMetadataUri"}
                     args["Environment"]["MLOPS_TRAINING_SELECTION"] = {"Get": "Parameters.TrainingMode"}
-        if kind == "inference":
-            configure_approved_inference(body, group, pipeline_source, batch_runtime, region,
+        if kind in {"testing", "inference"}:
+            configure_approved_inference(body, group, pipeline_source,
+                                         "processing" if kind == "testing" else batch_runtime, region,
                                          model_code_source=model_code_source)
         if data_sources[kind] == "feature_store":
             configure_feature_store(body, feature_store_config_uri, universe_data_root, region)
         else:
-            configure_csv_direct(body, csv_input_uri, region)
+            configure_csv_direct(body, (test_csv_input_uri if kind == "testing" else
+                                      (inference_csv_input_uri or csv_input_uri) if kind == "inference" else csv_input_uri), region)
         apply_job_settings(body, infrastructure or {})
         if kind == "training":
             train = next(step for step in walk_steps(body["Steps"]) if step["Name"] == "Train")["Arguments"]
@@ -618,10 +612,9 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                         MLOPS_TRAINING_MODEL_URI=model_uri,
                         MLOPS_TRAINING_REPORTS_URI=join(run, "reports/training/output.tar.gz"),
                         MLOPS_TRAINING_KMS_KEY=train["OutputDataConfig"].get("KmsKeyId", ""))
-                # Evaluate already depends on Train; registry reads its reported checkpoint_uri.
+                # Registration reads the exact model artifact produced by this training step.
                 body = replace(body, [({"Get": "Steps.Train.ModelArtifacts.S3ModelArtifacts"}, model_uri)])
-            from .training_files import configure_test_evaluation
-            configure_test_evaluation(body)
+
         for step in walk_steps(body["Steps"]):
             if step["Type"] != "Processing":
                 continue
@@ -637,7 +630,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
             configure_preparation_cache(body, preparation_cache_revision)
         for step in walk_steps(body["Steps"]):
             if step["Type"] == "Processing" and step["Name"] in {
-                    "PostprocessTest", "PostprocessTestTuned", "GetData", "Preprocess", "Score", "Postprocess"}:
+                    "GetData", "Preprocess", "Score", "Postprocess"}:
                 if kind == "training" and step["Name"] in {"GetData", "Preprocess"}:
                     continue
                 # All Processing inference code follows the selected mode,
@@ -654,7 +647,13 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                     step["Arguments"]["Environment"]["MLOPS_ANALYSIS_MODE"] = "prediction_inference"
         if kind == "training":
             configure_registration(body, pipeline_source, region)
-        configure_execution_records(body, kind, namespace, job_role, region, environment, batch_runtime)
+        if kind == "testing":
+            from .training_files import configure_testing
+            configure_testing(body)
+        from .training_files import configure_output_roots
+        configure_output_roots(body)
+        configure_execution_records(body, kind, namespace, job_role, region, environment,
+                                    "processing" if kind == "testing" else batch_runtime)
         if step_cache_revisions:
             configure_step_cache(body, step_cache_revisions, kind, data_sources[kind])
         # Keep the ordinary execution choices above deployment/runtime defaults.
@@ -678,8 +677,8 @@ def configure_execution_records(body, kind, namespace, job_role, region, environ
         args = step["Arguments"]
         args.setdefault("Environment", {}).update(
             MLOPS_PIPELINE_ARN=pipeline, MLOPS_STEP_NAME=step["Name"], MLOPS_ENVIRONMENT=environment)
-        if (kind == "inference" and batch_runtime == "processing" and step["Type"] == "Processing"
-                and args["AppSpecification"]["ContainerEntrypoint"][-1] in {"postprocess", "drift"}):
+        if (kind in {"testing", "inference"} and batch_runtime == "processing" and step["Type"] == "Processing"
+                and args["AppSpecification"]["ContainerEntrypoint"][-1] in {"postprocess", "postprocess-test", "drift"}):
             resolver = next(s for s in body["Steps"] if s["Name"] == "ResolveModel")
             decision_uri = resolver["Arguments"]["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
             args["Environment"].update(
@@ -824,50 +823,43 @@ def combine_inference_runtimes(processing, transform):
 
 
 def configure_registration(body, source_uri, region):
-    """Register through the API without granting native RegisterModel group-creation rights."""
-    steps = {step["Name"]: step for step in walk_steps(body["Steps"])}
-    for step in steps.values():
+    """Register the saved training artifact; test quality belongs to the testing pipeline."""
+    preparation = next(s for s in body["Steps"] if s["Name"] == "GetData")
+    for step in walk_steps(body["Steps"]):
         if step["Type"] != "RegisterModel":
             continue
         request = step["Arguments"]
-        evaluation = steps["PostprocessTestTuned" if step["Name"] == "RegisterTunedModel" else "PostprocessTest"]
-        args = deepcopy(evaluation["Arguments"])
-        args["ProcessingJobName"] = args["ProcessingJobName"].replace("-eval", "-reg")
-        args["AppSpecification"]["ContainerEntrypoint"] = [
-            "python", "/opt/ml/processing/source/mlops_models/registry/model_package.py"]
-        args["AppSpecification"].pop("ContainerArguments", None)
-        report_uri = request["ModelMetrics"]["ModelQuality"]["Statistics"]["S3Uri"]
+        args = deepcopy(preparation["Arguments"])
+        args["ProcessingJobName"] = args["ProcessingJobName"].removesuffix("-get") + ("-reg-tuned" if step["Name"] == "RegisterTunedModel" else "-reg")
+        args["AppSpecification"] = {"ImageUri": args["AppSpecification"]["ImageUri"], "ContainerEntrypoint": [
+            "python", "/opt/ml/processing/source/mlops_models/registry/model_package.py"]}
+        checkpoint = request["InferenceSpecification"]["Containers"][0]["ModelDataUrl"]
         output_uri = join(request["CustomerMetadataProperties"]["RunArtifacts"], "reports/registry")
-        args["ProcessingInputs"] = [source_input(source_uri), {
-            "InputName": "evaluation", "S3Input": {
-                "S3Uri": report_uri, "LocalPath": "/opt/ml/processing/evaluation",
-                "S3DataType": "S3Prefix", "S3InputMode": "File",
-                "S3DataDistributionType": "FullyReplicated"}}]
-        args["ProcessingOutputConfig"]["Outputs"] = [{
-            "OutputName": "registration", "AppManaged": True, "S3Output": {
-                "S3Uri": output_uri, "LocalPath": "/opt/ml/processing/output",
-                "S3UploadMode": "EndOfJob"}}]
+        args["ProcessingInputs"] = [source_input(source_uri), {"InputName": "model", "S3Input": {
+            "S3Uri": checkpoint, "LocalPath": "/opt/ml/processing/model", "S3DataType": "S3Prefix",
+            "S3InputMode": "File", "S3DataDistributionType": "FullyReplicated"}}]
+        args["ProcessingOutputConfig"]["Outputs"] = [{"OutputName": "registration", "AppManaged": True,
+            "S3Output": {"S3Uri": output_uri, "LocalPath": "/opt/ml/processing/output", "S3UploadMode": "EndOfJob"}}]
         args["Environment"] = {
-            "MODEL_ID": {"Get": "Parameters.ModelId"},
-            "TRAINING_MODE": {"Get": "Parameters.TrainingMode"},
+            "MODEL_ID": {"Get": "Parameters.ModelId"}, "TRAINING_MODE": {"Get": "Parameters.TrainingMode"},
             "MODEL_PACKAGE_GROUP": request["ModelPackageGroupName"],
             "IMAGE_URI": request["InferenceSpecification"]["Containers"][0]["Image"],
-            "EVALUATION_URI": report_uri, "REGISTRATION_OUTPUT_URI": output_uri,
+            "CHECKPOINT_URI": checkpoint, "REGISTRATION_OUTPUT_URI": output_uri,
             "SOURCE_URI": source_uri, "DEPLOY_MODE": body["Metadata"]["DeployMode"],
             "DEPLOYMENT_NAMESPACE": body["Metadata"]["DeploymentNamespace"],
             "ENVIRONMENT": body["Metadata"]["Environment"],
             "PIPELINE_EXECUTION_ARN": {"Get": "Execution.PipelineExecutionArn"},
             "AWS_DEFAULT_REGION": region, "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": "/opt/ml/processing/source", "PYTHONSAFEPATH": "1",
-            "S3_KMS_KEY": args["ProcessingOutputConfig"].get("KmsKeyId", ""),
-        }
+            "S3_KMS_KEY": args["ProcessingOutputConfig"].get("KmsKeyId", "")}
         step.update(Type="Processing", Arguments=args)
 
 
 def configure_csv_direct(body, csv_uri, region):
     """Mount one flat CSV for either pipeline's GetData step."""
     body["Parameters"] = [p for p in body["Parameters"] if p["Name"] != "InputDataRoot"]
-    body["Parameters"].append({"Name": "CsvInputUri", "Type": "String", "DefaultValue": csv_uri})
+    body["Parameters"].append({"Name": "CsvInputUri", "Type": "String",
+                               **({"DefaultValue": csv_uri} if csv_uri else {})})
     for step in walk_steps(body["Steps"]):
         if step["Type"] != "Processing":
             continue
