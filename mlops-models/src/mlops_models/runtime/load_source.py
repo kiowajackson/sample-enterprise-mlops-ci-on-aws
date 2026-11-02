@@ -364,8 +364,11 @@ def main():
                 scratch.mkdir()
                 # Only output paths change; SageMaker's input mounts stay intact.
                 sys.argv.extend(["--output", str(scratch)])
+                # Model code reading the environment must use the same writable folder.
+                os.environ["SM_OUTPUT_DATA_DIR"] = str(scratch)
                 print(json.dumps({"event": "processing_output_directory", "step": selected.step,
-                                  "configured": str(output_dir), "writable": str(scratch)}), flush=True)
+                                  "configured": str(output_dir), "writable": str(scratch),
+                                  "SM_OUTPUT_DATA_DIR": os.environ["SM_OUTPUT_DATA_DIR"]}), flush=True)
 
             # Inference preprocessing also needs the saved model's selected-feature CSV.
             if selected.step in {"preprocess", "preprocess-test"}:
@@ -460,6 +463,12 @@ def main():
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+        elif output_config is not None:
+            value = original_environment["SM_OUTPUT_DATA_DIR"]
+            if value is None:
+                os.environ.pop("SM_OUTPUT_DATA_DIR", None)
+            else:
+                os.environ["SM_OUTPUT_DATA_DIR"] = value
         if original_model_dir is None:
             os.environ.pop("MLOPS_MODEL_DIR", None)
         else:
