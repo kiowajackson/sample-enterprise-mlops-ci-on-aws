@@ -203,8 +203,10 @@ def analyze_predictions(data_path, selection_file, predictions, output_directory
     config = parameters
     # Only this example analysis chooses a particular input; the reader accepts all CSVs.
     matches = [name for name in predictions if Path(name).name.lower() == "messaging_final.csv"]
+    if not matches:
+        matches = [name for name in predictions if Path(name).name.lower() == "predictions.csv"]
     if len(matches) != 1:
-        raise ValueError("Example analysis needs exactly one messaging_final.csv at any depth; "
+        raise ValueError("Example analysis needs exactly one predictions.csv (or legacy messaging_final.csv); "
                          f"found {len(matches)}. Available CSVs: {list(predictions)}. "
                          "Adapt prediction_test() to select the files required by your analysis.")
     df = pd.read_csv(predictions[matches[0]], dtype={config["primary_key"]: str},
