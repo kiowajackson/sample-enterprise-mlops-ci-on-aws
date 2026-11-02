@@ -582,7 +582,7 @@ def build_definitions(namespace, job_role, image, s3_root, source_uri, identity,
                 args = step["Arguments"]
                 if step["Type"] == "Tuning":
                     args = args["TrainingJobDefinition"]
-                if step["Name"] in {"Preprocess", "Train", "Tune"}:
+                if step["Name"] in {"FeatureSelection", "Preprocess", "Train", "Tune"}:
                     args.setdefault("Environment", {})["MLOPS_MODEL_METADATA_URI"] = {
                         "Get": "Parameters.ModelMetadataUri"}
                     args["Environment"]["MLOPS_TRAINING_SELECTION"] = {"Get": "Parameters.TrainingMode"}
