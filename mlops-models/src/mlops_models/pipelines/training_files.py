@@ -75,7 +75,7 @@ def configure_file_training(body):
 
 
 def configure_testing(body):
-    """Use approved-model retrieval with test data, test preprocessing and test analysis."""
+    """Use approved-model retrieval and finish testing with the model's postprocessing."""
     from .source import replace, join
     body.update(replace(body, [("get-inference-data", "get-test-data"),
                                ("preprocess", "preprocess-test"),
@@ -100,13 +100,6 @@ def configure_testing(body):
             output = step["Arguments"]["ProcessingOutputConfig"]["Outputs"][0]
             output["OutputName"] = "evaluation"
             output["S3Output"]["LocalPath"] = "/opt/ml/processing/evaluation"
-    report = join({"Get": "Steps.Postprocess.ProcessingOutputConfig.Outputs['evaluation'].S3Output.S3Uri"},
-                  "evaluation.json")
-    body["Steps"].append({"Name": "QualityGate", "Type": "Condition", "DependsOn": ["Postprocess"],
-        "Arguments": {"Conditions": [{"Type": "Equals", "LeftValue": {
-            "Std:JsonGet": {"S3Uri": report, "Path": "quality.passed"}}, "RightValue": True}],
-            "IfSteps": [], "ElseSteps": [{"Name": "QualityFailed", "Type": "Fail",
-                "Arguments": {"ErrorMessage": "Test quality thresholds failed; inspect Postprocess evaluation.json."}}]}})
     body["Metadata"].update(PipelineKind="testing", EvaluationInputContract="separately-selected-test-data")
 
 

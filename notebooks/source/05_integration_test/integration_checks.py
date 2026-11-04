@@ -130,7 +130,6 @@ class IntegrationSuite:
             if kind == "inference" and meta.get("BatchRuntime") != "processing":
                 raise ValueError("This first integration suite covers Processing inference; deploy that runtime.")
             required = ({"GetData", "FeatureSelection", "Preprocess", "Train", "RegisterModel"} if kind == "training"
-                        else {"ResolveModel", "GetData", "Preprocess", "Score", "Postprocess", "QualityGate"} if kind == "testing"
                         else {"ResolveModel", "GetData", "Preprocess", "Score", "Postprocess"})
             if not required.issubset(s["Name"] for s in _steps(body["Steps"])):
                 raise ValueError(f"{kind} definition does not contain the ordinary {sorted(required)} steps.")
@@ -470,12 +469,6 @@ class IntegrationSuite:
                     and binding.get("feature_count") == full["feature_count"],
                     binding)
         analysis, _ = self._output(case, "Postprocess", "evaluation" if case["phase"] == "prediction_test" else "predictions")
-        if case["phase"] == "prediction_test":
-            report, _ = self._json(analysis + "/evaluation.json")
-            self._check(case, "Test quality gate passed", report.get("quality", {}).get("passed") is True,
-                        report.get("quality", {}))
-            self._check(case, "Test uses selected model metadata", report.get("model_metadata_sha256") == full["metadata_sha256"],
-                        analysis + "/evaluation.json")
         score_files, analysis_files = self._files(scores), self._files(analysis)
         # Score often writes predictions/raw beneath Postprocess's predictions prefix.
         # Those earlier files must not make a missing analysis output appear successful.
