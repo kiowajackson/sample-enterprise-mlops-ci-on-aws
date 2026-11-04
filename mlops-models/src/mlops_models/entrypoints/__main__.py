@@ -31,6 +31,8 @@ def parse_job_arguments():
     parser.add_argument("--output")
     parser.add_argument("--selection")
     parser.add_argument("--data", default="/opt/ml/processing/raw")
+    parser.add_argument("--train-data", default=None)
+    parser.add_argument("--resolve-training-data", action="store_true")
     parser.add_argument("--model-dir", default=None)
     parser.add_argument("--chunk-rows", type=int, default=10000)
     parser.add_argument("--analysis-mode", choices=["prediction_inference", "prediction_test"],
@@ -59,7 +61,8 @@ def dispatch_pipeline_step(args):
             namespace=os.environ["DEPLOYMENT_NAMESPACE"], model_id=args.model,
             environment=os.environ["ENVIRONMENT"], package_arn=args.model_package,
             metadata_uri=os.getenv("MLOPS_MODEL_METADATA_URI", ""),
-            metadata_checkpoint_uri=os.getenv("MLOPS_METADATA_CHECKPOINT_URI", ""))
+            metadata_checkpoint_uri=os.getenv("MLOPS_METADATA_CHECKPOINT_URI", ""),
+            include_training_data=getattr(args, "resolve_training_data", False))
     if args.step == "score":
         from . import predict
         return predict.execute(args.model, args.input, args.model_dir, args.output)
@@ -113,7 +116,8 @@ def dispatch_pipeline_step(args):
         from . import postprocess_test
         return postprocess_test.execute(
             args.model, args.input, args.output, model_dir=args.model_dir,
-            data_directory=args.data, selection_file=args.selection)
+            data_directory=args.data, selection_file=args.selection,
+            train_data_directory=getattr(args, "train_data", None))
 
     # Run the prediction-pipeline operations.
     if args.step == "preprocess":

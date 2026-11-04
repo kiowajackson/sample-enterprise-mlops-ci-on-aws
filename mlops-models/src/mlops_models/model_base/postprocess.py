@@ -12,8 +12,14 @@ import pandas as pd
 
 
 def prediction_test(data_directory, selection_file, prediction_directory, output_directory,
-                    model_directory, *, parameter_path=None):
+                     model_directory, *, parameter_path=None, train_data_file=None):
     """Read test inputs, run the model's analysis and publish its output files."""
+    if train_data_file is not None:
+        train_data_file = Path(train_data_file)
+        if not train_data_file.is_file():
+            raise FileNotFoundError(f"Raw training CSV not found: {train_data_file}")
+        print(f"Training analysis data: {train_data_file}", flush=True)
+        # Customer train_stats reads this file; test_stats reads data_path below.
     data_path, selection_path, predictions, output, parameters = get_container_input(
         data_directory, selection_file, prediction_directory, output_directory, model_directory)
     analyze_predictions(data_path, selection_path, predictions, output, parameters)

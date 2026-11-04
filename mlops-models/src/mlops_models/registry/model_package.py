@@ -189,9 +189,118 @@ def validate_approved_model_package(package_arn, group, image_uri, checkpoint_ur
     return record
 
 
+def resolve_training_raw_input(package, *, client):
+    """Follow the registered checkpoint to its training job and actual raw input.
+
+    Preprocess's input is authoritative, including when Train or Preprocess reused
+    an earlier execution. Never substitute the current notebook's training CSV.
+    """
+    execution = package.get("MetadataProperties", {}).get("GeneratedBy", "")
+    if ":pipeline/" not in execution or "/execution/" not in execution:
+        raise ValueError("The selected model has no training pipeline execution recorded in GeneratedBy.")
+    checkpoint = package["InferenceSpecification"]["Containers"][0]["ModelDataUrl"]
+    executions = {}
+
+    def steps(arn):
+        if arn not in executions:
+            executions[arn] = [
+                item for page in client.get_paginator("list_pipeline_execution_steps").paginate(
+                    PipelineExecutionArn=arn) for item in page["PipelineExecutionSteps"]
+            ]
+        return executions[arn]
+
+    def producer(arn, name):
+        seen = set()
+        while True:
+            if arn in seen or len(seen) >= 20:
+                raise ValueError(f"Invalid or excessive producer chain for {name}.")
+            seen.add(arn)
+            matches = [item for item in steps(arn) if item["StepName"] == name]
+            if len(matches) != 1:
+                raise ValueError(f"Cannot identify {name} in training execution {arn}.")
+            item = matches[0]
+            previous = (item.get("CacheHitResult", {}).get("SourcePipelineExecutionArn")
+                        or item.get("SelectiveExecutionResult", {}).get("SourcePipelineExecutionArn"))
+            if previous:
+                arn = previous
+                continue
+            return arn, item
+
+    matched = []
+    for item in steps(execution):
+        metadata = item.get("Metadata", {})
+        if not ({"TrainingJob", "TuningJob"} & metadata.keys()
+                or item["StepName"] in {"Train", "Tune"}):
+            continue
+        training_execution, item = producer(execution, item["StepName"])
+        metadata = item.get("Metadata", {})
+        if "TrainingJob" in metadata:
+            name = metadata["TrainingJob"]["Arn"].rsplit("/", 1)[-1]
+        elif "TuningJob" in metadata:
+            tuning = client.describe_hyper_parameter_tuning_job(
+                HyperParameterTuningJobName=metadata["TuningJob"]["Arn"].rsplit("/", 1)[-1])
+            name = tuning.get("BestTrainingJob", {}).get("TrainingJobName")
+            if not name:
+                continue
+        else:
+            continue
+        job = client.describe_training_job(TrainingJobName=name)
+        if job["TrainingJobStatus"] != "Completed":
+            continue
+        environment = job.get("Environment", {})
+        artifacts = {job.get("ModelArtifacts", {}).get("S3ModelArtifacts"),
+                     environment.get("MLOPS_TRAINING_MODEL_URI")}
+        if environment.get("MLOPS_TRAINING_OUTPUT_UPLOAD") == "application":
+            artifacts.add(job["OutputDataConfig"]["S3OutputPath"].rstrip("/")
+                          + "/application/model.tar.gz")
+        if checkpoint in artifacts:
+            matched.append((training_execution, job))
+    if len(matched) != 1:
+        raise ValueError(
+            "Cannot uniquely match the registered checkpoint to a completed training job: "
+            f"{checkpoint}. Retain its training execution history.")
+    training_execution, training = matched[0]
+    prepared = [item["DataSource"]["S3DataSource"]["S3Uri"].rstrip("/")
+                for item in training["InputDataConfig"] if item["ChannelName"] == "prepared"]
+    if len(prepared) != 1:
+        raise ValueError("The selected training job must have one prepared-data channel.")
+    preparation_execution, preparation = producer(training_execution, "Preprocess")
+    job_arn = preparation.get("Metadata", {}).get("ProcessingJob", {}).get("Arn")
+    if not job_arn:
+        raise ValueError("The training Preprocess producer has no recorded Processing job.")
+    job = client.describe_processing_job(ProcessingJobName=job_arn.rsplit("/", 1)[-1])
+    if job["ProcessingJobStatus"] != "Completed":
+        raise ValueError("The training Preprocess producer did not complete.")
+    prepared_outputs = []
+    for item in job["ProcessingOutputConfig"]["Outputs"]:
+        output = item["S3Output"]
+        local = PurePosixPath(output["LocalPath"])
+        try:
+            relative = PurePosixPath("/opt/ml/processing/output/prepared").relative_to(local)
+        except ValueError:
+            continue
+        prepared_outputs.append(output["S3Uri"].rstrip("/")
+                                + ("/" + str(relative) if str(relative) != "." else ""))
+    if prepared[0] not in prepared_outputs:
+        raise ValueError("The training channel does not match its Preprocess output; raw input is ambiguous.")
+    raw = [item["S3Input"]["S3Uri"].rstrip("/") for item in job["ProcessingInputs"]
+           if item.get("S3Input", {}).get("LocalPath", "").rstrip("/") == "/opt/ml/processing/raw"]
+    if len(raw) != 1:
+        raise ValueError("The training Preprocess job must record one raw-data input.")
+    s3_location(raw[0])
+    return {
+        "training_raw_uri": raw[0],
+        "training_execution_arn": training_execution,
+        "training_job_arn": training["TrainingJobArn"],
+        "training_preprocess_execution_arn": preparation_execution,
+        "training_preprocess_job_arn": job_arn,
+        "training_prepared_uri": prepared[0],
+    }
+
+
 def resolve_latest_approved_model(group, output_dir, *, namespace, model_id, environment,
-                                 package_arn="", client=None, metadata_uri="",
-                                 metadata_checkpoint_uri="", s3=None):
+                                  package_arn="", client=None, metadata_uri="",
+                                  metadata_checkpoint_uri="", s3=None, include_training_data=False):
     """Resolve an ARN, or latest-approved (also an omitted ARN in older pipelines)."""
     if client is None:
         import boto3
@@ -247,6 +356,9 @@ def resolve_latest_approved_model(group, output_dir, *, namespace, model_id, env
     # An empty checksum means the loader cannot verify the saved metadata.
     record["model_metadata"] = properties.get("ModelMetadataUri", "")
     record["model_metadata_sha256"] = properties.get("ModelMetadataSha256", "")
+    if include_training_data:
+        # Resolve before a metadata override changes this execution's checkpoint URI.
+        record.update(resolve_training_raw_input(package, client=client))
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     if metadata_uri and metadata_uri != "registry":

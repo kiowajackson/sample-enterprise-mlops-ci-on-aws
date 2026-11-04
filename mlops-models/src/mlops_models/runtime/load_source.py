@@ -224,6 +224,7 @@ def main():
     parser.add_argument("--output")
     parser.add_argument("--input")
     parser.add_argument("--data", default="/opt/ml/processing/raw")
+    parser.add_argument("--train-data")
     parser.add_argument("--selection", default="/opt/ml/processing/selection/selected_features.csv")
     selected, _ = parser.parse_known_args()
     source = Path(__file__).resolve().parent
@@ -402,6 +403,9 @@ def main():
                     "model_id": selected.model,
                     "data_directory": {"local": selected.data,
                                        "s3": mounts.get(selected.data.rstrip("/"), "")},
+                    "train_data_directory": {
+                        "local": selected.train_data,
+                        "s3": mounts.get((selected.train_data or "").rstrip("/"), "")},
                     "selection_file": {"local": selected.selection,
                                        "s3": selection_uri},
                     "input_path": {"local": selected.input or input_path,

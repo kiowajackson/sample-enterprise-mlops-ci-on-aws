@@ -81,9 +81,22 @@ def configure_testing(body):
                                ("preprocess", "preprocess-test"),
                                ("postprocess", "postprocess-test")]))
     for step in walk_steps(body["Steps"]):
+        if step["Name"] == "ResolveModel":
+            step["Arguments"]["AppSpecification"]["ContainerArguments"].append("--resolve-training-data")
         if step["Name"] in {"GetData", "Preprocess", "Score", "Postprocess"}:
             step["Arguments"]["Environment"]["MLOPS_ANALYSIS_MODE"] = "prediction_test"
         if step["Name"] == "Postprocess":
+            args = step["Arguments"]
+            resolver = next(item for item in body["Steps"] if item["Name"] == "ResolveModel")
+            decision = resolver["Arguments"]["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
+            training = deepcopy(next(item for item in args["ProcessingInputs"] if item["InputName"] == "raw"))
+            training["InputName"] = "training-raw"
+            training["S3Input"].update(
+                S3Uri={"Std:JsonGet": {"S3Uri": join(decision, "package.json"), "Path": "training_raw_uri"}},
+                LocalPath="/opt/ml/processing/training-raw")
+            args["ProcessingInputs"].append(training)
+            args["AppSpecification"]["ContainerArguments"].extend(
+                ["--train-data", "/opt/ml/processing/training-raw"])
             output = step["Arguments"]["ProcessingOutputConfig"]["Outputs"][0]
             output["OutputName"] = "evaluation"
             output["S3Output"]["LocalPath"] = "/opt/ml/processing/evaluation"
