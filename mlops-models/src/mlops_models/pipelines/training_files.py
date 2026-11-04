@@ -200,11 +200,11 @@ def combine_training_testing(training, testing):
         return result
 
     training["Steps"] = add_test_steps(training["Steps"])
+    # Keep descriptive contract prose out of the 20-entry pipeline metadata map.
+    # Tracking adds one entry; retain the fields used to identify this workflow.
     training["Metadata"].update(
         TrainingWorkflow="train-test-register",
-        TestDataSource=testing["Metadata"]["DataSource"],
-        EvaluationInputContract="separately-selected-test-data",
-        RegistrationPolicy="Register after test postprocessing succeeds; manual approval remains separate.")
+        TestDataSource=testing["Metadata"]["DataSource"])
 
 
 def configure_output_roots(body):
