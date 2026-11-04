@@ -41,6 +41,8 @@ def parse_job_arguments():
     parser.add_argument("--image-uri", default="")
     parser.add_argument("--checkpoint-uri", default="")
     args = parser.parse_args()
+    if args.step == "postprocess-test" and not args.train_data:
+        parser.error("--train-data is required for postprocess-test")
 
     # Resolve standard paths centrally; direct Python/local callers may override them.
     from ..runtime.job_paths import job_paths, selected_features_path
@@ -115,9 +117,13 @@ def dispatch_pipeline_step(args):
     if args.step == "postprocess-test":
         from . import postprocess_test
         return postprocess_test.execute(
-            args.model, args.input, args.output, model_dir=args.model_dir,
-            data_directory=args.data, selection_file=args.selection,
-            train_data_directory=getattr(args, "train_data", None))
+            model_id=args.model,
+            train_data_path=Path(args.train_data) / "data.csv",
+            test_data_path=Path(args.data) / "data.csv",
+            selection_file=args.selection,
+            predictions=args.input,
+            output_directory=args.output,
+        )
 
     # Run the prediction-pipeline operations.
     if args.step == "preprocess":
