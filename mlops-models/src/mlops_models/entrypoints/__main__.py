@@ -118,8 +118,8 @@ def dispatch_pipeline_step(args):
         from . import postprocess_test
         return postprocess_test.execute(
             model_id=args.model,
-            train_data_path=Path(args.train_data) / "data.csv",
-            test_data_path=Path(args.data) / "data.csv",
+            train_data_path=args.train_data,
+            test_data_path=args.data,
             selection_file=args.selection,
             predictions=args.input,
             output_directory=args.output,

@@ -13,11 +13,11 @@ import pandas as pd
 
 def prediction_test(train_data_path, test_data_path, selection_file, predictions,
                     output_directory):
-    """Read test inputs, run the model's analysis and publish its output files."""
-    train_data_path = Path(train_data_path)
-    if not train_data_path.is_file():
-        raise FileNotFoundError(f"Raw training CSV not found: {train_data_path}")
-    print(f"Training analysis data: {train_data_path}", flush=True)
+    """Read training/test folders, run analysis and publish its output files."""
+    train_data_file = Path(train_data_path) / "data.csv"
+    if not train_data_file.is_file():
+        raise FileNotFoundError(f"Raw training CSV not found: {train_data_file}")
+    print(f"Training analysis data: {train_data_file}", flush=True)
     # The bootstrap supplies the saved model before importing model code.
     # These are internal dependencies of this example's reporting, not hook arguments.
     model_directory = Path(os.environ["MLOPS_MODEL_DIR"])
@@ -35,8 +35,7 @@ def prediction_inference(data_directory, selection_file, prediction_directory, o
     """Load this step's inputs and run inference analysis; there is no mode selection."""
     with TemporaryDirectory(prefix="postprocess-inputs-") as converted_directory:
         data_path, selection_path, predictions, output, parameters = get_container_input(
-            Path(data_directory) / "data.csv", selection_file, prediction_directory,
-            output_directory, model_directory,
+            data_directory, selection_file, prediction_directory, output_directory, model_directory,
             converted_directory=converted_directory, chunk_rows=chunk_rows)
         analyze_predictions(data_path, selection_path, predictions, output, parameters)
         return write_inference_output(
@@ -44,10 +43,10 @@ def prediction_inference(data_directory, selection_file, prediction_directory, o
             predictions=predictions, parameters=parameters)
 
 
-def get_container_input(data_path, selection_file, prediction_directory,
+def get_container_input(data_directory, selection_file, prediction_directory,
                         output_directory, model_directory, *, converted_directory=None, chunk_rows=10000):
     """Resolve CSV paths and the destination; read the saved model's parameters."""
-    data_path = Path(data_path)
+    data_path = Path(data_directory) / "data.csv"
     if not data_path.is_file():
         raise FileNotFoundError(f"Postprocess needs the original GetData snapshot: {data_path}")
     selection_path = Path(selection_file)
