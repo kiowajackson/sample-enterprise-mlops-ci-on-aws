@@ -28,6 +28,19 @@ MAX_REPORT_BYTES = 10 * 1024 * 1024
 REPORT_SUFFIXES = {".csv", ".png", ".jpg", ".jpeg", ".svg", ".html", ".json", ".txt", ".pdf"}
 
 
+def print_event(record):
+    """Print a stable event header and indented fields; jsonl retains one-line output."""
+    event = {
+        "event": record["event"],
+        "step": os.getenv("MLOPS_STEP_NAME", ""),
+        "model_id": os.getenv("MODEL_ID", ""),
+        "pipeline_execution_id": os.getenv("PIPELINE_EXECUTION_ID", ""),
+    }
+    event.update(record)
+    indent = None if os.getenv("MLOPS_LOG_FORMAT") == "jsonl" else 2
+    print(json.dumps(event, indent=indent), flush=True)
+
+
 def prepare_inference_inputs(model_dir, output_dir, model_id):
     """Copy the training selection unchanged before calling preprocessing."""
     model_dir = Path(model_dir)
@@ -70,10 +83,10 @@ def upload_processing_outputs(config, output_dir, scratch):
                   if config.get("KmsKeyId") else {})
     s3 = boto3.client("s3")
     for path, bucket, key in uploads:
-        print(json.dumps({"event": "processing_output_upload", "source": str(path),
-                          "destination": f"s3://{bucket}/{key}"}), flush=True)
+        print_event({"event": "processing_output_upload", "source": str(path),
+                          "destination": f"s3://{bucket}/{key}"})
         s3.upload_file(str(path), bucket, key, ExtraArgs=encryption)
-    print(json.dumps({"event": "processing_outputs_uploaded", "files": len(uploads)}), flush=True)
+    print_event({"event": "processing_outputs_uploaded", "files": len(uploads)})
 
 
 def upload_training_outputs(work):
@@ -100,8 +113,8 @@ def upload_training_outputs(work):
         archive_key = location.path.lstrip("/")
         files_prefix = archive_key.removesuffix(".tar.gz") + "/"
         files_uri = f"s3://{location.netloc}/{files_prefix}"
-        print(json.dumps({"event": "training_files_upload", "source": str(directory),
-                          "destination": files_uri}), flush=True)
+        print_event({"event": "training_files_upload", "source": str(directory),
+                          "destination": files_uri})
         file_count = 0
         for path in sorted(directory.rglob("*")):
             if path.is_symlink():
@@ -110,18 +123,18 @@ def upload_training_outputs(work):
                 key = files_prefix + path.relative_to(directory).as_posix()
                 s3.upload_file(str(path), location.netloc, key, ExtraArgs=encryption)
                 file_count += 1
-        print(json.dumps({"event": "training_output_upload", "source": str(archive_path),
+        print_event({"event": "training_output_upload", "source": str(archive_path),
                           "destination": uri, "bytes": archive_path.stat().st_size,
-                          "files_uri": files_uri, "files": file_count}), flush=True)
+                          "files_uri": files_uri, "files": file_count})
         s3.upload_file(str(archive_path), location.netloc, archive_key, ExtraArgs=encryption)
     # The same record is readable without downloading/unpacking the trained model.
     location = urlparse(os.environ["MLOPS_TRAINING_MODEL_URI"])
     s3.upload_file(str(model / "_execution.json"), location.netloc,
                    location.path.lstrip("/").rsplit("/", 1)[0] + "/_execution.json",
                    ExtraArgs=encryption)
-    print(json.dumps({"event": "training_outputs_uploaded",
+    print_event({"event": "training_outputs_uploaded",
                       "model_uri": os.environ["MLOPS_TRAINING_MODEL_URI"],
-                      "reports_uri": os.environ["MLOPS_TRAINING_REPORTS_URI"]}), flush=True)
+                      "reports_uri": os.environ["MLOPS_TRAINING_REPORTS_URI"]})
 
 
 def describe_outputs(record, directories):
@@ -209,6 +222,9 @@ def main():
     parser.add_argument("--model", default=os.getenv("MODEL_ID"))
     parser.add_argument("--model-dir")
     parser.add_argument("--output")
+    parser.add_argument("--input")
+    parser.add_argument("--data", default="/opt/ml/processing/raw")
+    parser.add_argument("--selection", default="/opt/ml/processing/selection/selected_features.csv")
     selected, _ = parser.parse_known_args()
     source = Path(__file__).resolve().parent
     logging_source = source / "mlops_models/pipelines/tracking.py"
@@ -261,7 +277,7 @@ def main():
                         "verified": bool(expected_metadata_sha) and actual_metadata_sha == expected_metadata_sha,
                         "feature_count": len(metadata.get("feature_mapping", {})),
                     }
-                    print(json.dumps({"event": "inference_metadata_loaded", **metadata_binding}), flush=True)
+                    print_event({"event": "inference_metadata_loaded", **metadata_binding})
                     if expected_metadata_sha and actual_metadata_sha != expected_metadata_sha:
                         raise ValueError(
                             "Model archive metadata does not match the selected Registry/override metadata: "
@@ -319,7 +335,7 @@ def main():
             # from an older registered release after the pipeline is republished.
             os.environ.update(SOURCE_COMMIT=source_metadata.get("commit", "uncommitted"),
                               SOURCE_DIRTY=str(source_metadata.get("dirty", True)).lower())
-            print(json.dumps({"event": "source_loaded", "step": selected.step,
+            print_event({"event": "source_loaded", "step": selected.step,
                               "source": str(source),
                               "model_code_source": os.getenv("MLOPS_MODEL_CODE_SOURCE", "artifact") if checkpoint else "pipeline",
                               "pipeline_execution_id": os.getenv("PIPELINE_EXECUTION_ID", ""),
@@ -327,8 +343,7 @@ def main():
                               "model_package": os.getenv("MLOPS_MODEL_PACKAGE", ""),
                               "loader_source": str(logging_source.parents[2]),
                               "model_metadata": metadata_binding,
-                              "identity": source_metadata}),
-                  flush=True)
+                              "identity": source_metadata})
 
             # Redirect Training's model/report writes into writable scratch folders.
             if managed_training:
@@ -340,10 +355,10 @@ def main():
                                   SM_OUTPUT_DIR=str(work / "output"))
                 tempfile.tempdir = str(work / "tmp")
                 sys.argv.extend(["--output", str(work / "output"), "--model-dir", str(work / "model")])
-                print(json.dumps({"event": "training_output_directories", "revision": "training-outputs-v1",
+                print_event({"event": "training_output_directories", "revision": "training-outputs-v1",
                                   "uid": os.geteuid(), "output": str(work / "output"),
                                   "model": str(work / "model"), "temporary": tempfile.gettempdir(),
-                                  "model_uri": os.environ["MLOPS_TRAINING_MODEL_URI"]}), flush=True)
+                                  "model_uri": os.environ["MLOPS_TRAINING_MODEL_URI"]})
 
             # main() is the stable command interface, including for older checkpoints.
             from mlops_models.entrypoints.__main__ import main as dispatch_command
@@ -366,9 +381,38 @@ def main():
                 sys.argv.extend(["--output", str(scratch)])
                 # Model code reading the environment must use the same writable folder.
                 os.environ["SM_OUTPUT_DATA_DIR"] = str(scratch)
-                print(json.dumps({"event": "processing_output_directory", "step": selected.step,
+                print_event({"event": "processing_output_directory", "step": selected.step,
                                   "configured": str(output_dir), "writable": str(scratch),
-                                  "SM_OUTPUT_DATA_DIR": os.environ["SM_OUTPUT_DATA_DIR"]}), flush=True)
+                                  "SM_OUTPUT_DATA_DIR": os.environ["SM_OUTPUT_DATA_DIR"]})
+
+            # Show the actual postprocessing inputs together before model code runs.
+            if selected.step in {"postprocess", "postprocess-test"}:
+                from mlops_models.runtime.job_paths import job_paths
+                input_path, default_output, _ = job_paths(selected.step)
+                config_file = Path("/opt/ml/config/processingjobconfig.json")
+                input_job = json.loads(config_file.read_text()) if config_file.is_file() else {}
+                mounts = {item["S3Input"]["LocalPath"].rstrip("/"): item["S3Input"]["S3Uri"]
+                          for item in input_job.get("ProcessingInputs", []) if "S3Input" in item}
+                selection_uri = mounts.get(str(Path(selected.selection).parent), "")
+                if selection_uri and not selection_uri.endswith("/" + Path(selected.selection).name):
+                    selection_uri = selection_uri.rstrip("/") + "/" + Path(selected.selection).name
+                print_event({
+                    "event": "postprocess_inputs",
+                    "step": selected.step,
+                    "model_id": selected.model,
+                    "data_directory": {"local": selected.data,
+                                       "s3": mounts.get(selected.data.rstrip("/"), "")},
+                    "selection_file": {"local": selected.selection,
+                                       "s3": selection_uri},
+                    "input_path": {"local": selected.input or input_path,
+                                   "s3": mounts.get((selected.input or input_path).rstrip("/"), "")},
+                    "model_dir": {"local": str(checkpoint), "archive_local": archive_path,
+                                  "s3": mounts.get(str(Path(archive_path).parent),
+                                                   os.getenv("MLOPS_MODEL_ARTIFACT_URI", ""))},
+                    "output_dir": {"local": str(scratch if output_config is not None
+                                                 else selected.output or default_output),
+                                   "s3": output_uri if output_config is not None else ""},
+                })
 
             # Inference preprocessing also needs the saved model's selected-feature CSV.
             if selected.step in {"preprocess", "preprocess-test"}:
