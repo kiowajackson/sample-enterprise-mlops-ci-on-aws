@@ -227,7 +227,6 @@ class IntegrationSuite:
         finally:
             self.state["ended_at"] = _now()
             self._save()
-            (self.directory / "results.json").write_text(json.dumps(self.report(), indent=2) + "\n")
             self._notify()
         return self.report()
 
@@ -507,6 +506,9 @@ class IntegrationSuite:
 
     def _notify(self):
         report = self.report()
+        temporary = self.directory / ("results." + uuid4().hex + ".tmp")
+        temporary.write_text(json.dumps(report, indent=2) + "\n")
+        temporary.replace(self.directory / "results.json")
         if self.on_update:
             self.on_update(report)
         else:
