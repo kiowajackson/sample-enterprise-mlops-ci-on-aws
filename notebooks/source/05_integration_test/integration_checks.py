@@ -74,13 +74,16 @@ class IntegrationSuite:
             raise ValueError("model_code_source must be artifact or pipeline.")
         targets = deepcopy(publication.get("pipelines", {}))
         targets.update(pipelines or {})
-        if not all(targets.get(kind) for kind in ("training", "testing", "inference")):
-            raise ValueError("Run notebook 02 first, or provide all three pipeline names/ARNs in PIPELINES.")
+        if not all(targets.get(kind) for kind in ("training", "inference")):
+            raise ValueError("Run notebook 02 first, or provide the training and inference names/ARNs in PIPELINES.")
+        self.combined = not targets.get("testing")
+        self.phases = ("preliminary", "full", "prediction_inference") if self.combined else PHASES
         self.targets = {
             kind: ({"name": target} if isinstance(target, str) else target)
             for kind, target in targets.items() if kind in {"training", "testing", "inference"}
         }
-        self.settings = {"namespace": self.namespace, "run_label": run_label, "workflow": "three-pipelines-v1",
+        self.settings = {"namespace": self.namespace, "run_label": run_label,
+                         "workflow": "train-test-register-v2" if self.combined else "three-pipelines-v1",
                          "model_ids": list(model_ids), "csv_inputs": csv_inputs or {},
                          "model_code_source": model_code_source,
                          "targets": {k: v.get("arn") or v.get("name") for k, v in self.targets.items()}}
@@ -111,7 +114,7 @@ class IntegrationSuite:
         temporary.replace(self.path)
 
     def prepare(self):
-        """Read and pin all three definitions, validate the matrix; start no jobs."""
+        """Pin the published definitions and validate the complete matrix; start no jobs."""
         pinned = {}
         for kind, target in self.targets.items():
             name = target.get("arn") or target["name"]
@@ -131,16 +134,22 @@ class IntegrationSuite:
                 raise ValueError("This first integration suite covers Processing inference; deploy that runtime.")
             required = ({"GetData", "FeatureSelection", "Preprocess", "Train", "RegisterModel"} if kind == "training"
                         else {"ResolveModel", "GetData", "Preprocess", "Score", "Postprocess"})
+            if kind == "training":
+                if self.combined != (meta.get("TrainingWorkflow") == "train-test-register"):
+                    raise ValueError("Training topology differs from the saved publication. "
+                                     "Rerun notebook 02 and use a new RUN_LABEL.")
+                if self.combined:
+                    required |= {"GetTestData", "PreprocessTest", "PredictTest", "PostprocessTest"}
             if not required.issubset(s["Name"] for s in _steps(body["Steps"])):
                 raise ValueError(f"{kind} definition does not contain the ordinary {sorted(required)} steps.")
             pinned[kind] = {"arn": described["PipelineArn"], "version": int(version), "definition": body}
         if len({tuple(p["arn"].split(":")[:5]) for p in pinned.values()}) != 1:
-            raise ValueError("All three pipelines must be in the same account and Region.")
+            raise ValueError("All pipelines must be in the same account and Region.")
         if pinned["training"]["arn"].split(":")[3] != self.region:
             raise ValueError("The client Region does not match the pipeline Region.")
         environments = {p["definition"]["Metadata"].get("Environment") for p in pinned.values()}
         if len(environments) != 1 or not next(iter(environments)):
-            raise ValueError("All three pipelines must declare the same nonempty Environment.")
+            raise ValueError("All pipelines must declare the same nonempty Environment.")
         self.pipelines = pinned
         available = self._declared("training")["ModelId"].get("EnumValues", [])
         self.models = self.settings["model_ids"] or available
@@ -149,7 +158,7 @@ class IntegrationSuite:
         if set(self.settings["csv_inputs"]) - set(self.models):
             raise ValueError("CSV_INPUTS contains a model not selected in MODEL_IDS.")
         for model in self.models:
-            for phase in PHASES:
+            for phase in self.phases:
                 self._parameters(model, phase, metadata_uri="s3://placeholder/metadata.json",
                                  package_arn="pending-package")
         if self.state.get("pipelines") and self.state["pipelines"] != pinned:
@@ -163,7 +172,7 @@ class IntegrationSuite:
                  "metadata/model": ("none" if phase == "preliminary" else
                                     "this test's preliminary metadata" if phase == "full" else
                                     "this test's approved full model")}
-                for phase in PHASES for model in self.models]
+                for phase in self.phases for model in self.models]
 
     def _declared(self, kind):
         return {p["Name"]: p for p in self.pipelines[kind]["definition"]["Parameters"]}
@@ -184,6 +193,11 @@ class IntegrationSuite:
                              ModelMetadataUri="none" if phase == "preliminary" else metadata_uri)
             if "UseHPO" in declared:
                 overrides["UseHPO"] = False
+            if self.combined:
+                test_csv = self._csv(model, "prediction_test")
+                if test_csv:
+                    _location(test_csv)
+                    overrides["TestCsvInputUri"] = test_csv
         else:
             overrides.update(ModelPackageArn=package_arn, ModelMetadataUri="registry")
             if "ModelCodeSource" in declared:
@@ -218,7 +232,8 @@ class IntegrationSuite:
             self._phase("preliminary")
             self._phase("full")
             self._approve_full_models()
-            self._phase("prediction_test", "prediction_inference")
+            self._phase(*(("prediction_inference",) if self.combined else
+                          ("prediction_test", "prediction_inference")))
             self.state["status"] = "Passed"
         except BaseException as error:
             self.state.update(status="Interrupted" if isinstance(error, KeyboardInterrupt) else "Failed",
@@ -413,7 +428,18 @@ class IntegrationSuite:
         head = self.s3.head_object(Bucket=bucket, Key=key)
         self._check(case, "Model archive exists", head["ContentLength"] > 0, checkpoint)
         case.update(metadata_uri=metadata_uri, metadata_sha256=digest, feature_count=len(mapping),
-                    package_arn=arn, checkpoint_uri=checkpoint, registry_group=group)
+                     package_arn=arn, checkpoint_uri=checkpoint, registry_group=group)
+        if self.combined:
+            self._verify_predictions(case, case, "PredictTest", "PostprocessTest", "evaluation")
+            _, job = self._output(case, "PostprocessTest", "evaluation")
+            mounts = {i["S3Input"]["LocalPath"].rstrip("/"): i["S3Input"]["S3Uri"].rstrip("/")
+                      for i in job["ProcessingInputs"] if "S3Input" in i}
+            train_raw, _ = self._output(case, "GetData", "raw")
+            test_raw, _ = self._output(case, "GetTestData", "raw")
+            self._check(case, "Separate training and held-out inputs",
+                        mounts.get("/opt/ml/processing/training-raw") == train_raw + "/raw"
+                        and mounts.get("/opt/ml/processing/raw") == test_raw + "/raw",
+                        mounts)
 
     def _approve_full_models(self):
         for model in self.models:
@@ -457,17 +483,22 @@ class IntegrationSuite:
                     and decision.get("checkpoint") == full["checkpoint_uri"]
                     and decision.get("model_metadata_sha256") == full["metadata_sha256"],
                     full["package_arn"])
-        scores, score_job = self._output(case, "Score", "scores")
+        self._verify_predictions(case, full, "Score", "Postprocess",
+                                 "evaluation" if case["phase"] == "prediction_test" else "predictions")
+        case.update(package_arn=full["package_arn"], feature_count=full["feature_count"])
+
+    def _verify_predictions(self, case, model, score_step, postprocess_step, output_name):
+        scores, score_job = self._output(case, score_step, "scores")
         inputs = [i["S3Input"]["S3Uri"] for i in score_job.get("ProcessingInputs", []) if "S3Input" in i]
-        self._check(case, "Score input model archive", full["checkpoint_uri"] in inputs, inputs)
+        self._check(case, "Score input model archive", model["checkpoint_uri"] in inputs, inputs)
         record, _ = self._json(scores + "/_execution.json")
         binding = record.get("model_metadata", {})
         self._check(case, "Scoring metadata matches training",
-                    binding.get("sha256") == full["metadata_sha256"]
-                    and binding.get("checkpoint_uri") == full["checkpoint_uri"]
-                    and binding.get("feature_count") == full["feature_count"],
+                    binding.get("sha256") == model["metadata_sha256"]
+                    and binding.get("checkpoint_uri") == model["checkpoint_uri"]
+                    and binding.get("feature_count") == model["feature_count"],
                     binding)
-        analysis, _ = self._output(case, "Postprocess", "evaluation" if case["phase"] == "prediction_test" else "predictions")
+        analysis, _ = self._output(case, postprocess_step, output_name)
         score_files, analysis_files = self._files(scores), self._files(analysis)
         # Score often writes predictions/raw beneath Postprocess's predictions prefix.
         # Those earlier files must not make a missing analysis output appear successful.
@@ -475,8 +506,7 @@ class IntegrationSuite:
         self._check(case, "Prediction files exist",
                     any(f["uri"].endswith((".csv", ".jsonl", ".parquet")) for f in score_files), scores)
         self._check(case, "Analysis files exist", bool(analysis_files), analysis)
-        case.update(package_arn=full["package_arn"], feature_count=full["feature_count"],
-                    score_uri=scores, analysis_uri=analysis,
+        case.update(score_uri=scores, analysis_uri=analysis,
                     output_files=score_files + analysis_files)
 
     def report(self):
