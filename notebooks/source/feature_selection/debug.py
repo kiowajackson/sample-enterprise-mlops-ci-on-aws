@@ -1,12 +1,16 @@
-"""Run the local FeatureSelection entrypoint with an existing job's raw input."""
+"""Prepare local FeatureSelection inputs and export the same call for VS Code."""
 
+from contextlib import contextmanager
 import importlib
 import json
 import os
 from pathlib import Path
+from pprint import pformat
 import sys
 from tempfile import mkdtemp, TemporaryDirectory
+from textwrap import indent
 from time import perf_counter
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import boto3
@@ -92,8 +96,78 @@ def _load_execute(repository, model_id):
     return entrypoint.execute
 
 
-def run(repository, model_id, execution_id):
-    """Resolve one job, prepare local inputs, and call the current checkout."""
+def _vscode_code(model_id, execution_arn, job_name, raw_uri, environment):
+    """A standalone main block for the existing entrypoint, with resolved inputs."""
+    local_keys = {"MLOPS_MODEL_DIR", "SM_MODEL_DIR", "SM_OUTPUT_DATA_DIR", "SM_OUTPUT_DIR"}
+    saved_environment = {key: value for key, value in environment.items() if key not in local_keys}
+    assignments = (
+        f"# Requested execution: {execution_arn}\n"
+        f"# FeatureSelection job: {job_name}\n"
+        f"MODEL_ID = {model_id!r}\n"
+        f"REGION = {execution_arn.split(':')[3]!r}\n"
+        f"DATA_URI = {raw_uri!r}\n"
+        f"environment = {pformat(saved_environment, sort_dicts=False)}\n"
+    )
+    setup_and_call = r'''
+from pathlib import Path
+from tempfile import mkdtemp
+from urllib.parse import urlsplit
+import os
+import boto3
+
+# This block belongs to entrypoints/feature_selection.py, where execute is defined.
+# Read the current checkout's parameters; do not reuse notebook-local paths.
+model_directory = Path(__file__).resolve().parents[1] / "models" / MODEL_ID
+work_directory = Path(mkdtemp(prefix="feature-selection-"))
+data_directory = work_directory / "raw"
+output_directory = work_directory / "output"
+data_directory.mkdir()
+output_directory.mkdir()
+(output_directory / "parameters.used.json").write_bytes(
+    (model_directory / "parameters.json").read_bytes()
+)
+address = urlsplit(DATA_URI)
+print("Download:", DATA_URI, flush=True)
+boto3.client("s3", region_name=REGION).download_file(
+    address.netloc, address.path.lstrip("/"), str(data_directory / "data.csv")
+)
+environment.update({
+    "MLOPS_MODEL_DIR": str(model_directory),
+    "SM_MODEL_DIR": str(model_directory),
+    "SM_OUTPUT_DATA_DIR": str(output_directory),
+    "SM_OUTPUT_DIR": str(output_directory),
+})
+previous = {key: os.environ.get(key) for key in environment}
+result = None
+try:
+    os.environ.update(environment)
+    result = execute(
+        model_id=MODEL_ID,
+        input_path=data_directory,
+        output_dir=output_directory,
+    )
+    print("Returned value:", result)
+finally:
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    print("Inputs and outputs retained at:", work_directory, flush=True)
+'''
+    code = (
+        "# Paste at the bottom of mlops-models/src/mlops_models/entrypoints/feature_selection.py.\n"
+        "# Replace its previous local main block. Open the repository root in VS Code.\n"
+        "# Use F5: Python: Debug current model entrypoint (the repository's launch.json).\n"
+        'if __name__ == "__main__":\n'
+        + indent(assignments + setup_and_call, "    ")
+    )
+    compile(code, "feature_selection.py", "exec")
+    return code
+
+
+def prepare(repository, model_id, execution_id):
+    """Resolve/download inputs without running selection; freeze the VS Code block."""
     started = perf_counter()
     repository = Path(repository).resolve()
     parameter_path = repository / "mlops-models/src/mlops_models/models" / model_id / "parameters.json"
@@ -142,13 +216,8 @@ def run(repository, model_id, execution_id):
     if producer_arn != execution_arn:
         print("Cached FeatureSelection producer:", producer_arn, flush=True)
     print("Raw input:", raw_uri, flush=True)
-    s3 = session.client("s3", config=client_options)
-    _download_raw(s3, raw_uri, data_directory / "data.csv")
+    work.mkdir(parents=True, exist_ok=True)
     output_directory = Path(mkdtemp(prefix="run-", dir=work))
-    (output_directory / "job.json").write_text(json.dumps(job, indent=2, default=str) + "\n")
-    (output_directory / "parameters.used.json").write_bytes(parameter_path.read_bytes())
-    print("Current checkout parameters:", parameter_path, flush=True)
-    print("Local output directory:", output_directory, flush=True)
     selection = recorded.get("MLOPS_TRAINING_SELECTION", recorded.get("MLOPS_TRAINING_MODE", "1"))
     mode = {"Preliminary models with validation": "1", "Final model with all data": "2"}.get(selection, selection)
     environment = {
@@ -164,21 +233,42 @@ def run(repository, model_id, execution_id):
         "SM_OUTPUT_DATA_DIR": str(output_directory),
         "SM_OUTPUT_DIR": str(output_directory),
     }
-    previous = {key: os.environ.get(key) for key in environment}
-    os.environ.update(environment)
-    fit_started = perf_counter()
+    vscode_code = _vscode_code(model_id, execution_arn, job_name, raw_uri, environment)
     try:
-        execute = _load_execute(repository, model_id)
-        print(f"Inputs ready in {fit_started - started:.1f}s. Running feature selection in this notebook.", flush=True)
-        print("Metadata input:", environment["MLOPS_MODEL_METADATA_URI"], flush=True)
-        result = execute(model_id=model_id, input_path=data_directory, output_dir=output_directory)
-        print(f"Feature selection completed in {perf_counter() - fit_started:.1f}s.", flush=True)
-        print("Returned value:", result, flush=True)
-        return result
+        # Save the export before downloading or importing the model's dependencies.
+        (output_directory / "vscode_main.py").write_text(vscode_code, encoding="utf-8")
+        (output_directory / "job.json").write_text(json.dumps(job, indent=2, default=str) + "\n")
+        (output_directory / "parameters.used.json").write_bytes(parameter_path.read_bytes())
+        s3 = session.client("s3", config=client_options)
+        _download_raw(s3, raw_uri, data_directory / "data.csv")
+    except BaseException:
+        print(vscode_code, flush=True)
+        raise
+    print("Current checkout parameters:", parameter_path, flush=True)
+    print("Local output directory:", output_directory, flush=True)
+    print(f"Inputs ready in {perf_counter() - started:.1f}s; run the next cell.", flush=True)
+    return SimpleNamespace(
+        repository=repository, model_id=model_id, data_directory=data_directory,
+        output_directory=output_directory, environment=environment, vscode_code=vscode_code,
+    )
+
+
+@contextmanager
+def execution(step):
+    """Load the local entrypoint under the job's settings, restoring them on exit."""
+    previous = {key: os.environ.get(key) for key in step.environment}
+    started = perf_counter()
+    try:
+        os.environ.update(step.environment)
+        parameter_path = Path(step.environment["MLOPS_MODEL_DIR"]) / "parameters.json"
+        (step.output_directory / "parameters.used.json").write_bytes(parameter_path.read_bytes())
+        print("Metadata input:", step.environment["MLOPS_MODEL_METADATA_URI"], flush=True)
+        yield _load_execute(step.repository, step.model_id)
     finally:
         for key, value in previous.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        print(f"Local run ended after {perf_counter() - fit_started:.1f}s; inputs and outputs retained at {work}", flush=True)
+        print(f"Local call ended after {perf_counter() - started:.1f}s; "
+              f"outputs retained at {step.output_directory}", flush=True)
