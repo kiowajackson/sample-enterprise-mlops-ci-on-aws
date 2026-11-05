@@ -1,19 +1,13 @@
 # Inspect the stopped FeatureSelection job
 
-Paste these two cells into your notebook in the same AWS account as the execution.
-This only reads pipeline and processing-job details; it does not start, stop or change jobs.
-
-## 1. Required input
-
-Paste the **pipeline execution ARN** from SageMaker Studio, not the pipeline ARN or a console URL.
+Paste this **single code block** into one notebook cell in the same AWS account as
+the execution. Set `EXECUTION_ARN` to the pipeline execution ARN from SageMaker
+Studio, not the pipeline ARN or a console URL. Run the cell to read the pipeline
+and processing-job details.
 
 ```python
 EXECUTION_ARN = ""
-```
 
-## 2. Inspect the job
-
-```python
 import json
 import boto3
 
@@ -60,7 +54,6 @@ report = {
 print(json.dumps(report, indent=2, default=str))
 ```
 
-Copy the printed JSON back for diagnosis. The key fields are `job_status`,
-`job_failure_reason`, `exit_message`, `max_runtime_seconds`, and the processing timestamps.
-A 900-second limit in the local template is a possible cause; the actual job details
-are needed to confirm why this execution stopped.
+Copy the printed JSON back for diagnosis. Check the actual job's
+`max_runtime_seconds` and processing timestamps alongside its status and failure
+reason. A `Stopped` status without a reason does not establish why it stopped.
