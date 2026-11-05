@@ -32,13 +32,15 @@ def _processing_job(sm, execution_arn):
         if len(steps) != 1:
             raise ValueError(f"No unique FeatureSelection step in {current}.")
         step = steps[0]
+        cached_from = step.get("CacheHitResult", {}).get("SourcePipelineExecutionArn")
+        if cached_from:
+            current = cached_from
+            continue
         job_arn = step.get("Metadata", {}).get("ProcessingJob", {}).get("Arn")
         if job_arn:
             return current, sm.describe_processing_job(
                 ProcessingJobName=job_arn.rsplit("/", 1)[-1])
-        current = step.get("CacheHitResult", {}).get("SourcePipelineExecutionArn")
-        if not current:
-            raise ValueError("FeatureSelection has no Processing job yet; choose an execution that reached it.")
+        raise ValueError("FeatureSelection has no Processing job yet; choose an execution that reached it.")
     raise ValueError("Repeated FeatureSelection cache reference: " + current)
 
 
@@ -73,7 +75,7 @@ def _download_raw(s3, uri, destination):
     receipt.write_text(json.dumps(identity, indent=2) + "\n")
 
 
-def _load_execute(repository, model_id):
+def _prepare_imports(repository, model_id):
     source = repository / "mlops-models/src"
     for name, module in tuple(sys.modules.items()):
         if name == "mlops_models" or name.startswith("mlops_models."):
@@ -90,10 +92,6 @@ def _load_execute(repository, model_id):
     ):
         if name in sys.modules:
             importlib.reload(sys.modules[name])
-    entrypoint = importlib.import_module("mlops_models.entrypoints.feature_selection")
-    entrypoint = importlib.reload(entrypoint)
-    print("Local entrypoint:", entrypoint.__file__, flush=True)
-    return entrypoint.execute
 
 
 def _vscode_code(model_id, execution_arn, job_name, raw_uri, environment):
@@ -158,7 +156,8 @@ finally:
     code = (
         "# Paste at the bottom of mlops-models/src/mlops_models/entrypoints/feature_selection.py.\n"
         "# Replace its previous local main block. Open the repository root in VS Code.\n"
-        "# Use F5: Python: Debug current model entrypoint (the repository's launch.json).\n"
+        "# Use this checkout's Python interpreter with the project installed editable,\n"
+        "# or the existing module-based F5 configuration. See README.md: Run a step locally.\n"
         'if __name__ == "__main__":\n'
         + indent(assignments + setup_and_call, "    ")
     )
@@ -254,8 +253,8 @@ def prepare(repository, model_id, execution_id):
 
 
 @contextmanager
-def execution(step):
-    """Load the local entrypoint under the job's settings, restoring them on exit."""
+def local_environment(step):
+    """Set local paths and environment; the notebook imports and calls its entrypoint."""
     previous = {key: os.environ.get(key) for key in step.environment}
     started = perf_counter()
     try:
@@ -263,7 +262,8 @@ def execution(step):
         parameter_path = Path(step.environment["MLOPS_MODEL_DIR"]) / "parameters.json"
         (step.output_directory / "parameters.used.json").write_bytes(parameter_path.read_bytes())
         print("Metadata input:", step.environment["MLOPS_MODEL_METADATA_URI"], flush=True)
-        yield _load_execute(step.repository, step.model_id)
+        _prepare_imports(step.repository, step.model_id)
+        yield
     finally:
         for key, value in previous.items():
             if value is None:
