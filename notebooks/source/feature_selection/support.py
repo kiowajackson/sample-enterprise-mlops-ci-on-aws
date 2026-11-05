@@ -81,9 +81,12 @@ def _prepare_imports(repository, model_id):
         if name == "mlops_models" or name.startswith("mlops_models."):
             origin = getattr(module, "__file__", None)
             if origin and not Path(origin).resolve().is_relative_to(source):
-                raise RuntimeError("Restart the kernel: mlops_models was imported from another checkout.")
-    if str(source) not in sys.path:
-        sys.path.insert(0, str(source))
+                raise RuntimeError(
+                    f"Restart the kernel or Python process: {name} was imported from "
+                    f"{origin}, but this run uses {source}."
+                )
+    # Prioritize this checkout even when another source path precedes it.
+    sys.path[:] = [str(source), *(path for path in sys.path if path != str(source))]
     importlib.invalidate_caches()
     # Reload the base before its subclass so reruns see edits in either file.
     for name in (
@@ -94,13 +97,54 @@ def _prepare_imports(repository, model_id):
             importlib.reload(sys.modules[name])
 
 
-def _vscode_code(model_id, execution_arn):
+def _parameter_path(repository, model_id):
+    models = repository / "mlops-models/src/mlops_models/models"
+    parameter_path = models / model_id / "parameters.json"
+    if not model_id.isidentifier() or not parameter_path.is_file():
+        available = sorted(path.parent.name for path in models.glob("*/parameters.json"))
+        raise ValueError(
+            f"MODEL_ID={model_id!r}: parameters file not found at {parameter_path}. "
+            f"Models in this checkout: {', '.join(available) or '(none)'}. "
+            "Model IDs must match the directory name, including case."
+        )
+    return parameter_path
+
+
+def _execution_client(repository, execution_id):
+    execution_id = execution_id.strip()
+    if not execution_id:
+        raise ValueError("Set EXECUTION_ID to a training execution ID or its full ARN.")
+    if execution_id.startswith("arn:"):
+        parts = execution_id.split(":", 5)
+        if len(parts) != 6 or parts[2] != "sagemaker" or not parts[5].startswith("pipeline/") or "/execution/" not in parts[5]:
+            raise ValueError("Supply a SageMaker pipeline execution ARN.")
+        session = boto3.Session(region_name=parts[3])
+        execution_arn = execution_id
+    else:
+        if any(character in execution_id for character in "/: \t\n"):
+            raise ValueError("Supply a bare execution ID or the full execution ARN, not a console URL.")
+        session = boto3.Session()
+        execution_arn = None
+    options = Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 2})
+    sm = session.client("sagemaker", config=options)
+    if execution_arn is None:
+        config_path = repository / "notebooks/config.json"
+        if not config_path.is_file():
+            raise ValueError(f"Use a full execution ARN, or provide namespace in {config_path}.")
+        namespace = json.loads(config_path.read_text()).get("namespace", "").strip()
+        if not namespace:
+            raise ValueError("Set namespace in notebooks/config.json, or use the full execution ARN.")
+        pipeline = sm.describe_pipeline(PipelineName=f"{namespace}-training")
+        execution_arn = pipeline["PipelineArn"] + "/execution/" + execution_id
+    return execution_arn, session, sm, options
+
+
+def _vscode_code(model_id, execution_id):
     """A standalone main block that resolves the editable model/execution inputs."""
-    pipeline_arn = execution_arn.rsplit("/execution/", 1)[0]
     assignments = (
         "# Change these two values to test another model and execution.\n"
         f"MODEL_ID = {model_id!r}\n"
-        f"EXECUTION_ID = {execution_arn!r}\n"
+        f"EXECUTION_ID = {execution_id!r}\n"
     )
     imports_and_lookup = r'''
 from pathlib import Path
@@ -108,36 +152,28 @@ from tempfile import mkdtemp
 from urllib.parse import urlsplit
 import json
 import os
+import sys
+import importlib
 import boto3
 from botocore.config import Config
 
 '''
-    # Embed the same cache-aware lookup; the pasted block needs no helper file.
-    imports_and_lookup += getsource(_processing_job) + "\n"
-    imports_and_lookup += (
-        "# A bare ID uses the original pipeline; a full ARN can select another one.\n"
-        "execution_arn = EXECUTION_ID.strip()\n"
-        "if not execution_arn:\n"
-        '    raise ValueError("Set EXECUTION_ID to an execution ID or its full ARN.")\n'
-        'if not execution_arn.startswith("arn:"):\n'
-        '    if any(character in execution_arn for character in "/: \\t\\n"):\n'
-        '        raise ValueError("Supply an execution ID or full ARN, not a console URL.")\n'
-        f"    execution_arn = {pipeline_arn + '/execution/'!r} + execution_arn\n"
-    )
+    # Use the notebook's own resolution/import functions without a runtime helper dependency.
+    for function in (_parameter_path, _execution_client, _processing_job, _prepare_imports):
+        imports_and_lookup += getsource(function) + "\n"
     setup_and_call = r'''
-parts = execution_arn.split(":", 5)
-if (len(parts) != 6 or parts[2] != "sagemaker"
-        or not parts[5].startswith("pipeline/") or "/execution/" not in parts[5]):
-    raise ValueError("Supply a SageMaker pipeline execution ARN.")
-
-# This block belongs to entrypoints/feature_selection.py, where execute is defined.
-# Read the current checkout's parameters; do not reuse notebook-local paths.
-model_directory = Path(__file__).resolve().parents[1] / "models" / MODEL_ID
-if not MODEL_ID.isidentifier() or not (model_directory / "parameters.json").is_file():
-    raise ValueError("Set MODEL_ID to a model in this checkout with parameters.json.")
-session = boto3.Session(region_name=parts[3])
-client_options = Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 2})
-sm = session.client("sagemaker", config=client_options)
+script_path = Path(__file__).resolve()
+repository = next((parent for parent in script_path.parents
+                   if (parent / "mlops-models/src/mlops_models").is_dir()), None)
+if repository is None:
+    raise ValueError(f"Cannot find the application checkout containing {script_path}.")
+print("Running file:", script_path, flush=True)
+print("Checkout:", repository, "| MODEL_ID:", MODEL_ID, flush=True)
+parameter_path = _parameter_path(repository, MODEL_ID)
+model_directory = parameter_path.parent
+parameters = json.loads(parameter_path.read_text())
+print("Parameters:", parameter_path, "| task_type:", parameters.get("task_type"), flush=True)
+execution_arn, session, sm, client_options = _execution_client(repository, EXECUTION_ID)
 print("Inspecting execution:", execution_arn, flush=True)
 producer_arn, job = _processing_job(sm, execution_arn)
 recorded = job.get("Environment", {})
@@ -156,7 +192,6 @@ if address.scheme != "s3" or not address.netloc or not address.path.strip("/"):
 print("Processing job:", job["ProcessingJobName"], "|", job["ProcessingJobStatus"], flush=True)
 if producer_arn != execution_arn:
     print("Cached FeatureSelection producer:", producer_arn, flush=True)
-print("Current checkout parameters:", model_directory / "parameters.json", flush=True)
 
 work_directory = Path(mkdtemp(prefix="feature-selection-"))
 data_directory = work_directory / "raw"
@@ -165,7 +200,7 @@ data_directory.mkdir()
 output_directory.mkdir()
 (output_directory / "job.json").write_text(json.dumps(job, indent=2, default=str) + "\n")
 (output_directory / "parameters.used.json").write_bytes(
-    (model_directory / "parameters.json").read_bytes()
+    parameter_path.read_bytes()
 )
 print("Download:", raw_uri, flush=True)
 session.client("s3", config=client_options).download_file(
@@ -190,7 +225,12 @@ previous = {key: os.environ.get(key) for key in environment}
 result = None
 try:
     os.environ.update(environment)
-    result = execute(
+    _prepare_imports(repository, MODEL_ID)
+    from mlops_models.entrypoints import feature_selection
+
+    feature_selection = importlib.reload(feature_selection)
+    print("Entrypoint:", feature_selection.__file__, flush=True)
+    result = feature_selection.execute(
         model_id=MODEL_ID,
         input_path=data_directory,
         output_dir=output_directory,
@@ -207,8 +247,8 @@ finally:
     code = (
         "# Paste at the bottom of mlops-models/src/mlops_models/entrypoints/feature_selection.py.\n"
         "# Replace its previous local main block. Open the repository root in VS Code.\n"
-        "# Use this checkout's Python interpreter with the project installed editable,\n"
-        "# or the existing module-based F5 configuration. See README.md: Run a step locally.\n"
+        "# Model and execution are read only from the two assignments below.\n"
+        "# A short execution ID uses notebooks/config.json in this checkout; a full ARN does not.\n"
         'if __name__ == "__main__":\n'
         + indent(assignments + imports_and_lookup + setup_and_call, "    ")
     )
@@ -220,32 +260,8 @@ def prepare(repository, model_id, execution_id):
     """Resolve/download inputs without running selection; prepare the VS Code block."""
     started = perf_counter()
     repository = Path(repository).resolve()
-    parameter_path = repository / "mlops-models/src/mlops_models/models" / model_id / "parameters.json"
-    if not model_id.isidentifier() or not parameter_path.is_file():
-        raise ValueError("Set MODEL_ID to a model in this checkout with parameters.json.")
-    execution_id = execution_id.strip()
-    if not execution_id:
-        raise ValueError("Set EXECUTION_ID to a training execution ID or its full ARN.")
-    if execution_id.startswith("arn:"):
-        parts = execution_id.split(":", 5)
-        if len(parts) != 6 or parts[2] != "sagemaker" or not parts[5].startswith("pipeline/") or "/execution/" not in parts[5]:
-            raise ValueError("Supply a SageMaker pipeline execution ARN.")
-        session = boto3.Session(region_name=parts[3])
-        execution_arn = execution_id
-    else:
-        if any(character in execution_id for character in "/: \t\n"):
-            raise ValueError("Supply a bare execution ID or the full execution ARN, not a console URL.")
-        session = boto3.Session()
-        execution_arn = None
-    client_options = Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 2})
-    sm = session.client("sagemaker", config=client_options)
-    if execution_arn is None:
-        config = json.loads((repository / "notebooks/config.json").read_text())
-        namespace = config.get("namespace", "").strip()
-        if not namespace:
-            raise ValueError("Set namespace in notebooks/config.json, or use the full execution ARN.")
-        pipeline = sm.describe_pipeline(PipelineName=f"{namespace}-training")
-        execution_arn = pipeline["PipelineArn"] + "/execution/" + execution_id
+    parameter_path = _parameter_path(repository, model_id)
+    execution_arn, session, sm, client_options = _execution_client(repository, execution_id)
     print("Inspecting execution:", execution_arn, flush=True)
     producer_arn, job = _processing_job(sm, execution_arn)
     recorded = job.get("Environment", {})
@@ -283,17 +299,13 @@ def prepare(repository, model_id, execution_id):
         "SM_OUTPUT_DATA_DIR": str(output_directory),
         "SM_OUTPUT_DIR": str(output_directory),
     }
-    vscode_code = _vscode_code(model_id, execution_arn)
-    try:
-        # Save the export before downloading or importing the model's dependencies.
-        (output_directory / "vscode_main.py").write_text(vscode_code, encoding="utf-8")
-        (output_directory / "job.json").write_text(json.dumps(job, indent=2, default=str) + "\n")
-        (output_directory / "parameters.used.json").write_bytes(parameter_path.read_bytes())
-        s3 = session.client("s3", config=client_options)
-        _download_raw(s3, raw_uri, data_directory / "data.csv")
-    except BaseException:
-        print(vscode_code, flush=True)
-        raise
+    vscode_code = _vscode_code(model_id, execution_id)
+    # Save the export before downloading or importing the model's dependencies.
+    (output_directory / "vscode_main.py").write_text(vscode_code, encoding="utf-8")
+    (output_directory / "job.json").write_text(json.dumps(job, indent=2, default=str) + "\n")
+    (output_directory / "parameters.used.json").write_bytes(parameter_path.read_bytes())
+    s3 = session.client("s3", config=client_options)
+    _download_raw(s3, raw_uri, data_directory / "data.csv")
     print("Current checkout parameters:", parameter_path, flush=True)
     print("Local output directory:", output_directory, flush=True)
     print(f"Inputs ready in {perf_counter() - started:.1f}s; run the next cell.", flush=True)

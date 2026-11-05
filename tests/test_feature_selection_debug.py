@@ -207,7 +207,9 @@ class FeatureSelectionDebug(unittest.TestCase):
         self.run_selection()
         self.etag = '"raw-v2"'
         self.s3.download_file.side_effect = RuntimeError("download interrupted")
-        with patch.object(support, "_prepare_imports") as load:
+        code = support._vscode_code("demo", EXECUTION)
+        with patch.object(support, "_vscode_code", return_value=code), \
+                patch.object(support, "_prepare_imports") as load:
             with self.assertRaisesRegex(RuntimeError, "download interrupted"):
                 self.run_selection()
             load.assert_not_called()
@@ -231,14 +233,30 @@ class FeatureSelectionDebug(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Restart the kernel"):
             support._prepare_imports(self.root, "demo")
 
-    def test_three_notebook_cells_execute_from_steps_directory(self):
+    def notebook_cell(self, cell_id):
+        notebook = json.loads((ROOT / "notebooks/steps/feature_selection.ipynb").read_text())
+        return "".join(next(cell["source"] for cell in notebook["cells"] if cell["id"] == cell_id))
+
+    def copy_helper(self):
+        helper = self.root / "notebooks/source/feature_selection/support.py"
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(HELPER, helper)
+
+    def export_namespace(self, code, script=None):
+        namespace = {
+            "__name__": "__main__",
+            "__file__": str(script or self.source / "mlops_models/entrypoints/feature_selection.py"),
+        }
+        with patch("tempfile.tempdir", str(self.root)), redirect_stdout(io.StringIO()):
+            exec(code, namespace)
+        return namespace
+
+    def test_four_cells_separate_step_output_from_copyable_export(self):
         notebook = json.loads((ROOT / "notebooks/steps/feature_selection.ipynb").read_text())
         cells = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
-        self.assertEqual(len(cells), 3)
+        self.assertEqual(len(cells), 4)
         self.assertTrue(all(not cell["outputs"] and cell["execution_count"] is None for cell in cells))
-        helper = self.root / "notebooks/source/feature_selection/support.py"
-        helper.parent.mkdir(parents=True)
-        shutil.copyfile(HELPER, helper)
+        self.copy_helper()
         steps = self.root / "notebooks/steps"
         steps.mkdir()
         namespace = {}
@@ -250,18 +268,24 @@ class FeatureSelectionDebug(unittest.TestCase):
             self.assertNotIn("result", namespace)
             exec("".join(cells[2]["source"]), namespace)
         self.assertTrue((namespace["result"] / "selected_features.csv").is_file())
-        self.assertIn(namespace["step"].vscode_code, output.getvalue())
+        self.assertNotIn('if __name__ == "__main__":', output.getvalue())
+        exported = io.StringIO()
+        with redirect_stdout(exported):
+            exec("".join(cells[3]["source"]), namespace)
+        self.assertEqual(exported.getvalue(), namespace["vscode_code"])
+        compile(exported.getvalue(), "copied-output.py", "exec")
 
     def test_preparation_does_not_import_or_run_the_model(self):
-        with patch.object(support, "_prepare_imports") as load:
+        code = support._vscode_code("demo", EXECUTION)
+        with patch.object(support, "_vscode_code", return_value=code), \
+                patch.object(support, "_prepare_imports") as load:
             step = self.prepare_step()
         load.assert_not_called()
         self.assertFalse((step.output_directory / "selection").exists())
         self.assertEqual((step.output_directory / "vscode_main.py").read_text(), step.vscode_code)
 
-    def test_notebook_exports_after_failure_interrupt_and_import_error(self):
+    def test_notebook_continues_to_clean_export_after_failure_interrupt_and_import_error(self):
         step = self.prepare_step()
-        cell = self.execution_cell()
         real_reload = importlib.reload
         real_prepare = support._prepare_imports
         for failure, during_import in [
@@ -270,7 +294,12 @@ class FeatureSelectionDebug(unittest.TestCase):
             (ModuleNotFoundError("model dependency missing"), True),
         ]:
             with self.subTest(failure=type(failure).__name__):
-                namespace = {"step": step, "support": {"local_environment": support.local_environment}, "result": "stale"}
+                namespace = {
+                    "step": step, "support": {"local_environment": support.local_environment},
+                    "result": "stale", "vscode_code": step.vscode_code,
+                    "MODEL_ID": "demo", "EXECUTION_ID": EXECUTION,
+                    "prepared_inputs": ("demo", EXECUTION),
+                }
                 execute = Mock(side_effect=failure)
                 load = Mock(side_effect=failure) if during_import else real_prepare
 
@@ -284,17 +313,17 @@ class FeatureSelectionDebug(unittest.TestCase):
                         patch.object(importlib, "reload", side_effect=reload_module), \
                         patch.dict(os.environ, {"MLOPS_TRACKING_URI": "before"}), \
                         redirect_stdout(output):
-                    try:
-                        exec(compile(cell, "feature_selection_notebook", "exec"), namespace)
-                    except BaseException as error:
-                        self.assertIs(error, failure)
-                        self.assertTrue(any(frame.filename == "feature_selection_notebook"
-                                            for frame in traceback.extract_tb(error.__traceback__)))
-                    else:
-                        self.fail("The execution error was suppressed.")
+                    exec(compile(self.execution_cell(), "feature_selection_notebook", "exec"), namespace)
                     self.assertEqual(os.environ["MLOPS_TRACKING_URI"], "before")
+                self.assertIs(namespace["execution_error"], failure)
                 self.assertIsNone(namespace["result"])
-                self.assertIn(step.vscode_code, output.getvalue())
+                self.assertIn(type(failure).__name__, output.getvalue())
+                self.assertIn("feature_selection_notebook", output.getvalue())
+                self.assertNotIn(step.vscode_code, output.getvalue())
+                exported = io.StringIO()
+                with redirect_stdout(exported):
+                    exec(self.notebook_cell("export-vscode"), namespace)
+                self.assertEqual(exported.getvalue(), step.vscode_code)
 
     def test_environment_prepares_imports_without_loading_an_entrypoint(self):
         step = self.prepare_step()
@@ -302,146 +331,171 @@ class FeatureSelectionDebug(unittest.TestCase):
             self.assertIsNone(value)
             self.assertNotIn("mlops_models.entrypoints.feature_selection", sys.modules)
 
-    def test_download_failure_still_prints_resolved_export(self):
+    def test_download_failure_saves_export_without_printing_it_among_logs(self):
         self.s3.download_file.side_effect = RuntimeError("download failed")
         output = io.StringIO()
         with redirect_stdout(output), self.assertRaisesRegex(RuntimeError, "download failed"):
             support.prepare(self.root, "demo", EXECUTION)
-        printed = output.getvalue()
-        self.assertIn('if __name__ == "__main__":', printed)
-        self.assertIn("older-get-data/steps/GetData/raw/data.csv", printed)
+        self.assertNotIn('if __name__ == "__main__":', output.getvalue())
+        saved = list((self.root / ".runs").rglob("vscode_main.py"))
+        self.assertEqual(len(saved), 1)
+        compile(saved[0].read_text(), "saved-export.py", "exec")
 
-    def test_failed_lookup_clears_previous_notebook_step(self):
-        notebook = json.loads((ROOT / "notebooks/steps/feature_selection.ipynb").read_text())
-        prepare = "".join(next(cell["source"] for cell in notebook["cells"] if cell["id"] == "prepare"))
-        helper = self.root / "notebooks/source/feature_selection/support.py"
-        helper.parent.mkdir(parents=True)
-        shutil.copyfile(HELPER, helper)
+    def test_failed_lookup_clears_previous_step_and_still_reaches_export(self):
+        self.copy_helper()
         namespace = {"step": self.prepare_step(), "MODEL_ID": "demo", "EXECUTION_ID": "invalid"}
         self.sm.get_paginator.return_value.paginate.side_effect = RuntimeError("execution missing")
-        with patch.object(Path, "cwd", return_value=self.root), redirect_stdout(io.StringIO()), \
-                self.assertRaisesRegex(RuntimeError, "execution missing"):
-            exec(prepare, namespace)
-        self.assertIsNone(namespace["step"])
-        with self.assertRaisesRegex(ValueError, "preparation cell"):
+        output = io.StringIO()
+        with patch.object(Path, "cwd", return_value=self.root), redirect_stdout(output):
+            exec(self.notebook_cell("prepare"), namespace)
             exec(self.execution_cell(), namespace)
+        self.assertIsNone(namespace["step"])
+        self.assertIsNone(namespace["result"])
+        self.assertIn("execution missing", output.getvalue())
+        self.assertNotIn('if __name__ == "__main__":', output.getvalue())
+        exported = io.StringIO()
+        with redirect_stdout(exported):
+            exec(self.notebook_cell("export-vscode"), namespace)
+        self.assertEqual(exported.getvalue(), namespace["vscode_code"])
+        self.assertIn("EXECUTION_ID = 'invalid'", exported.getvalue())
 
-    def test_export_resolves_current_job_inputs_without_notebook_or_helper(self):
+    def test_changed_notebook_inputs_do_not_execute_the_previously_prepared_model(self):
         step = self.prepare_step()
-        # The export resolves the selected execution when run, not when generated.
+        environment = Mock()
+        namespace = {
+            "step": step, "support": {"local_environment": environment},
+            "MODEL_ID": "ICLV", "EXECUTION_ID": EXECUTION,
+            "prepared_inputs": ("demo", EXECUTION), "result": "stale",
+        }
+        with redirect_stdout(io.StringIO()):
+            exec(self.execution_cell(), namespace)
+        environment.assert_not_called()
+        self.assertIsNone(namespace["result"])
+
+    def test_export_resolves_current_job_and_calls_real_entrypoint(self):
+        step = self.prepare_step()
         self.job["ProcessingInputs"][0]["S3Input"]["S3Uri"] = "s3://bucket/new/raw"
         self.assertNotIn("s3://bucket/new/raw", step.vscode_code)
         self.assertNotIn("s3://bucket/older-get-data", step.vscode_code)
-        execute = Mock(return_value="direct-result")
-        namespace = {
-            "__name__": "__main__",
-            "__file__": str(self.source / "mlops_models/entrypoints/feature_selection.py"),
-            "execute": execute,
-        }
-        with patch("tempfile.tempdir", str(self.root)), redirect_stdout(io.StringIO()), \
-                patch.dict(os.environ, {"MLOPS_MODEL_METADATA_URI": "before"}):
-            exec(step.vscode_code, namespace)
+        with patch.dict(os.environ, {"MLOPS_MODEL_METADATA_URI": "before"}):
+            namespace = self.export_namespace(step.vscode_code)
             self.assertEqual(os.environ["MLOPS_MODEL_METADATA_URI"], "before")
-        execute.assert_called_once_with(
-            model_id="demo", input_path=namespace["data_directory"],
-            output_dir=namespace["output_directory"],
-        )
-        self.assertEqual(namespace["result"], "direct-result")
+        self.assertTrue((namespace["result"] / "selected_features.csv").is_file())
+        observed = json.loads((namespace["output_directory"] / "observed.json").read_text())
+        self.assertEqual(observed["task_type"], "classification")
         self.assertEqual((namespace["data_directory"] / "data.csv").read_bytes(), self.raw)
         self.assertEqual(self.s3.download_file.call_args.args[:2], ("bucket", "new/raw/data.csv"))
 
-    def test_export_switches_model_execution_region_and_cached_producer_together(self):
+    def test_switch_from_classifier_to_uppercase_regression_model_runs_correct_code(self):
         step = self.prepare_step()
-        second_model = self.parameters.parent.parent / "second_model"
+        first = self.export_namespace(step.vscode_code)
+        first_observed = json.loads((first["output_directory"] / "observed.json").read_text())
+        self.assertEqual(first_observed["task_type"], "classification")
+        second_model = self.parameters.parent.parent / "ICLV"
         second_model.mkdir()
         second_parameters = second_model / "parameters.json"
-        second_parameters.write_bytes(self.parameters.read_bytes())
+        second_parameters.write_text(json.dumps({**self.settings, "task_type": "regression"}))
+        (second_model / "training").mkdir()
+        shutil.copyfile(self.override, second_model / "training/feature_selection.py")
         before = {path: path.read_bytes() for path in (self.parameters, second_parameters)}
         second_execution = EXECUTION.replace("us-east-1", "us-west-2").replace("newrun", "secondrun")
         second_producer = second_execution.replace("secondrun", "secondproducer")
         self.steps[second_execution] = [{
-            **self.steps[EXECUTION][0],
-            "CacheHitResult": {"SourcePipelineExecutionArn": second_producer},
+            **self.steps[EXECUTION][0], "CacheHitResult": {"SourcePipelineExecutionArn": second_producer},
         }]
         self.steps[second_producer] = [{
-            "StepName": "FeatureSelection",
-            "Metadata": {"ProcessingJob": {"Arn": "arn:job/second-job"}},
+            "StepName": "FeatureSelection", "Metadata": {"ProcessingJob": {"Arn": "arn:job/second-job"}},
         }]
         self.job = {
-            **self.job,
-            "ProcessingJobName": "second-job",
+            **self.job, "ProcessingJobName": "second-job",
             "Environment": {
-                "MODEL_ID": "second_model", "MLOPS_TRAINING_SELECTION": "Preliminary models with validation",
+                "MODEL_ID": "ICLV", "MLOPS_TRAINING_SELECTION": "Preliminary models with validation",
                 "MLOPS_MODEL_METADATA_URI": "none",
             },
-            "ProcessingInputs": [{
-                "InputName": "raw", "S3Input": {"S3Uri": "s3://second-bucket/second/data.csv"},
-            }],
+            "ProcessingInputs": [{"InputName": "raw", "S3Input": {"S3Uri": "s3://second-bucket/second/data.csv"}}],
         }
         self.sm.describe_processing_job.return_value = self.job
-        second_raw = self.raw.replace(b"001,1,8,0", b"001,9,8,0")
+        # Continuous targets would fail if the old classifier were still selected.
+        second_raw = b"id,x,y,target\n001,1,8,0.15\n002,2,7,0.35\n003,3,6,1.25\n004,4,5,1.75\n005,5,4,0.55\n006,6,3,1.65\n"
         self.s3.download_file.side_effect = lambda bucket, key, path: Path(path).write_bytes(second_raw)
         self.session_factory.reset_mock()
-        observed = {}
-
-        def execute(**kwargs):
-            observed.update(kwargs)
-            observed["environment"] = dict(os.environ)
-            return "second-result"
-
-        namespace = {
-            "__name__": "__main__",
-            "__file__": str(self.source / "mlops_models/entrypoints/feature_selection.py"),
-            "execute": execute,
-        }
-        code = step.vscode_code.replace("MODEL_ID = 'demo'", "MODEL_ID = 'second_model'").replace(
+        code = step.vscode_code.replace("MODEL_ID = 'demo'", "MODEL_ID = 'ICLV'").replace(
             f"EXECUTION_ID = {EXECUTION!r}", f"EXECUTION_ID = {second_execution!r}")
-        with patch("tempfile.tempdir", str(self.root)), redirect_stdout(io.StringIO()), \
-                patch.dict(os.environ, {"MODEL_ID": "previous-model"}):
-            exec(code, namespace)
-            self.assertEqual(os.environ["MODEL_ID"], "previous-model")
+        with patch.dict(os.environ, {"MODEL_ID": "demo", "MLOPS_MODEL_DIR": str(self.parameters.parent)}):
+            namespace = self.export_namespace(code)
+            self.assertEqual(os.environ["MODEL_ID"], "demo")
         self.session_factory.assert_called_once_with(region_name="us-west-2")
         self.sm.describe_processing_job.assert_called_with(ProcessingJobName="second-job")
         self.assertEqual(namespace["producer_arn"], second_producer)
-        self.assertEqual(namespace["result"], "second-result")
-        self.assertEqual(observed["model_id"], "second_model")
-        self.assertEqual(observed["environment"]["MLOPS_TRAINING_MODE"], "1")
-        self.assertEqual(observed["environment"]["MLOPS_MODEL_METADATA_URI"], "none")
-        self.assertEqual(observed["environment"]["MLOPS_MODEL_DIR"], str(second_model.resolve()))
-        self.assertEqual((observed["input_path"] / "data.csv").read_bytes(), second_raw)
-        self.assertEqual(self.s3.download_file.call_args.args[:2], ("second-bucket", "second/data.csv"))
+        observed = json.loads((namespace["output_directory"] / "observed.json").read_text())
+        self.assertEqual(observed["task_type"], "regression")
+        self.assertEqual(observed["mode"], "1")
+        self.assertEqual(observed["metadata"], "none")
+        self.assertEqual(namespace["parameter_path"], second_parameters.resolve())
+        self.assertTrue((namespace["result"] / "selected_features.csv").is_file())
+        self.assertEqual((namespace["data_directory"] / "data.csv").read_bytes(), second_raw)
         self.assertTrue(all(path.read_bytes() == content for path, content in before.items()))
 
-    def test_export_accepts_bare_id_in_original_pipeline_without_local_config(self):
+    def test_export_uses_current_checkout_config_for_short_id(self):
         step = self.prepare_step()
+        self.sm.describe_pipeline.reset_mock()
+        new_execution = EXECUTION.replace("debug-training", "new-namespace-training").replace("123456789012", "999999999999")
+        self.steps[new_execution] = self.steps[EXECUTION]
+        self.sm.describe_pipeline.return_value = {"PipelineArn": new_execution.rsplit("/execution/", 1)[0]}
+        (self.root / "notebooks/config.json").write_text(json.dumps({"namespace": "new-namespace"}))
+        code = step.vscode_code.replace(f"EXECUTION_ID = {EXECUTION!r}", "EXECUTION_ID = 'newrun'")
+        self.assertNotIn("123456789012", code)
+        self.assertNotIn("debug-training", code)
+        namespace = self.export_namespace(code)
+        self.sm.describe_pipeline.assert_called_once_with(PipelineName="new-namespace-training")
+        self.assertEqual(namespace["execution_arn"], new_execution)
+        self.assertTrue((namespace["result"] / "selected_features.csv").is_file())
+
+    def test_full_arn_occurs_only_in_editable_input_and_needs_no_config(self):
+        step = self.prepare_step()
+        self.assertEqual(step.vscode_code.count(EXECUTION), 1)
+        self.assertEqual(step.vscode_code.count("123456789012"), 1)
         (self.root / "notebooks/config.json").unlink()
         self.sm.describe_pipeline.reset_mock()
-        namespace = {
-            "__name__": "__main__",
-            "__file__": str(self.source / "mlops_models/entrypoints/feature_selection.py"),
-            "execute": Mock(return_value="bare-id-result"),
-        }
-        code = step.vscode_code.replace(f"EXECUTION_ID = {EXECUTION!r}", "EXECUTION_ID = 'newrun'")
-        with patch("tempfile.tempdir", str(self.root)), redirect_stdout(io.StringIO()):
-            exec(code, namespace)
+        namespace = self.export_namespace(step.vscode_code)
         self.sm.describe_pipeline.assert_not_called()
         self.assertEqual(namespace["execution_arn"], EXECUTION)
-        self.assertEqual(namespace["result"], "bare-id-result")
 
-    def test_export_rejects_mismatched_model_before_download_or_execution(self):
+    def test_short_id_without_config_reports_required_path(self):
+        (self.root / "notebooks/config.json").unlink()
+        with self.assertRaisesRegex(ValueError, "full execution ARN.*notebooks/config.json"):
+            self.export_namespace(support._vscode_code("demo", "newrun"))
+
+    def test_export_rejects_mismatched_job_model_before_download_or_execution(self):
         step = self.prepare_step()
         self.job["Environment"]["MODEL_ID"] = "different-model"
         self.s3.download_file.reset_mock()
-        execute = Mock()
-        namespace = {
-            "__name__": "__main__",
-            "__file__": str(self.source / "mlops_models/entrypoints/feature_selection.py"),
-            "execute": execute,
-        }
-        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "different-model"):
-            exec(step.vscode_code, namespace)
+        with self.assertRaisesRegex(ValueError, "different-model"):
+            self.export_namespace(step.vscode_code)
         self.s3.download_file.assert_not_called()
-        execute.assert_not_called()
+        self.assertNotIn("mlops_models.entrypoints.feature_selection", sys.modules)
+
+    def test_model_lookup_uses_checkout_not_fixed_parent_depth(self):
+        code = support._vscode_code("demo", EXECUTION)
+        nested_script = self.parameters.parent / "training/local_run.py"
+        namespace = self.export_namespace(code, script=nested_script)
+        self.assertEqual(namespace["parameter_path"], self.parameters.resolve())
+        self.assertTrue((namespace["result"] / "selected_features.csv").is_file())
+
+    def test_missing_model_reports_exact_path_and_available_models(self):
+        with self.assertRaises(ValueError) as caught:
+            self.export_namespace(support._vscode_code("ICLV", EXECUTION))
+        self.assertIn("MODEL_ID='ICLV'", str(caught.exception))
+        self.assertIn(str(self.parameters.parent.parent.resolve() / "ICLV/parameters.json"), str(caught.exception))
+        self.assertIn("demo", str(caught.exception))
+        self.s3.download_file.assert_not_called()
+
+    def test_export_rejects_foreign_import_instead_of_using_its_model_code(self):
+        foreign = ModuleType("mlops_models")
+        foreign.__file__ = "/different-checkout/mlops_models/__init__.py"
+        sys.modules["mlops_models"] = foreign
+        with self.assertRaisesRegex(RuntimeError, "/different-checkout/.*but this run uses"):
+            self.export_namespace(support._vscode_code("demo", EXECUTION))
 
     def test_exported_main_runs_real_entrypoint_in_relocated_clone_without_launch_config(self):
         step = self.prepare_step()
