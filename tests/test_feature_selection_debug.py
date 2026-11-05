@@ -326,20 +326,19 @@ class FeatureSelectionDebug(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "preparation cell"):
             exec(self.execution_cell(), namespace)
 
-    def test_export_uses_frozen_inputs_and_runs_without_notebook_or_helper(self):
+    def test_export_resolves_current_job_inputs_without_notebook_or_helper(self):
         step = self.prepare_step()
-        # A later notebook lookup must not change the previous export.
+        # The export resolves the selected execution when run, not when generated.
         self.job["ProcessingInputs"][0]["S3Input"]["S3Uri"] = "s3://bucket/new/raw"
-        self.prepare_step()
         self.assertNotIn("s3://bucket/new/raw", step.vscode_code)
+        self.assertNotIn("s3://bucket/older-get-data", step.vscode_code)
         execute = Mock(return_value="direct-result")
         namespace = {
             "__name__": "__main__",
             "__file__": str(self.source / "mlops_models/entrypoints/feature_selection.py"),
             "execute": execute,
         }
-        with patch("boto3.client", return_value=self.s3), \
-                patch("tempfile.tempdir", str(self.root)), redirect_stdout(io.StringIO()), \
+        with patch("tempfile.tempdir", str(self.root)), redirect_stdout(io.StringIO()), \
                 patch.dict(os.environ, {"MLOPS_MODEL_METADATA_URI": "before"}):
             exec(step.vscode_code, namespace)
             self.assertEqual(os.environ["MLOPS_MODEL_METADATA_URI"], "before")
@@ -349,8 +348,102 @@ class FeatureSelectionDebug(unittest.TestCase):
         )
         self.assertEqual(namespace["result"], "direct-result")
         self.assertEqual((namespace["data_directory"] / "data.csv").read_bytes(), self.raw)
+        self.assertEqual(self.s3.download_file.call_args.args[:2], ("bucket", "new/raw/data.csv"))
 
-    def test_exported_main_runs_real_entrypoint_in_relocated_clone_with_launch_config(self):
+    def test_export_switches_model_execution_region_and_cached_producer_together(self):
+        step = self.prepare_step()
+        second_model = self.parameters.parent.parent / "second_model"
+        second_model.mkdir()
+        second_parameters = second_model / "parameters.json"
+        second_parameters.write_bytes(self.parameters.read_bytes())
+        before = {path: path.read_bytes() for path in (self.parameters, second_parameters)}
+        second_execution = EXECUTION.replace("us-east-1", "us-west-2").replace("newrun", "secondrun")
+        second_producer = second_execution.replace("secondrun", "secondproducer")
+        self.steps[second_execution] = [{
+            **self.steps[EXECUTION][0],
+            "CacheHitResult": {"SourcePipelineExecutionArn": second_producer},
+        }]
+        self.steps[second_producer] = [{
+            "StepName": "FeatureSelection",
+            "Metadata": {"ProcessingJob": {"Arn": "arn:job/second-job"}},
+        }]
+        self.job = {
+            **self.job,
+            "ProcessingJobName": "second-job",
+            "Environment": {
+                "MODEL_ID": "second_model", "MLOPS_TRAINING_SELECTION": "Preliminary models with validation",
+                "MLOPS_MODEL_METADATA_URI": "none",
+            },
+            "ProcessingInputs": [{
+                "InputName": "raw", "S3Input": {"S3Uri": "s3://second-bucket/second/data.csv"},
+            }],
+        }
+        self.sm.describe_processing_job.return_value = self.job
+        second_raw = self.raw.replace(b"001,1,8,0", b"001,9,8,0")
+        self.s3.download_file.side_effect = lambda bucket, key, path: Path(path).write_bytes(second_raw)
+        self.session_factory.reset_mock()
+        observed = {}
+
+        def execute(**kwargs):
+            observed.update(kwargs)
+            observed["environment"] = dict(os.environ)
+            return "second-result"
+
+        namespace = {
+            "__name__": "__main__",
+            "__file__": str(self.source / "mlops_models/entrypoints/feature_selection.py"),
+            "execute": execute,
+        }
+        code = step.vscode_code.replace("MODEL_ID = 'demo'", "MODEL_ID = 'second_model'").replace(
+            f"EXECUTION_ID = {EXECUTION!r}", f"EXECUTION_ID = {second_execution!r}")
+        with patch("tempfile.tempdir", str(self.root)), redirect_stdout(io.StringIO()), \
+                patch.dict(os.environ, {"MODEL_ID": "previous-model"}):
+            exec(code, namespace)
+            self.assertEqual(os.environ["MODEL_ID"], "previous-model")
+        self.session_factory.assert_called_once_with(region_name="us-west-2")
+        self.sm.describe_processing_job.assert_called_with(ProcessingJobName="second-job")
+        self.assertEqual(namespace["producer_arn"], second_producer)
+        self.assertEqual(namespace["result"], "second-result")
+        self.assertEqual(observed["model_id"], "second_model")
+        self.assertEqual(observed["environment"]["MLOPS_TRAINING_MODE"], "1")
+        self.assertEqual(observed["environment"]["MLOPS_MODEL_METADATA_URI"], "none")
+        self.assertEqual(observed["environment"]["MLOPS_MODEL_DIR"], str(second_model.resolve()))
+        self.assertEqual((observed["input_path"] / "data.csv").read_bytes(), second_raw)
+        self.assertEqual(self.s3.download_file.call_args.args[:2], ("second-bucket", "second/data.csv"))
+        self.assertTrue(all(path.read_bytes() == content for path, content in before.items()))
+
+    def test_export_accepts_bare_id_in_original_pipeline_without_local_config(self):
+        step = self.prepare_step()
+        (self.root / "notebooks/config.json").unlink()
+        self.sm.describe_pipeline.reset_mock()
+        namespace = {
+            "__name__": "__main__",
+            "__file__": str(self.source / "mlops_models/entrypoints/feature_selection.py"),
+            "execute": Mock(return_value="bare-id-result"),
+        }
+        code = step.vscode_code.replace(f"EXECUTION_ID = {EXECUTION!r}", "EXECUTION_ID = 'newrun'")
+        with patch("tempfile.tempdir", str(self.root)), redirect_stdout(io.StringIO()):
+            exec(code, namespace)
+        self.sm.describe_pipeline.assert_not_called()
+        self.assertEqual(namespace["execution_arn"], EXECUTION)
+        self.assertEqual(namespace["result"], "bare-id-result")
+
+    def test_export_rejects_mismatched_model_before_download_or_execution(self):
+        step = self.prepare_step()
+        self.job["Environment"]["MODEL_ID"] = "different-model"
+        self.s3.download_file.reset_mock()
+        execute = Mock()
+        namespace = {
+            "__name__": "__main__",
+            "__file__": str(self.source / "mlops_models/entrypoints/feature_selection.py"),
+            "execute": execute,
+        }
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "different-model"):
+            exec(step.vscode_code, namespace)
+        self.s3.download_file.assert_not_called()
+        execute.assert_not_called()
+
+    def test_exported_main_runs_real_entrypoint_in_relocated_clone_without_launch_config(self):
         step = self.prepare_step()
         clone = self.root / "relocated clone"
         shutil.copytree(self.source, clone / "mlops-models/src")
@@ -359,21 +452,29 @@ class FeatureSelectionDebug(unittest.TestCase):
         # The copy intentionally has no notebook, helper, or notebook config.
         (clone / "boto3.py").write_text(
             "from pathlib import Path\n"
+            f"JOB = {self.job!r}\n"
+            "class Paginator:\n"
+            "    def paginate(self, **kwargs):\n"
+            "        return [{'PipelineExecutionSteps': [{'StepName': 'FeatureSelection',\n"
+            "            'Metadata': {'ProcessingJob': {'Arn': 'arn:job/selection-job'}}}]}]\n"
+            "class SM:\n"
+            "    def get_paginator(self, name):\n"
+            "        return Paginator()\n"
+            "    def describe_processing_job(self, **kwargs):\n"
+            "        return JOB\n"
             "class S3:\n"
             "    def download_file(self, bucket, key, path):\n"
             "        assert (bucket, key) == ('bucket', 'older-get-data/steps/GetData/raw/data.csv')\n"
             f"        Path(path).write_bytes({self.raw!r})\n"
-            "def client(name, **kwargs):\n"
-            "    assert name == 's3'\n"
-            "    return S3()\n"
+            "class Session:\n"
+            "    def __init__(self, region_name):\n"
+            "        assert region_name == 'us-east-1'\n"
+            "    def client(self, name, **kwargs):\n"
+            "        return {'sagemaker': SM(), 's3': S3()}[name]\n"
         )
-        config = json.loads((ROOT / ".vscode/launch.json").read_text())["configurations"][0]
-        module = config["module"].replace("${fileBasenameNoExtension}", "feature_selection")
-        pythonpath = config["env"]["PYTHONPATH"].replace("${workspaceFolder}", str(clone))
-        cwd = config["cwd"].replace("${workspaceFolder}", str(clone))
         process = subprocess.run(
-            [sys.executable, "-m", module], cwd=cwd,
-            env={**os.environ, "PYTHONPATH": pythonpath, "PYTHONDONTWRITEBYTECODE": "1",
+            [sys.executable, "-m", "mlops_models.entrypoints.feature_selection"], cwd=clone,
+            env={**os.environ, "PYTHONPATH": str(clone / "mlops-models/src"), "PYTHONDONTWRITEBYTECODE": "1",
                  "TMPDIR": str(clone)},
             text=True, capture_output=True, timeout=45,
         )

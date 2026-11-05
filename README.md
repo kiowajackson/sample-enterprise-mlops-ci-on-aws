@@ -1,694 +1,562 @@
-# Enterprise MLOps — training and batch prediction
+# Training and batch inference pipelines on SageMaker
 
-Updated: 2026-11-05.
+Train, test and run batch inference for your models with SageMaker pipelines,
+started from SageMaker Studio.
 
-Run **00 Deploy pipelines → 05 Integration test** from a complete application
-checkout. Apply replacement files to that checkout before running them.
-Each namespace has one shared training pipeline and one shared inference pipeline;
-each execution selects its model through `ModelId`.
+## Quick start
 
-Model parameters are supplied inputs in
-`mlops-models/src/mlops_models/models/<ModelId>/parameters.json`. The setup and
-step notebooks read them unchanged. Model owners define their structure and
-contents; synthetic examples must fit that contract.
+![Two steps to get running](assets/images/get-started.png)
 
-Training registers a Development model. An authorized reviewer approves the
-version, and inference selects an eligible approved model in the same namespace.
-MLflow is optional and defaults off. Production promotion through CDK/CI remains
-separate platform integration work.
-
-## Notebook workflows
-
-| Notebook | Purpose |
-| --- | --- |
-| [00 — Deploy pipelines](notebooks/00_deploy_pipelines.ipynb) | Main setup: validate configuration, reuse or prepare data, publish the training/inference pair. |
-| [01 — Prepare data](notebooks/01_prepare_data.ipynb) | Optional detailed data preparation and Feature Store ingestion. |
-| [02 — Deploy pipelines](notebooks/02_deploy_pipelines.ipynb) | Optional detailed publication and exact-version model approval. |
-| [03 — Experiment with model code](notebooks/03_experiment_model_base.ipynb) | Run model code directly in the notebook kernel. |
-| [04 — Run and monitor](notebooks/04_run_and_monitor.ipynb) | Start and inspect individual managed executions. |
-| [05 — Integration test](notebooks/05_integration_test.ipynb) | Run preliminary training, full training and inference; inspect their artifacts. |
-
-Notebook 00 reads `notebooks/config.json`. A complete local configuration is
-reused without reading Secrets Manager. Shared settings can initialize an
-incomplete configuration; `REFRESH_SHARED=True` explicitly requests a refresh.
-Outside Studio, supply `user_alias` or `namespace`.
-
-With `DATA_MODE="auto"`, complete data inputs are reused. When none are supplied,
-setup prepares synthetic training, held-out test and inference files. Partial or
-inaccessible inputs stop the run. Choose `reuse` to require existing data or
-`generate` to deliberately regenerate synthetic inputs.
-
-Notebook 00 returns the namespace, input locations and published pipeline
-names/versions. It does not start training. Notebooks 01 and 02 are optional
-detailed alternatives; running all three setup notebooks is unnecessary.
-
-If setup fails, save the notebook **with outputs**. Its output includes the
-failing stage, source paths/hashes, SDK versions, AWS request details and original
-traceback. Detailed logs and reports remain under `.runs/setup/`. A partial
-publication can leave successfully published versions in place; inspect the
-reported versions before retrying.
-
-The setup files have distinct responsibilities:
-
-| File | Responsibility |
-| --- | --- |
-| [deploy_pipelines.py](notebooks/source/setup/deploy_pipelines.py) | Coordinate configuration, data preparation/reuse and publication; return the overall result. |
-| [publish_pipelines.py](notebooks/source/setup/publish_pipelines.py) | Validate/upload inputs and source, build definitions, publish and verify pipeline versions. |
-| [deployment_diagnostics.py](notebooks/source/setup/deployment_diagnostics.py) | Record context, API request/response summaries and chained errors for those operations. |
-
-Use notebook 04 to start individual runs or inspect an existing execution.
-Each run of its Start cell creates a new execution; status and output inspection
-do not start another job.
-
-### Run a step locally
-
-Open [Feature selection](notebooks/steps/feature_selection.ipynb), set `MODEL_ID`
-and `EXECUTION_ID`, and run its preparation and execution cells. The setup finds
-the actual job's raw input, including cached producers. The final cell imports
-`mlops_models.entrypoints.feature_selection` and calls
-`feature_selection.execute(...)` directly.
-
-The notebook uses the current checkout's model code and unchanged parameters.
-`notebooks/source/feature_selection/support.py` prepares inputs, the local
-environment and the VS Code export. It does not call the entrypoint. The
-notebook retains local inputs/outputs and prints the export in `finally`, so an
-execution failure still leaves the original traceback and a block to copy into
-the entrypoint for VS Code.
-
-With the model dependencies installed, an editable installation connects a
-standalone Python process to the checkout:
+**1. Clone the repository** in a terminal in your SageMaker Studio space:
 
 ```bash
-python -m pip install --no-deps -e .
+git clone <REPOSITORY_URL>
 ```
 
-Use that interpreter in VS Code. The existing F5 configuration is another
-supported option; a new `launch.json` is not required. Rerun the execution cell
-after editing model code; rerun preparation after changing model/execution
-inputs. Restart the kernel after changing shared dependencies or checkouts.
-Other step notebooks retain their current input cells and have not all been
-converted to this layout.
+**2. Run notebook 00.** Open `notebooks/00_deploy_pipelines.ipynb` and run all
+cells.
 
-| I want to… | Start here |
-| --- | --- |
-| Inspect or run the existing deployment | [Use the existing pipelines](#use-the-existing-pipelines) |
-| Understand the steps and data flow | [How the application works](#how-the-application-works) |
-| Find the code for a step or model | [Read the code](#read-the-code) |
-| Run the managed test suite | [Integration test after deployment](#integration-test-after-deployment) |
-| Review production integration | [Notebook isolation and the future CDK route](#notebook-isolation-and-the-future-cdk-route) |
+That's it. These two steps deploy everything described below: your namespace,
+its input data and your training and batch inference pipelines. **You are now up
+and running.** Start a training run from Studio: **Pipelines →
+`<namespace>-training` → Create execution**.
 
-## Use the existing pipelines
+Read on to see how it works.
 
-Obtain the current deployment's account/Region, training and inference pipeline
-names, accepted version numbers, available `ModelId` values and Registry groups
-from the deployment owner. Use the actual deployed values; names shown in source
-examples are not receiving-environment bindings.
+## Contents
 
-**To inspect the working example**, open SageMaker Studio → Pipelines and select
-a completed execution. Review its effective parameters, step graph, jobs and
-outputs. Follow its registered model version into the inference execution.
-You can complete this walkthrough without starting jobs.
+1. [What you deploy](#1-what-you-deploy)
+2. [What notebook 00 sets up](#2-what-notebook-00-sets-up)
+3. [Train and deploy a model](#3-train-and-deploy-a-model)
+4. [Outputs: where every file lands and how to pick it up](#4-outputs-where-every-file-lands-and-how-to-pick-it-up)
+5. [Notebooks at a glance](#5-notebooks-at-a-glance)
+6. [Your model code and how to change it](#6-your-model-code-and-how-to-change-it)
+7. [From your namespace to production](#7-from-your-namespace-to-production)
+8. [Appendix](#8-appendix): configuration, experiment tracking, drift, Feature
+   Store, troubleshooting and terms
 
-**To test with an existing approved model**, start at step 3 below. A new scoring
-batch does not require another training run.
+---
 
-1. **Train when a new Development model is needed.** Open the existing training pipeline,
-   select the accepted published version and set `ModelId` and `CsvInputUri` to
-   the intended model and training CSV. Set TestCsvInputUri to the separate held-out
-   labelled CSV. Preliminary training produces metadata;
-   final training requires that metadata through `ModelMetadataUri`, as described below.
-   Training data must contain the columns and target required by that model.
-2. **Review the Development version.** After PostprocessTest and RegisterModel
-   succeed, open the resulting version in Model Registry. Check its namespace and
-   outputs. Set model approval to `Approved` and lifecycle to
-   `Development / Approved`. Notebook 02 includes an optional exact-version cell
-   that updates both fields together after review.
-3. **Run batch inference.** Open the existing inference pipeline with the same
-   `ModelId` and the scoring `CsvInputUri`. Where `InferenceRuntime` is exposed,
-   use `processing` for the baseline. ResolveModel selects the highest numeric
-   Completed, Approved version with lifecycle `Development / Approved` and matching
-   namespace, environment and ModelId. Set `ModelPackageArn` to replay an exact
-   version with those same checks. Other namespaces and ProductionCandidate
-   versions are excluded. Leave `ModelMetadataUri=registry` to use that model's
-   metadata, or supply an S3 JSON URI to override metadata for this execution. Scoring
-   inputs need model features and identifiers; a target is not required.
-   For Development Processing, select `ModelCodeSource=pipeline` to test newly
-   published inference code against that approved model without retraining.
-   The notebook's default, `artifact`, runs the model's saved code.
-4. **Inspect results.** Open the producing Postprocess job's S3 output. Check the
-   final analysis, row identifiers/counts and expected result columns. Retain
-   the execution ARN, model-package ARN and output URI with the test result.
+## 1. What you deploy
 
-Training has two sequential paths:
+![Two pipelines in your namespace](assets/images/pipelines.png)
 
-| TrainingMode | ModelMetadataUri | Trainer input |
+| Pipeline | Name in Studio | Steps |
 | --- | --- | --- |
-| `Preliminary models with validation` (default) | Leave `none`; any supplied value is ignored | `MLOPS_TRAINING_MODE="1"`, `config={}`; produces new metadata |
-| `Final model with all data` | Required: S3 URI of the preliminary run's `reports/registry/model_metadata.json` | `MLOPS_TRAINING_MODE="2"`, saved JSON as `config` |
+| Training and test | `<namespace>-training` | GetData → FeatureSelection → Preprocess → Train → GetTestData → PreprocessTest → PredictTest → PostprocessTest → RegisterModel |
+| Batch inference | `<namespace>-inference` | ResolveModel → GetData → Preprocess → Score → Postprocess, plus an optional DriftComparison |
 
-Final training with blank/`none` metadata, an empty JSON object or an inaccessible
-file fails before fitting. Preprocessing and training both apply this contract.
-Direct local calls in final mode can read an adjacent model_metadata.json when
-no metadata-URI environment variable is set. A pipeline's explicit blank/none
-never falls back to an unrelated bundled file.
+- **Training** fits the model on the training CSV. It then tests that same model
+  on a separate held-out CSV and registers a new version in Model Registry,
+  pending approval.
+- **Batch inference** picks the newest version you approved, prepares the
+  scoring CSV the same way and writes predictions.
+- **One pipeline pair serves every model.** The `ModelId` parameter (`usecase1`,
+  `usecase2`, …) selects the model's code and settings for a run.
+- **Your namespace is your own.** Your runs, outputs and registered versions carry
+  it, and inference only selects versions from your namespace.
 
-The entrypoint converts the readable selection to code `"1"` or `"2"` before
-preprocessing/training calls model code. Mode remains separate from parameters
-and hyperparameters. Custom trainers own the interpretation of the metadata;
-the example trainer remains a demonstration of fit/refit behavior. `UseHPO`, when
-published, is a separate choice; its validation objective still comes from a
-model fitted with validation.
+## 2. What notebook 00 sets up
 
-The parameter list puts ModelId, TrainingMode and ModelMetadataUri first for
-training. Inference starts with ModelId, ReferenceExecutionArn
-(when monitoring is enabled), and ModelCodeSource (when available). Other defaults
-follow. The metadata description states the conditional requirement; the native
-pipeline parameter schema does not provide conditional visibility/required rules.
-Republish with notebook 02 for the new descriptions, ordering and preprocessing
-mode binding. Confirm the displayed order in your Studio version.
+Notebook 00 is the only setup you run. It:
 
-For inference, the selected Registry model remains the source of fitted weights,
-saved parameters and image. A metadata override replaces the complete JSON
-document for the execution. ResolveModel writes a separate model archive under
-its output prefix, changing only `model_metadata.json`; it leaves the Registry
-version and original artifact unchanged. `package.json` records the original
-artifact, override URI and checksum. The override must match the fitted model's
-features and preprocessing. This works with Processing and native Transform.
+1. loads the platform settings (bucket, roles, container image, Registry
+   group prefix). If `notebooks/config.json` is incomplete, it reads them from the
+   AWS Secrets Manager secret `wsf-mlops-setup`.
+2. creates your namespace the first time and saves it in `notebooks/config.json`.
+   The name is `wsf-` + the first seven characters of your Studio user name + `-` +
+   an eight-character hash, for example `wsf-jsmith-1a2b3c4d`.
+3. reuses the configured datasets, or prepares sample data if none are configured
+   (`DATA_MODE = "auto"`)
+4. publishes the code and the CSVs to S3 and creates or updates
+   `<namespace>-training` and `<namespace>-inference`
 
-The prediction entrypoint reads `model_metadata.json` from the local directory
-where the selected **S3 model archive was unpacked**. It is not a lookup in the
-notebook working directory. Evaluation's metadata report is a byte-for-byte copy
-of that file. Processing passes the selected metadata checksum to the loader,
-which compares it before importing model code. A mismatch fails with the archive
-URI, metadata URI and both checksums. Older packages without a recorded checksum
-are explicitly reported as unverified.
+It prints the namespace, the published S3 paths and the pipeline names and
+versions. It saves a full report under `.runs/setup/deploy-<timestamp>/`. It does
+not start training or approve models.
 
-Development Processing has two independent choices:
+> Re-run notebook 00 whenever you change model code or `parameters.json`. A run
+> uses the code published with its pipeline version; runs already started keep
+> theirs.
 
-| Execution input | Meaning |
-| --- | --- |
-| `ModelCodeSource=artifact` | Use code saved inside the approved model archive. Default in notebook 02. |
-| `ModelCodeSource=pipeline` | Use the published source selected for each step. Edit, publish with notebook 02, then run inference; no training required. |
-| `ModelMetadataUri=registry` | Use the selected model's metadata. |
-| `ModelMetadataUri=s3://.../model_metadata.json` | Replace only metadata for this execution; it must remain compatible with the selected fitted model. |
+---
 
-`pipeline` means the source uploaded from the notebook's checkout; a managed job
-cannot read files directly from your notebook filesystem. Publish after editing,
-then select the new pipeline version and `ModelCodeSource=pipeline`. For a
-controlled comparison, keep the same explicit `ModelPackageArn`. The execution
-choice is available only for Development Processing. CI and native Transform
-continue to use registered model code.
+## 3. Train and deploy a model
 
-Use a complete S3 object URI, not a local filename or folder. The job role needs
-read access to the object and its encryption key, and the container needs S3
-connectivity. Keep each supplied metadata object immutable under its own key:
-training can reuse cached results for an unchanged URI, and preprocessing and
-training read that same URI independently. Invalid or inaccessible JSON fails
-instead of silently falling back. Keep the named defaults in Studio rather than
-clearing the fields.
+![Train, pick a winner, train the full model, deploy](assets/images/basic-flow.png)
 
-These fields appear after publishing the updated source with notebook 02 and
-selecting the resulting pipeline version. Copying Python files alone does not
-update an already-published execution form.
+### Step 1: preliminary runs
 
-The templates name final outputs `prediction_analysis.csv` and `summary.json`.
-Adapted analysis writes its own files into the supplied output directory:
-plots, metrics and lead files retain their names and subfolders in S3.
-It need not return a dataframe or create those demo filenames. Registry errors
-or missing approval stop inference. The [analysis call flow and file inputs](#read-the-code)
-show where to connect the model's prediction-analysis function.
+Start `<namespace>-training`. These are the parameters you normally set:
 
-| Question | Where to look |
-| --- | --- |
-| Which model, data and settings did this execution use? | Pipeline execution parameters; ResolveModel's `package.json` for the selected package/image/artifact |
-| What ran, failed or reused cached results? | Execution step details and linked Training/Processing jobs |
-| Where are the fitted model and evaluation? | Registered version's model-data and evaluation references |
-| Where are predictions and final analysis? | Score and Postprocess job output S3 locations |
-| Why did a step fail? | The first failed step, its failure reason and complete CloudWatch job logs |
+| Parameter | Default | Set to |
+| --- | --- | --- |
+| `ModelId` | first model | the model to train, from the drop-down |
+| `TrainingMode` | `Preliminary models with validation` | keep the default |
+| `ModelMetadataUri` | `none` | keep `none`; preliminary runs ignore it |
+| `CsvInputUri` | the published training CSV | another training CSV, if you want |
+| `TestCsvInputUri` | the published held-out CSV | another labelled held-out CSV, if you want |
+| `PrepareInstanceType`, `PreprocessInstanceType`, `TrainInstanceType`, `PostprocessInstanceType` | `ml.m5.large` | a larger instance for larger data |
 
-An unchanged repeat can reuse successful compute outputs. Follow the **actual
-producer's** job/output location shown by the cached step. A new execution folder
-can contain only a registration receipt while its data/model/reports remain
-under an older execution. Processing inference always runs Postprocess, which
-writes `run.json` with the original producer/output links. The completion Lambda finalizes that
-report from native execution status; MLflow is optional.
+Leave `PipelineSourceUri`, `OutputDataRoot`, `PipelineName` and `BatchChunkRows`
+as published.
 
-For complete logs, use the existing
-[job-log helper](mlops-models/scratch/job_log_cell.py) with the linked job name.
-It reads logs without restarting the job. The
-[artifact and cache reference](#source-publication-and-pipeline-execution)
-explains the detailed layout and producer links.
+Run as many preliminary runs as you need, changing settings in the model's
+`parameters.json` (re-run notebook 00 after each change) or the input data. Each
+run trains, tests on the held-out CSV and registers a pending version.
 
-## How the application works
+### Step 2: pick a winner
 
-Each step reads completed files from its upstream producer, calls the selected
-model function and writes outputs for the next step.
+Compare the runs' `steps/PostprocessTest/` output on the held-out data (section
+4). The example models write their predictions to `prediction_analysis.csv` and
+leave the `metrics` block in `evaluation.json` empty. Your model's
+`prediction_test` function decides what analysis and metrics appear there.
 
-```mermaid
-flowchart TB
-    TrainingCSV["Training CSV<br/>or configured Feature Store"]
-    TrainingCSV --> GetTrain["GetData<br/>raw snapshot"]
-    subgraph Training["Shared training pipeline — selected ModelId"]
-        GetTrain --> Select["FeatureSelection<br/>selected features + PDF"]
-        Select --> PrepTrain["Preprocess<br/>prepared training files"]
-        PrepTrain --> Train["Train<br/>model + metadata + saved metrics"]
-        Train --> GetTest["GetTestData<br/>separate held-out rows"]
-        TestCSV["Held-out labelled CSV"] --> GetTest
-        GetTest --> PrepTest["PreprocessTest<br/>test preprocessing + original selection"]
-        PrepTest --> PredictTest["PredictTest<br/>same prediction code + new model"]
-        PredictTest --> PostTest["PostprocessTest<br/>test analysis / leads"]
-        GetTrain --> PostTest
-        PostTest --> Register["RegisterModel<br/>Development / PendingApproval"]
-    end
-    Register --> Approval["Authorized model review and approval"]
-    Approval --> Registry["Model Registry<br/>approved Development model + source + image"]
-    ScoringCSV["Scoring CSV<br/>features + identifiers"] --> GetScore
-    Registry --> Resolve
-    subgraph Inference["Shared inference pipeline — Processing baseline"]
-        Resolve["ResolveModel<br/>record approved package"] --> GetScore["GetData<br/>scoring snapshot"]
-        GetScore --> PrepScore["Preprocess<br/>use original training selection"]
-        PrepScore --> Score["Score<br/>prediction files"]
-        Score --> Post["Postprocess<br/>final analysis / leads"]
-        Post --> Gate{"ReferenceExecutionArn supplied?"}
-        Gate -->|Yes| Drift["DriftComparison<br/>Evidently reports"]
-        Gate -->|No| Done["Finish"]
-    end
-    Post --> Results["S3 outputs<br/>inspect and pass to downstream owner"]
-```
-
-Feature selection also consumes the raw snapshot; training preprocessing receives
-both raw data and selected features. Train receives the prepared files and
-selection. Inference postprocessing receives raw data, saved selection and
-predictions. Those separate handoffs preserve the inputs needed by model code.
-
-Test and inference preprocessing/post-processing have separate modules under
-`model_base/inference/`, with optional use-case overrides. Prediction is shared. The source-deployed
-training pipeline calls `postprocess_test.py` with training/test directories, the selected-feature
-file, the scoring directory and the output directory. Test postprocessing must
-succeed before registration. No generic quality gate or mandatory `evaluation.json`
-is imposed; model-specific analysis owns its output files and metrics.
-
-The model archive now preserves the original `selected_features.csv` unchanged.
-Older archives without that file must be repackaged with the original selection
-or replaced by a new training run. A metadata override does not replace selection.
-No new train/test split is introduced: customer data preparation owns that split.
-
-Model parameters live in `models/<ModelId>/parameters.json`. Learned information
-travels with the saved model in `model_metadata.json` and any fitted objects.
-Inference uses that registered model's learned state. The
-[detailed contracts](#how-the-application-works)
-describe the exact function arguments and files.
-
-The supplied `usecase1` regression and `usecase2` binary-classification folders are
-replaceable examples. Their prepared-input evaluation is a workflow smoke check;
-model owners supply real validation and acceptance thresholds.
-
-Native Batch Transform is an optional inference branch with its own image/startup
-acceptance. HPO and Feature Store are also separate acceptance items. The initial
-walkthrough follows the receiving team's working training/Processing path.
-
-## Source publication and pipeline execution
-
-```mermaid
-flowchart LR
-    Code["Reviewed source + configuration"]
-    Code --> Publish["Notebook 02<br/>upload source + publish definitions"]
-    Image["Existing approved image"] --> Publish
-    Publish --> Pipeline["Published SageMaker pipeline"]
-    Operator["Studio / approved scheduler<br/>select version + ModelId + input"] --> Pipeline
-    Pipeline --> Jobs["Managed jobs"]
-    Jobs --> Artifacts["S3 artifacts + Model Registry"]
-```
-
-**To inspect existing runs, enter through the published pipeline.**
-Notebook 01 prepares sample data or performs configured ingestion. Notebook 02
-uploads source and publishes definitions; these are preparation/release
-operations. Running either notebook is not required to inspect or start an
-already deployed pipeline.
-
-A Git commit or pull request records source; it does not update SageMaker or
-rebuild an image. A source change reaches runtime through a deliberate upload
-and publication. The approved image supplies dependencies separately. Retain
-the actual deployed source/image identity rather than assuming the newest
-repository commit produced an old execution. Source publication uses a content
-digest and conditional S3 writes: changing code creates a new source location,
-while reusing a `deploy_name` cannot overwrite the old source through this
-publisher. Repeating an identical upload verifies/reuses the existing files.
-Notebook-uploaded CSVs similarly use their existing checksum in the destination.
-Externally supplied data locations retain their owner's update policy.
-
-With notebook caching enabled, each compute step resolves an immutable source
-binding based on its code fingerprint. A registry-only edit keeps the existing
-source URI for unchanged training and test compute steps; registration
-uses the new publication. An edit to a step's own code changes its binding, and
-changed upstream outputs still invalidate downstream consumers. Shared runtime
-and logging changes refresh the steps that execute them.
-
-Notebook 02 prints each step's selected source and saves the bindings in
-`publication.json`. A retained source URI is expected when the relevant code is
-unchanged. Full source snapshots and their original provenance remain intact.
-The first publication using these bindings establishes a new cache baseline.
-Keep the retained source objects and binding records under the deployment prefix.
-The pipeline execution role needs `s3:GetObject` on the binding JSON objects under
-the existing source prefix; job roles need read access to the retained snapshots.
-
-The 24-hour cache still requires an earlier successful matching step in the same
-pipeline. Changed data, model selection, execution inputs, image or job settings
-can require a rerun. Concurrent unfinished jobs are not reusable cached results.
-
-When a new deployment is intended, follow the
-[notebook publication guide](#notebook-workflows).
-Keep existing environment configuration and adapted model code.
-
-### Integration test after deployment
-
-After deployment, [notebook 05](notebooks/05_integration_test.ipynb) runs the normal
-integration matrix for all selected models: preliminary training, full training
-using the resulting metadata, both Development approvals, and inference.
-Both training modes run test preprocessing, prediction and analysis before
-registration. For two models this is six executions. It displays artifact
-checks, durations and cache hits, with receipts for resuming interrupted tests.
-Keep the Studio space running; the notebook/browser can close after launch.
-An older three-pipeline publication still runs its original eight-execution matrix.
-A fresh `RUN_LABEL` starts a new test. Reuse its saved label to resume the same
-executions; changing the label creates a separate test. Per-model `CSV_INPUTS`
-can supply `training`, `prediction_test` and `prediction_inference` URIs;
-omitted values use the corresponding published defaults. Reports and requests
-are retained under `.runs/integration-tests/<namespace>/<label>/`.
-HPO, native Transform, drift and MLflow finalization need separate acceptance.
-
-New output paths are grouped by model, pipeline and execution:
+Copy the winner's metadata URI. For example, from a real run:
 
 ```text
-s3://<bucket>/<prefix>/<namespace>/models/<ModelId>/<namespace>-training/runs/<execution-id>/
-    steps/GetData/raw/data.csv
-    steps/GetTestData/raw/data.csv
-    steps/PreprocessTest/prepared/data.csv
-    steps/PredictTest/
-    steps/PostprocessTest/
-    model/application/model.tar.gz
-    reports/registry/package.json
-    reports/registry/model_metadata.json
+s3://<bucket>/wsf-mlops/<namespace>/models/usecase1/<namespace>-training/runs/61i8exal85y6/reports/registry/model_metadata.json
 ```
 
-Inference uses the same layout under `<namespace>-inference`. Cached outputs can
-live under an earlier execution; inspect job inputs rather than constructing all
-paths from the current ID. Existing S3 objects are not moved.
+### Step 3: train the full model
 
-Registry descriptions and per-version custom metadata identify model, mode,
-namespace, pipeline and execution. A saved model producer ID is shown separately
-when available. Groups are existing platform resources; the notebook does not
-create them. An optional `model_package_group` in config.json can select one shared
-group; otherwise `registry_group_prefix` and the model ID select existing groups.
-Selection continues to require matching ModelId, namespace, environment and approval.
+Start `<namespace>-training` again:
 
+| Parameter | Set to |
+| --- | --- |
+| `ModelId` | the same model |
+| `TrainingMode` | `Final model with all data` |
+| `ModelMetadataUri` | the winner's `model_metadata.json` URI |
 
-## Notebook isolation and the future CDK route
+Full training refits the selected model on the training and validation rows. It
+stops before fitting if `ModelMetadataUri` is `none`, empty or unreadable, with
+the message *"Final model with all data requires ModelMetadataUri"*.
 
-Notebook 02 generates a namespace on first use and saves it in
-`notebooks/config.json`; subsequent runs reuse it. Supply an explicit namespace
-for an existing deployment. Each person uses their own config/namespace, while
-model versions remain in the existing shared Registry group.
+### Step 4: approve the version
 
-Set `s3_prefix` in `notebooks/config.json` to the shared top-level folder for
-application outputs. It defaults to `wsf-mlops` when the field is omitted.
-Every team member uses the same `s3_prefix` and their own `namespace`:
+Every training run registers a version with model approval
+`PendingManualApproval` and lifecycle `Development / PendingApproval`. In
+Studio, open **Models → Registered models**. Open your model's group
+(`<registry_group_prefix><ModelId>-sm-dev`) and the version from the full run.
+Then set **both**:
+
+- **Model approval:** `Approved`
+- **Lifecycle:** stage `Development`, status `Approved`
+
+Notebook 02 has an optional cell that does this for one exact version.
+
+### Step 5: run batch inference
+
+Start `<namespace>-inference`:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `ModelId` | first model | the model to score with |
+| `CsvInputUri` | the published scoring CSV | the rows to score: identifiers and features; no target needed |
+| `ModelPackageArn` | `latest-approved` | or the exact ARN of one approved version |
+| `ModelMetadataUri` | `registry` | use the model's own metadata |
+| `ModelCodeSource` | `artifact` | `artifact` runs the code saved with the model; `pipeline` runs the currently published code |
+| `ReferenceExecutionArn` | `none` | an earlier inference execution, to run the drift comparison |
+
+ResolveModel goes through the group's `Approved` versions from newest to oldest.
+It uses the first one that is `Completed` and `Development / Approved`, and that
+matches your namespace, `ModelId` and environment. An explicit
+`ModelPackageArn` must pass the same checks. If nothing qualifies, the run stops
+with *"No eligible Development model…"*; it never falls back to another
+namespace's model.
+
+> **Prefer a notebook?** `notebooks/04_run_and_monitor.ipynb` starts the same runs
+> (`PIPELINE_KIND = "training"` or `"inference"`). It can also check status, list
+> each job's actual output locations, wait or stop.
+
+---
+
+## 4. Outputs: where every file lands and how to pick it up
+
+![Where each step writes its files in S3](assets/images/s3-outputs.png)
+
+The layouts below were read from real runs on 5 November 2026: a preliminary
+training run, a full training run and a batch inference run of `usecase1`.
+
+### 4.1 Your namespace in S3
 
 ```text
-s3://team-bucket/
-  wsf-mlops/
-    alice/
-      source/       uploaded source and cache bindings
-      inputs/       uploaded local CSVs
-      models/       execution data, model artifacts and reports
-      features/     optional Feature Store data, receipts and query results
-      tracking/     tracking receipts
-      completion/   optional completion-service records
-    bob/
-      ...
+s3://<bucket>/wsf-mlops/<namespace>/
+├── source/direct-deploy/my-review/sha256-<digest>/      one folder per code publication
+│   ├── load_source.py                                  the step bootstrap
+│   ├── source.json                                     commit, digest, publication name
+│   └── mlops_models/                                   the application code the jobs run
+├── inputs/csv-direct/my-review/sha256-<file-hash>/data.csv
+│                                                       published training, held-out and scoring CSVs
+└── models/<ModelId>/
+    ├── <namespace>-training/runs/<execution-id>/       one folder per training run (4.2)
+    └── <namespace>-inference/runs/<execution-id>/      one folder per inference run (4.3)
 ```
 
-Both notebooks use the same setting. A nested value such as `team/mlops` is
-also valid; an empty value is rejected. Changing the folder does not rename
-pipelines or Registry groups. Set `"s3_prefix": "wsf-mlops"` explicitly in any
-existing config that still contains an older value, then republish.
-Each published pipeline fixes `OutputDataRoot` to its configured namespace
-folder, so execution parameters cannot redirect outputs elsewhere.
-Existing objects and externally supplied input URIs stay where they are.
-Previously created Feature Groups keep their original offline storage; notebook 01
-checks that it matches, so use newly provisioned groups or a new namespace when
-changing their destination. An enforced Athena workgroup result location and
-MLflow's configured experiment artifact locations remain platform settings.
-The application's tracking receipts use the new folder.
+The execution ID is the last part of the run's ARN, shown on the run's page in
+Studio, for example `61i8exal85y6`.
 
-Training retains the source snapshot, including uncommitted model code and the
-existing metadata input. The registered version links its source URI/digest,
-commit, image digest and trained artifacts. Development Processing uses a
-published loader that applies the execution's `ModelCodeSource` choice to GetData,
-Preprocess, Score, Postprocess and optional DriftComparison. This also lets the
-current loader report and check an older model's metadata. CI keeps the loader
-and model code bound to the registered release.
+### 4.2 A training run
 
-Source snapshots are published before execution and can serve several runs, so
-they remain under `source/` rather than being copied into each run folder.
-`source_loaded` logs the actual source identity, execution ID, model package and
-metadata binding. Successful jobs save the same bindings in their run output's
-`_execution.json`; cached outputs keep the original producer's identity.
-`SourceDigest` identifies the registered source snapshot, while
-`ModelMetadataSha256` identifies the metadata file. Compare each digest with its
-own referenced object, not with a different publication's digest.
+```text
+<namespace>-training/runs/<execution-id>/
+├── steps/
+│   ├── GetData/          raw/data.csv, raw/provenance.json
+│   ├── FeatureSelection/ selection/selected_features.csv, selection/random_forest_plots.pdf,
+│   │                     selection/metrics.json
+│   ├── Preprocess/       prepared/data.csv
+│   ├── GetTestData/      raw/data.csv, raw/provenance.json
+│   ├── PreprocessTest/   prepared/data.csv, selection/selected_features.csv
+│   ├── PredictTest/      predictions.csv, messaging.csv, messaging_final.csv
+│   └── PostprocessTest/  prediction_analysis.csv, summary.json, evaluation.json,
+│                         model_metadata.json, parameters.json, training_execution.json
+├── model/application/
+│   ├── model.tar.gz      the model archive: registered, tested and used by inference
+│   └── model/            the same files unpacked, for browsing:
+│                         predictor/, code/, parameters.json, model_metadata.json,
+│                         selected_features.csv, evaluation.json
+└── reports/
+    ├── training/         output.tar.gz and output/training.json
+    └── registry/         package.json, model_metadata.json
+```
 
-Retain the S3 source/model objects and ECR image for replay; code pinning does not
-make randomized training deterministic. Older versions without namespace and
-source metadata stay untouched and require new training before these new
-pipelines can select them.
+Every step folder also contains `_execution.json`. It records the step, the
+execution that produced it, the source commit and digest, and the metadata used.
 
-| Deployment route | Registration stage | Current scope |
+| File | What it contains |
+| --- | --- |
+| `GetData/raw/provenance.json` | data source, input URI, column list, row count and execution ID |
+| `FeatureSelection/selection/selected_features.csv` | one column, `feature`, listing the selected features |
+| `FeatureSelection/selection/metrics.json` | input rows, rows sampled, candidate and selected feature counts |
+| `PredictTest/predictions.csv` | `<primary key>,score` for every held-out row |
+| `PostprocessTest/prediction_analysis.csv` | your test analysis; in the examples `<primary key>,PREDICTION` |
+| `PostprocessTest/summary.json` | row count, task type and analysis file name |
+| `reports/registry/package.json` | the Registry version ARN, approval and lifecycle state, the model archive URI, the metadata URI and its hash, the source URI and digest, and the training mode and execution IDs |
+| `reports/registry/model_metadata.json` | what the run learned: selected model, feature mapping, predictor path, framework. Full training reads this file. |
+
+The Train job's page in Studio shows a different "model artifacts" path; that
+object is not written. Use `model/application/model.tar.gz`.
+
+### 4.3 A batch inference run
+
+```text
+<namespace>-inference/runs/<execution-id>/
+├── run.json              the whole run: parameters, step records, every output file,
+│                         the model version used and the input data
+└── steps/
+    ├── ResolveModel/     package.json
+    ├── GetData/          raw/data.csv, raw/provenance.json
+    ├── Preprocess/       prepared/data.csv, selection/selected_features.csv
+    ├── Score/            predictions.csv, messaging.csv, messaging_final.csv
+    └── Postprocess/      prediction_analysis.csv, summary.json
+```
+
+| File | What it contains |
+| --- | --- |
+| `ResolveModel/package.json` | the version used (ARN and number), its lifecycle, the model archive and metadata URIs, the source commit and container image |
+| `Score/predictions.csv` | `<primary key>,score` for every scored row |
+| `Postprocess/prediction_analysis.csv` | your inference analysis; in the examples `<primary key>,PREDICTION` |
+| `run.json` | a single index of the run, including every output file's URI |
+
+The model archive is not copied into the inference run. `ResolveModel/package.json`
+points to it in the training run's `model/application/` folder.
+
+### 4.4 What each step reads and writes inside its container
+
+Each step is a SageMaker job. The pipeline mounts its inputs at fixed local
+paths. Your function receives those paths and a writable output directory.
+Everything written under the output directory is uploaded to the step's S3
+folder with its subfolders kept. An output directory left empty fails the step.
+
+**Training pipeline**
+
+| Step | Local input ← S3 source | Uploaded to |
 | --- | --- | --- |
-| Notebook, isolated namespace | Development / PendingApproval | Implemented; approve within Development and run inference in that namespace |
-| Trusted CDK/CI pipeline | ProductionCandidate / PendingApproval | Platform integration to implement; no notebook switch enables it |
+| GetData | `/opt/ml/processing/input` ← `CsvInputUri` | `steps/GetData/` |
+| FeatureSelection | `/opt/ml/processing/raw` ← `GetData/raw/` | `steps/FeatureSelection/` |
+| Preprocess | `/opt/ml/processing/raw` ← `GetData/raw/`, `/opt/ml/processing/selection` ← `FeatureSelection/selection/` | `steps/Preprocess/` |
+| Train | `prepared` ← `Preprocess/prepared/`, `selection` ← `FeatureSelection/selection/` | `model/application/` and `reports/training/` |
+| GetTestData | `/opt/ml/processing/input` ← `TestCsvInputUri`, `/opt/ml/processing/model` ← the new model archive | `steps/GetTestData/` |
+| PreprocessTest | `/opt/ml/processing/raw` ← `GetTestData/raw/`, the model archive | `steps/PreprocessTest/` |
+| PredictTest | `/opt/ml/processing/prepared` ← `PreprocessTest/prepared/`, the model archive | `steps/PredictTest/` |
+| PostprocessTest | `/opt/ml/processing/input` ← `PredictTest/`, `/opt/ml/processing/raw` ← `GetTestData/raw/`, `/opt/ml/processing/selection` ← `PreprocessTest/selection/`, `/opt/ml/processing/training-raw` ← `GetData/raw/`, the model archive | `steps/PostprocessTest/` (written from `/opt/ml/processing/evaluation`) |
+| RegisterModel | `/opt/ml/processing/model` ← the model archive | `reports/registry/` |
 
-For the CDK route, agree a protected CI build from the merge commit, an immutable
-source release and image digest, a dedicated registration role, and restrictions
-on pipeline updates, role passing and Registry stage transitions. A notebook
-parameter or editable environment variable is not that permission boundary.
-The production candidate must come from a new training execution of the trusted
-pipeline, rather than relabeling a notebook model. Account/environment names are
-separate from the lifecycle stage.
+**Batch inference pipeline**
 
-## Read the code
+| Step | Local input ← S3 source | Uploaded to |
+| --- | --- | --- |
+| ResolveModel | Registry only | `steps/ResolveModel/` |
+| GetData | `/opt/ml/processing/input` ← `CsvInputUri`, `/opt/ml/processing/model` ← the approved model archive | `steps/GetData/` |
+| Preprocess | `/opt/ml/processing/raw` ← `GetData/raw/`, the model archive | `steps/Preprocess/` |
+| Score | `/opt/ml/processing/prepared` ← `Preprocess/prepared/`, the model archive | `steps/Score/` |
+| Postprocess | `/opt/ml/processing/input` ← `Score/`, `/opt/ml/processing/raw` ← `GetData/raw/`, `/opt/ml/processing/selection` ← `Preprocess/selection/`, the model archive | `steps/Postprocess/` |
 
-Follow this chain for any Processing or ordinary Training step:
+Every job also mounts the published code at `/opt/ml/processing/source`. Unless
+you change the defaults, Processing steps run for up to 15 minutes, except
+FeatureSelection (60 minutes); the Train job also has 15 minutes.
 
-`published definition → runtime loader → entrypoint → selected model function → files`
+### 4.5 Picking up outputs in another process
 
-| Read here | What it does |
+- **The model a run produced:** read `reports/registry/package.json` in the
+  training run. It names the Registry version and gives the model archive and
+  metadata URIs.
+- **The model an inference run used:** read `steps/ResolveModel/package.json`.
+- **Predictions:** `steps/Score/predictions.csv` holds the raw scores;
+  `steps/Postprocess/` holds your analysis.
+- **Everything about an inference run in one file:** `run.json` lists the
+  parameters, each step and the URI of every file it wrote.
+- **Cached steps.** A step whose inputs and settings are unchanged can be reused
+  for up to 24 hours. Caching applies to every training step except
+  RegisterModel, and to inference's GetData, Preprocess and Score. A reused
+  step's files stay in the earlier run's folder. In the full run shown above,
+  GetData came from execution `ka8uk3u9b52i`, not from the current run. To find a
+  step's files, use the step's job in Studio, notebook 04's *Find outputs* cell or
+  the step's `_execution.json`. Don't build the path from the current execution
+  ID.
+
+---
+
+## 5. Notebooks at a glance
+
+| Notebook | Use it to |
 | --- | --- |
-| [Pipeline builder](mlops-models/src/mlops_models/pipelines/source.py) | Builds the shared graphs, input/output references and optional branches |
-| [Training step definitions](mlops-models/src/mlops_models/pipelines/training_files.py) | Wires raw, selection and prepared-data handoffs |
-| [Runtime loader](mlops-models/src/mlops_models/runtime/load_source.py) | Locates source/model files, provides writable paths, dispatches a step and uploads its outputs |
-| [Entrypoint dispatcher](mlops-models/src/mlops_models/entrypoints/__main__.py) | Selects the step's `execute()` function |
-| [Per-model folders](mlops-models/src/mlops_models/models) | Model-specific parameters and training/inference overrides |
-| [Model base](mlops-models/src/mlops_models/model_base) | Shared example implementations that model code replaces or extends |
-| [AutoGluon framework](mlops-models/src/mlops_models/frameworks/autogluon.py) | `gluonTraining` and `gluonPredictor` contain the existing training and prediction implementations |
-| [Registry operations](mlops-models/src/mlops_models/registry/model_package.py) | Registers versions and resolves approved models |
-| [Optional tracking](mlops-models/src/mlops_models/pipelines/tracking.py) | Logs directly from existing jobs; the completion Lambda finalizes native status and cached-producer references |
+| `00_deploy_pipelines.ipynb` | Set up and publish your pipelines. Start here; re-run after code or settings changes. |
+| `05_integration_test.ipynb` | Check everything end to end. For each model it runs preliminary training, full training, approval of that exact full model and batch inference: six executions for two models. Keep the Studio space running while it works. |
+| `04_run_and_monitor.ipynb` | Start training or inference from code, check status, find each job's output locations, read a report, wait or stop. |
+| `03_experiment_model_base.ipynb` | Run feature selection on the configured CSV in your notebook kernel. |
+| `01_prepare_data.ipynb`, `02_deploy_pipelines.ipynb` | Detailed views of preparation and publication; 02 also has the exact-version approval cell. Optional. |
+| `notebooks/steps/` | Re-run one step locally (`feature_selection`, `preprocess_training`, `train`, `predict`, `postprocess`) with the inputs of a real run, for debugging. |
+| `notebooks/operations/create_setup_secret.ipynb` | For operators: create the `wsf-mlops-setup` secret once per account and region. |
 
-Model scripts retain **read inputs → model code → write outputs**. The
-orchestration supplies paths and configuration. Start with one execution's step
-and follow its entrypoint into the matching model folder; the
-[implementation reference](#read-the-code)
-covers overrides, archived source and file contracts.
+---
 
-Each entrypoint uses `load_step()` from the existing
-`entrypoints/__init__.py` to look up a named function or class in
-`models/<ModelId>/<step>.py`, then in the matching `model_base` module.
-A missing file or name uses the default; an import error inside an override
-is reported. `model_base` keeps ordinary module-level functions.
+## 6. Your model code and how to change it
 
-`usecase2` demonstrates a model with only `parameters.json`. `usecase1` adds two
-small examples:
+![How a pipeline step finds your model code](assets/images/code-map.png)
 
-- `training/feature_selection.py` subclasses `FeatureSelector` and overrides
-  `fit()`. The entrypoint passes that class to the unchanged base selection function.
-- `training/train.py` subclasses `gluonTraining` as `ModelTraining` and overrides
-  its `train_model()` method. It also defines a top-level `train_model()` override,
-  which receives the entrypoint arguments and forwards them to the base function.
+### 6.1 Three layers
 
-The class methods print a message and call `super()` with `*args, **kwargs`.
-The top-level function prints its own message and calls `base_train_model(*args, **kwargs)`.
-These examples preserve model behavior without repeating the delegated signatures.
-To replace a complete step, define its existing function name in the corresponding
-use-case module. Keep its call signature, including keyword arguments (or accept
-`*args, **kwargs`). Only names explicitly selected by the entrypoint are override points;
-redefining a helper in a different module does not change a base function's globals.
-Postprocessing resolves one whole-step function: `prediction_test` or
-`prediction_inference`. Each function reads its inputs, calls the replaceable
-`analyze_predictions` example and writes its outputs. Test output handling preserves
-the evaluation report, quality-gate result and model metadata needed by Registry;
-the entrypoint does not call a second evaluator.
+| Layer | Where | What it is |
+| --- | --- | --- |
+| Entrypoints | `mlops_models/entrypoints/` | One short file per step, 11–22 lines. Each reads the model's `parameters.json`, looks up the function or class it needs and calls it with the job's paths. You don't edit these. |
+| The model code | `mlops_models/model_base/` | The shared implementation every model uses. These six modules are the code you work with (see the table below). |
+| Your use case | `mlops_models/models/<ModelId>/` | `parameters.json` (required) and, optionally, modules that override parts of `model_base` for this model only. |
 
-The optional `framework` parameter defaults to `autogluon`. The small mapping in
-`frameworks/__init__.py` selects a trainer/predictor pair; only AutoGluon is supplied.
-Training records the framework in model metadata; prediction reads that saved
-choice, with saved parameters as the fallback for older metadata. Explicit use-case
-classes take precedence. The example trainer in `usecase1` is therefore tied to
-AutoGluon: remove or adapt it when choosing another framework.
-The base handles input settings and output packaging; framework classes handle
-fitting and prediction. Framework changes invalidate Train, PredictTest,
-PostprocessTest and Score source fingerprints; preparation remains independent.
+The model code in `model_base/`:
 
-Drift follows the same chain: `entrypoints/drift.py` calls
-the optional `models/<ModelId>/inference/drift.py` override, falling back to
-`model_base/inference/drift.py`. The base module owns `get_container_input()`,
-the comparison/report calls in `compare_drift()`, and `write_container_output()`.
-Customize the use-case module to change that model's comparison workflow.
-Drift code is saved with the trained model; changing it also invalidates the
-training cache so the next model archive includes the updated implementation.
+| Module | Steps it serves | Main functions and classes |
+| --- | --- | --- |
+| `get_data.py` | GetData, GetTestData | `download_train_data`, `download_test_data`, `download_inference_data` |
+| `training/feature_selection.py` | FeatureSelection | `run_feature_selection`, class `FeatureSelector` |
+| `preprocess.py` | Preprocess, PreprocessTest | `process_train`, `process_test`, `process_inference` |
+| `training/train.py` | Train | `train_model` |
+| `inference/predict.py` | PredictTest, Score | `predict_with_model` |
+| `postprocess.py` | PostprocessTest, Postprocess | `prediction_test`, `prediction_inference` |
 
-## What this source includes
+The trainer and predictor classes come from the framework named in
+`parameters.json`. `"framework": "autogluon"` selects `gluonTraining` (method
+`train_model`) and `gluonPredictor` (methods `predict_file`,
+`predict_with_best_model`) in `mlops_models/frameworks/autogluon.py`.
+`model_base` uses those classes unless your use case supplies its own.
 
-The latest shared additions leave model algorithms unchanged:
+### 6.2 How a step chooses your code
 
-| Addition | Value for the handoff |
-| --- | --- |
-| Configured temporary directory | The loader honors the image's `TMPDIR`, allowing the approved non-root user to use owned writable scratch |
-| Producer records beside outputs | `_execution.json` records source, execution and settings, including when later runs reuse cached artifacts |
-| Evaluation support files | Publishes available saved training parameters and producer metadata with evaluation; older packages may omit those records |
-| Optional MLflow integration | Existing jobs log to one shared execution run when configured; no tracking-only jobs are added |
-| Analysis metrics and reports | Optional `metrics.json` publishes prediction metrics; selection outputs and HTML/JSON reports are visible alongside evaluation |
-| Run index and final status | EventBridge and the completion Lambda finalize the run from native status and write the run-folder index; cached outputs retain their original producers |
-| Batch monitoring | The HasReference gate runs DriftComparison only when `ReferenceExecutionArn` is supplied; compares saved inputs/scores and publishes Evidently reports in the same inference MLflow run |
+For each name, the entrypoint looks in `models/<ModelId>/`. If your module
+defines that name, yours is used; otherwise the one in `model_base` is used.
+Checked with the repository's two example models:
 
-Keep `"tracking_uri": ""` in the source configuration until an approved service,
-compatible clients, connectivity and caller permissions are ready. With tracking
-off, the jobs make no MLflow connection. The pipeline graph is the same with tracking on or off. Existing
-published pipelines retain their own configuration until deliberately republished.
+| Name looked up | `usecase1` uses | `usecase2` uses |
+| --- | --- | --- |
+| `FeatureSelector` | `models/usecase1/training/feature_selection.py`, a subclass of the base `FeatureSelector` | `model_base` |
+| `train_model` | `models/usecase1/training/train.py`, which then calls the base `train_model` | `model_base` |
+| `ModelTraining` (trainer class) | `models/usecase1/training/train.py`, a subclass of `gluonTraining` | none, so `gluonTraining` |
+| everything else | `model_base` | `model_base` |
 
-To use an existing MLflow Tracking Server or App, set just this field in your
-existing `notebooks/config.json` (keep its other values):
+Every name you can override:
 
-```json
-{"tracking_uri": "arn:aws:sagemaker:REGION:ACCOUNT:mlflow-tracking-server/NAME"}
+| Step | File in `models/<ModelId>/` | Names |
+| --- | --- | --- |
+| GetData, GetTestData | `get_data.py` | `download_train_data`, `download_test_data`, `download_inference_data` |
+| FeatureSelection | `training/feature_selection.py` | `run_feature_selection`, `FeatureSelector` |
+| Preprocess, PreprocessTest | `preprocess.py` | `process_train`, `process_test`, `process_inference` |
+| Train | `training/train.py` | `train_model`, `ModelTraining` |
+| PredictTest, Score | `inference/predict.py` | `predict_with_model`, `ModelPredictor` |
+| PostprocessTest, Postprocess | `postprocess.py` | `prediction_test`, `prediction_inference` |
+
+A `ModelId` without `models/<ModelId>/parameters.json` is rejected with
+*"Unknown model: '<id>'; expected models/<model>/parameters.json."*
+
+### 6.3 Examples
+
+**Override one method of a class.** Keep the shared feature selection, then keep
+only the top five features. `models/<ModelId>/training/feature_selection.py`:
+
+```python
+from mlops_models.model_base.training.feature_selection import FeatureSelector as BaseSelector
+
+
+class FeatureSelector(BaseSelector):
+    def fit(self, df):
+        super().fit(df)                        # the shared random-forest ranking
+        self.selected = self.selected.head(5)  # then keep only the top five
+        self.metrics["selected_features"] = len(self.selected)
 ```
 
-An App ARN uses `mlflow-app/NAME` instead. Notebook 02 derives experiment names
-from the existing namespace and obtains artifact locations from the service.
-For a Tracking Server, it describes the server in the ARN's Region and checks
-that it is active. For either service, it uses the installed client to verify
-parameters, metrics, tags, dataset references, run search and artifact
-upload/download in a labelled `connection-check` run in each model experiment.
-The checks remain visible, and `publication.json` records their IDs and observed
-client/server versions. An empty `tracking_uri` skips all MLflow connections.
+`selected_features.csv` then lists five features and `metrics.json` reports
+`"selected_features": 5`.
 
-Use the MLflow client and `sagemaker-mlflow` plugin already supplied by the
-notebook and job images. The integration does not require equal notebook, job
-and server versions, install packages or change those images. An actual API or
-access failure stops the check with the failed operation and original error.
-Notebook success does not prove job-image compatibility, job-role, network or
-UI access; verify an actual execution in the supplied image.
+**Customise the AutoGluon trainer.** Subclass the framework class and override
+the method you need. `model_base` creates your class instead of `gluonTraining`.
+`models/<ModelId>/training/train.py`:
 
-Use the [managed MLflow integration guide](#what-this-source-includes) for
-caller permissions and activation with notebook 02.
-
-The [logging and monitoring guide](#automatic-execution-completion) explains the
-run ID, finalization call and report locations. The image build uses the root
-`requirements.txt` and its resolved lock for model jobs, MLflow and Evidently.
-The model-library versions remain pinned. Evidently requires the documented
-`requests` update from 2.31.0 to 2.34.2; apply that through the approved image build.
-BMO extends its scheduling, model-quality analysis and response integration.
-
-Enable `monitoring` in notebook 02 once Evidently is available in the approved
-image. Run inference in Studio first without a reference, then again with
-that successful execution's ARN. HasReference skips the DriftComparison job when
-no reference is supplied; Postprocess still writes prediction analysis and run.json.
-With a reference, DriftComparison uses the same saved model source/image and writes
-`reports/drift/monitoring/` under the current run folder. MLflow artifacts appear
-under `outputs/DriftComparison/monitoring/`. Missing outcomes mean quality is unavailable.
-The reference's job-written run.json identifies its actual cached producers,
-independently of MLflow. An invalid supplied reference fails the comparison. Use the same model version for the first
-comparison. Model owners configure the prediction CSV/score column and drift
-thresholds; shared code aligns records by the configured primary key.
-
-## First walkthrough and feedback
-
-Use one completed training execution and its approved model/inference example:
-
-1. Confirm model/input/version, then follow raw data through training to Registry.
-2. Follow the approved model and scoring input through inference to final output.
-3. Open one entrypoint and its model function; identify the input/output contract.
-4. Inspect a cache hit or a failed step and its producer/log links.
-5. Record the receiving team's test findings and assign the open
-   [platform and integration decisions](#notebook-isolation-and-the-future-cdk-route).
-
-First-handoff acceptance is that another engineer can find the working pipelines,
-understand and test the supported path, locate outputs/logs and identify the code
-to change. Record per-model results and the accepted source/deployment identities
-inside the receiving environment. Remaining feature and production acceptance
-continues through the integration plan.
-
-## Automatic execution completion
-
-Only notebooks 01 (data preparation) and 02 (deployment) are used. No notebook or
-launcher process must run after a pipeline execution. When completion_code_uri is
-supplied, notebook 02 deploys a completion Lambda, a terminal EventBridge rule, a five-minute reconciliation rule
-and an error alarm before publishing the pipelines. Succeeded, Failed, Stopped and
-cached executions are finalized using native execution records. Failed publication
-is retried; the reconciliation schedule covers missed events.
-
-Leave completion_code_uri empty to skip service deployment while Platform prepares it.
-This does not remove an existing service. Jobs still produce S3 outputs, register
-models and log directly to MLflow when configured. Without the service, terminal
-MLflow status and the final consolidated report are not automatic; inspect native
-SageMaker status. Postprocess still writes its initial run.json. With tracking_uri
-empty too, jobs run without MLflow. An inaccessible configured tracker fails visibly.
-
-Build the Lambda ZIP using `operations/completion/build.py` inside the same approved
-Linux x86_64 Python 3.12 image. It copies the installed MLflow client dependencies;
-it does not create another image or install different package versions. Upload it
-to an immutable S3 key and set `completion_code_uri` in notebook configuration.
-Deployment rejects a ZIP containing different reporting/handler source.
-
-The Platform deployment needs CloudFormation, IAM, Lambda and EventBridge access.
-The runtime role needs the configured pipeline/job reads, project-output S3 access,
-MLflow API access, and S3 writes to the selected experiments' artifact locations.
-Notebook 02 resolves those locations when preparing the experiments. Platform can
-express the supplied template in its CDK constructs and add its required network,
-KMS and permission-boundary settings. The model jobs continue using one image.
-
-## Feature counts
-
-Notebook 01 normally generates one column per unique supplied metadata definition,
-excluding generated ID/time keys. Set `demo_10000_features=True` in its Defaults cell
-for an explicit synthetic width demonstration. It generates metadata for 10,000
-predictors plus the target for `demo_model_id` (usecase2 by default), then uses the
-same sample-generation path. Choose that ModelId when executing training.
-
-Both example configurations now consider every predictor except ID, timestamp and
-target. FeatureSelection fits those candidates, saves `selection/metrics.json` with
-actual input/candidate/selected counts, and retains up to `feature_selection.top_k`
-(50 by default). Preprocess passes only those selected columns, keys and target to
-Train. Direct MLflow logging exposes `selection.candidate_features` and
-`selection.selected_features` using the existing metrics reader. An explicit customer
-`features` list still constrains selection. The generated sample repeats five reference
-patterns; it demonstrates feature width and artifact flow, not model quality.
+```python
+from mlops_models.frameworks.autogluon import gluonTraining
 
 
-## Source export and reference material
-
-From the repository root, run:
-
-```bash
-python release/export.py --output /your/output/source.zip
+class ModelTraining(gluonTraining):
+    def train_model(self, checkpoint_path, output):
+        self.parameters["time_limit_seconds"] = 30  # change a setting, add steps, ...
+        return super().train_model(checkpoint_path, output)
 ```
 
-The exporter packages the current working source, including staged edits, and
-clears notebook outputs. The root README is the only Markdown guide included.
-Local configuration, execution evidence and internal `docs/` notes are excluded.
-An export does not establish that its source has passed a managed integration run.
+`train_model` must return the checkpoint folder and a metadata dictionary. That
+dictionary becomes `model_metadata.json`.
 
-The CSVs in `examples/data/` are synthetic inputs. Feature Store setup and
-ingestion are available through notebook 01 and the `mlops-features/` package;
-the model application consumes the published storage configuration and completed
-delivery. Scheduling and upstream business feature calculations remain separate.
-Historical notes are retained under `docs/` for internal reference.
+**Replace a whole function.** Give it the same name and signature. For example,
+`models/<ModelId>/preprocess.py`:
+
+```python
+from pathlib import Path
+import json
+import pandas as pd
+
+
+def process_train(data_directory, selection_file, output_directory, config, parameter_path):
+    parameters = json.loads(Path(parameter_path).read_text())
+    data = pd.read_csv(Path(data_directory) / "data.csv",
+                       dtype={parameters["primary_key"]: str})
+    # ... your preparation ...
+    output = Path(output_directory) / "prepared"
+    output.mkdir(parents=True, exist_ok=True)
+    data.to_csv(output / "data.csv", index=False)  # Train reads prepared/*.csv
+    return output
+```
+
+Only `process_train` changes; `process_test` and `process_inference` still come
+from `model_base`.
+
+**Customise prediction.** Subclass the framework's predictor.
+`models/<ModelId>/inference/predict.py`:
+
+```python
+from mlops_models.frameworks.autogluon import gluonPredictor
+
+
+class ModelPredictor(gluonPredictor):
+    def predict_with_best_model(self, df, *, output_dir=None):
+        scores = super().predict_with_best_model(df, output_dir=output_dir)
+        return scores  # must keep the primary key and a score column
+```
+
+### 6.4 After you change code
+
+1. Try it locally first: notebook 03, or a step notebook in `notebooks/steps/`
+   with a real run's inputs.
+2. Commit the change.
+3. Restart the kernel and run notebook 00 to publish it.
+4. Start a new run. Earlier runs keep the code they were published with.
+
+**Adding a new model:**
+
+1. Create `models/<new_model>/` with a `parameters.json` copied from an existing
+   model.
+2. Ask the platform owner for its Registry group,
+   `<registry_group_prefix><new_model>-sm-dev`. Notebook 00 checks that the group
+   exists; it does not create it.
+3. Re-run notebook 00. The new `ModelId` then appears in the pipelines' drop-down.
+
+---
+
+## 7. From your namespace to production
+
+![From your namespace to production](assets/images/path-to-production.png)
+
+Your namespace is for development. Its versions can be approved for testing and
+used for inference there; they are not promoted to production by changing their
+labels. The intended path is:
+
+1. Open a model PR with the code and the winning `model_metadata.json`.
+2. Review and merge; the repository's required checks must pass.
+3. Platform CI/CD deploys the reviewed code to the official pipelines.
+4. Official training creates a production candidate, pending approval.
+5. The Lead Data Scientist approves the exact evaluated model. Code approval and
+   model approval are separate decisions.
+6. Production batch inference uses that approved model.
+
+> This path is being finalized with ML Platform, including accounts, roles and
+> release steps. Treat it as the intended process, not a finished one.
+
+---
+
+## 8. Appendix
+
+### Configuration
+
+Settings live in `notebooks/config.json`; `notebooks/config.example.json` lists
+the keys:
+
+```text
+bucket, s3_prefix ("wsf-mlops"), role_arn, image_uri, registry_group_prefix,
+csv_input, test_csv_input, inference_csv_input, primary_key, metadata_csv,
+feature_store_config_uri, tracking_uri, completion_code_uri, namespace, user_alias
+```
+
+If you were given a `config.json`, copy it to `notebooks/config.json` before
+running notebook 00. Leave `namespace` and `user_alias` empty so that notebook 00
+creates your own namespace. Outside Studio, set `user_alias` instead.
+
+The sections below are still being finalized; expect changes.
+
+### A. Experiment tracking (MLflow)
+
+Off by default. Set `tracking_uri` to the SageMaker MLflow tracking server or
+App and re-run notebook 00. Jobs then log runs to MLflow. Model versions and
+approvals stay in Model Registry. Setup and access are being agreed with ML
+Platform.
+
+### B. Drift
+
+Set `ReferenceExecutionArn` to an earlier inference execution to run the
+DriftComparison step after Postprocess. With the default `none`, the step is
+skipped. Reports and alerting are still being designed.
+
+### C. Feature Store
+
+The deployments described here read CSV files from S3 (`csv_direct`). GetData
+can also read SageMaker Feature Store, but Feature Store ingestion and reads for
+BMO data are not yet set up.
+
+### D. Troubleshooting
+
+| You see | Likely cause |
+| --- | --- |
+| *Final model with all data requires ModelMetadataUri* | Set `ModelMetadataUri` to the winner's `reports/registry/model_metadata.json`. |
+| *No eligible Development model…* | No version for this `ModelId` and namespace is both `Approved` and `Development / Approved`. |
+| *Unknown model: '…'* | `models/<ModelId>/parameters.json` does not exist. |
+| A step finished in seconds | It was reused from an earlier run; its files are in that run's folder (4.5). |
+| Your code change did not take effect | Notebook 00 was not re-run, or the run started before republishing. |
+| A step stopped at its time limit | 15 minutes for most steps, 60 for FeatureSelection; use a larger instance type or ask for a longer limit. |
+| The Train job's "model artifacts" link is missing | Use `model/application/model.tar.gz` (4.2). |
+
+### E. Terms
+
+| Term | Meaning |
+| --- | --- |
+| Namespace | Your personal prefix for pipelines, S3 outputs and registered versions. |
+| `ModelId` | The use case a run is for; selects `models/<ModelId>/`. |
+| Preliminary run | Training with validation; compares settings and produces metadata. |
+| Full run | Training on all data using a chosen preliminary run's metadata. |
+| Model metadata | `model_metadata.json`: what a run learned, used by the full run and by inference. |
+| Execution ID | The ID of one pipeline run; names its S3 run folder. |
+| `_execution.json` | A record of the code, inputs and execution that produced a step's files. |

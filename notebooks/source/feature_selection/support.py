@@ -2,10 +2,10 @@
 
 from contextlib import contextmanager
 import importlib
+from inspect import getsource
 import json
 import os
 from pathlib import Path
-from pprint import pformat
 import sys
 from tempfile import mkdtemp, TemporaryDirectory
 from textwrap import indent
@@ -94,47 +94,98 @@ def _prepare_imports(repository, model_id):
             importlib.reload(sys.modules[name])
 
 
-def _vscode_code(model_id, execution_arn, job_name, raw_uri, environment):
-    """A standalone main block for the existing entrypoint, with resolved inputs."""
-    local_keys = {"MLOPS_MODEL_DIR", "SM_MODEL_DIR", "SM_OUTPUT_DATA_DIR", "SM_OUTPUT_DIR"}
-    saved_environment = {key: value for key, value in environment.items() if key not in local_keys}
+def _vscode_code(model_id, execution_arn):
+    """A standalone main block that resolves the editable model/execution inputs."""
+    pipeline_arn = execution_arn.rsplit("/execution/", 1)[0]
     assignments = (
-        f"# Requested execution: {execution_arn}\n"
-        f"# FeatureSelection job: {job_name}\n"
+        "# Change these two values to test another model and execution.\n"
         f"MODEL_ID = {model_id!r}\n"
-        f"REGION = {execution_arn.split(':')[3]!r}\n"
-        f"DATA_URI = {raw_uri!r}\n"
-        f"environment = {pformat(saved_environment, sort_dicts=False)}\n"
+        f"EXECUTION_ID = {execution_arn!r}\n"
     )
-    setup_and_call = r'''
+    imports_and_lookup = r'''
 from pathlib import Path
 from tempfile import mkdtemp
 from urllib.parse import urlsplit
+import json
 import os
 import boto3
+from botocore.config import Config
+
+'''
+    # Embed the same cache-aware lookup; the pasted block needs no helper file.
+    imports_and_lookup += getsource(_processing_job) + "\n"
+    imports_and_lookup += (
+        "# A bare ID uses the original pipeline; a full ARN can select another one.\n"
+        "execution_arn = EXECUTION_ID.strip()\n"
+        "if not execution_arn:\n"
+        '    raise ValueError("Set EXECUTION_ID to an execution ID or its full ARN.")\n'
+        'if not execution_arn.startswith("arn:"):\n'
+        '    if any(character in execution_arn for character in "/: \\t\\n"):\n'
+        '        raise ValueError("Supply an execution ID or full ARN, not a console URL.")\n'
+        f"    execution_arn = {pipeline_arn + '/execution/'!r} + execution_arn\n"
+    )
+    setup_and_call = r'''
+parts = execution_arn.split(":", 5)
+if (len(parts) != 6 or parts[2] != "sagemaker"
+        or not parts[5].startswith("pipeline/") or "/execution/" not in parts[5]):
+    raise ValueError("Supply a SageMaker pipeline execution ARN.")
 
 # This block belongs to entrypoints/feature_selection.py, where execute is defined.
 # Read the current checkout's parameters; do not reuse notebook-local paths.
 model_directory = Path(__file__).resolve().parents[1] / "models" / MODEL_ID
+if not MODEL_ID.isidentifier() or not (model_directory / "parameters.json").is_file():
+    raise ValueError("Set MODEL_ID to a model in this checkout with parameters.json.")
+session = boto3.Session(region_name=parts[3])
+client_options = Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 2})
+sm = session.client("sagemaker", config=client_options)
+print("Inspecting execution:", execution_arn, flush=True)
+producer_arn, job = _processing_job(sm, execution_arn)
+recorded = job.get("Environment", {})
+if recorded.get("MODEL_ID") != MODEL_ID:
+    raise ValueError(f"This job belongs to {recorded.get('MODEL_ID')!r}, not {MODEL_ID!r}.")
+raw = [item["S3Input"] for item in job["ProcessingInputs"]
+       if item.get("InputName") == "raw" and "S3Input" in item]
+if len(raw) != 1:
+    raise ValueError("The FeatureSelection job must have one raw S3 input.")
+raw_uri = raw[0]["S3Uri"].rstrip("/")
+if not raw_uri.endswith(".csv"):
+    raw_uri += "/data.csv"
+address = urlsplit(raw_uri)
+if address.scheme != "s3" or not address.netloc or not address.path.strip("/"):
+    raise ValueError("The job's raw input is not an S3 URI: " + raw_uri)
+print("Processing job:", job["ProcessingJobName"], "|", job["ProcessingJobStatus"], flush=True)
+if producer_arn != execution_arn:
+    print("Cached FeatureSelection producer:", producer_arn, flush=True)
+print("Current checkout parameters:", model_directory / "parameters.json", flush=True)
+
 work_directory = Path(mkdtemp(prefix="feature-selection-"))
 data_directory = work_directory / "raw"
 output_directory = work_directory / "output"
 data_directory.mkdir()
 output_directory.mkdir()
+(output_directory / "job.json").write_text(json.dumps(job, indent=2, default=str) + "\n")
 (output_directory / "parameters.used.json").write_bytes(
     (model_directory / "parameters.json").read_bytes()
 )
-address = urlsplit(DATA_URI)
-print("Download:", DATA_URI, flush=True)
-boto3.client("s3", region_name=REGION).download_file(
+print("Download:", raw_uri, flush=True)
+session.client("s3", config=client_options).download_file(
     address.netloc, address.path.lstrip("/"), str(data_directory / "data.csv")
 )
-environment.update({
+selection = recorded.get("MLOPS_TRAINING_SELECTION", recorded.get("MLOPS_TRAINING_MODE", "1"))
+mode = {"Preliminary models with validation": "1", "Final model with all data": "2"}.get(selection, selection)
+environment = {
+    "MODEL_ID": MODEL_ID,
+    "MLOPS_TRAINING_MODE": mode,
+    "MLOPS_TRAINING_SELECTION": selection,
+    "MLOPS_MODEL_METADATA_URI": recorded.get("MLOPS_MODEL_METADATA_URI", "none"),
+    "MLOPS_TRACKING_URI": "",
+    "MLOPS_WRITE_RUN_REPORT": "0",
+    "MLOPS_LOG_ARTIFACTS": "0",
     "MLOPS_MODEL_DIR": str(model_directory),
     "SM_MODEL_DIR": str(model_directory),
     "SM_OUTPUT_DATA_DIR": str(output_directory),
     "SM_OUTPUT_DIR": str(output_directory),
-})
+}
 previous = {key: os.environ.get(key) for key in environment}
 result = None
 try:
@@ -159,14 +210,14 @@ finally:
         "# Use this checkout's Python interpreter with the project installed editable,\n"
         "# or the existing module-based F5 configuration. See README.md: Run a step locally.\n"
         'if __name__ == "__main__":\n'
-        + indent(assignments + setup_and_call, "    ")
+        + indent(assignments + imports_and_lookup + setup_and_call, "    ")
     )
     compile(code, "feature_selection.py", "exec")
     return code
 
 
 def prepare(repository, model_id, execution_id):
-    """Resolve/download inputs without running selection; freeze the VS Code block."""
+    """Resolve/download inputs without running selection; prepare the VS Code block."""
     started = perf_counter()
     repository = Path(repository).resolve()
     parameter_path = repository / "mlops-models/src/mlops_models/models" / model_id / "parameters.json"
@@ -232,7 +283,7 @@ def prepare(repository, model_id, execution_id):
         "SM_OUTPUT_DATA_DIR": str(output_directory),
         "SM_OUTPUT_DIR": str(output_directory),
     }
-    vscode_code = _vscode_code(model_id, execution_arn, job_name, raw_uri, environment)
+    vscode_code = _vscode_code(model_id, execution_arn)
     try:
         # Save the export before downloading or importing the model's dependencies.
         (output_directory / "vscode_main.py").write_text(vscode_code, encoding="utf-8")
