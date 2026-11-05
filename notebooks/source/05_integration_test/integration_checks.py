@@ -222,18 +222,20 @@ class IntegrationSuite:
         return kind, overrides, effective
 
     def run(self):
-        """Run all phases; retain evidence and surface failures without hiding them."""
+        """Finish independent routes, then report any failures together."""
         if not self.prepared:
             raise ValueError("Run prepare() before run().")
         self.state.setdefault("started_at", _now())
         self.state.update(status="Running", error="", ended_at=None)
         self.deadline = time.monotonic() + self.timeout_minutes * 60
         try:
-            self._phase("preliminary")
-            self._phase("full")
-            self._approve_full_models()
-            self._phase(*(("prediction_inference",) if self.combined else
-                          ("prediction_test", "prediction_inference")))
+            errors = self._phase("preliminary")
+            errors.extend(self._phase("full"))
+            errors.extend(self._approve_full_models())
+            errors.extend(self._phase(*(("prediction_inference",) if self.combined else
+                                       ("prediction_test", "prediction_inference"))))
+            if errors:
+                raise RuntimeError("Independent routes finished; some tests failed:\n" + "\n".join(errors))
             self.state["status"] = "Passed"
         except BaseException as error:
             self.state.update(status="Interrupted" if isinstance(error, KeyboardInterrupt) else "Failed",
@@ -246,51 +248,76 @@ class IntegrationSuite:
         return self.report()
 
     def _phase(self, *phases):
-        cases = []
+        cases, errors = [], []
         # Submit the whole phase before waiting, so independent models run together.
         for phase in phases:
             for model in self.models:
                 key = f"{model}/{phase}"
+                kind = "testing" if phase == "prediction_test" else (
+                    "inference" if phase == "prediction_inference" else "training")
+                case = self.state["executions"].setdefault(key, {
+                    "model": model, "phase": phase, "kind": kind, "status": "Pending"})
+                prefix = key + "/"
+                self.state["checks"] = {k: v for k, v in self.state["checks"].items()
+                                        if not k.startswith(prefix)}
+                case.pop("error", None)
+                case["verification"] = "Pending"
                 prior = self.state["executions"].get(f"{model}/preliminary", {})
                 full = self.state["executions"].get(f"{model}/full", {})
-                kind, overrides, effective = self._parameters(
-                    model, phase, metadata_uri=prior.get("metadata_uri", ""),
-                    package_arn=full.get("package_arn", ""))
-                display_name = (
-                    f"{model}-{phase.removeprefix('prediction_')}-{self.settings['run_label']}"
-                )[:82].rstrip("-")
-                # A resume retains the original submitted request and token.
-                prior_case = self.state["executions"].get(key)
-                if prior_case:
-                    display_name = prior_case["request"]["PipelineExecutionDisplayName"]
-                request = {"PipelineName": self.pipelines[kind]["arn"],
-                           "PipelineVersionId": self.pipelines[kind]["version"],
-                           "PipelineExecutionDisplayName": display_name,
-                           "PipelineParameters": [{"Name": k, "Value": _string(v)}
-                                                  for k, v in sorted(overrides.items())]}
-                case = self.state["executions"].setdefault(key, {
-                    "model": model, "phase": phase, "kind": kind, "request": request,
-                    "effective": effective,
-                    "token": uuid5(NAMESPACE_URL, self.settings["run_label"] +
-                                   json.dumps(request, sort_keys=True)).hex,
-                    "status": "Pending"})
-                if case["request"] != request:
-                    raise ValueError(f"{key}: saved request differs. Use a new RUN_LABEL.")
-                self._save()  # Persist the token before any possible start request.
-                if not case.get("execution_arn"):
-                    response = self.sm.start_pipeline_execution(
-                        **request, ClientRequestToken=case["token"])
-                    case.update(execution_arn=response["PipelineExecutionArn"], status="Executing",
-                                started_at=_now())
+                dependency = ""
+                if phase == "full" and not self._verified(prior):
+                    dependency = f"{model}/preliminary did not pass its execution and output checks."
+                elif phase.startswith("prediction_") and (
+                        not self._verified(full) or full.get("approval") != "Passed"):
+                    dependency = f"{model}/full did not pass its execution, output checks and approval."
+                if dependency:
+                    case.update(verification="Blocked", error=dependency)
+                    if not case.get("execution_arn"):
+                        case["status"] = "Blocked"
                     self._save()
+                    self._notify()
+                    continue
+                try:
+                    kind, overrides, effective = self._parameters(
+                        model, phase, metadata_uri=prior.get("metadata_uri", ""),
+                        package_arn=full.get("package_arn", ""))
+                    display_name = (
+                        f"{model}-{phase.removeprefix('prediction_')}-{self.settings['run_label']}"
+                    )[:82].rstrip("-")
+                    # A resume retains the original submitted request and token.
+                    if case.get("request"):
+                        display_name = case["request"]["PipelineExecutionDisplayName"]
+                    request = {"PipelineName": self.pipelines[kind]["arn"],
+                               "PipelineVersionId": self.pipelines[kind]["version"],
+                               "PipelineExecutionDisplayName": display_name,
+                               "PipelineParameters": [{"Name": k, "Value": _string(v)}
+                                                      for k, v in sorted(overrides.items())]}
+                    if case.get("request", request) != request:
+                        raise ValueError(f"{key}: saved request differs. Use a new RUN_LABEL.")
+                    case.update(request=request, effective=effective)
+                    case.setdefault("token", uuid5(NAMESPACE_URL, self.settings["run_label"] +
+                                                   json.dumps(request, sort_keys=True)).hex)
+                    self._save()  # Persist the token before any possible start request.
+                    if not case.get("execution_arn"):
+                        response = self.sm.start_pipeline_execution(
+                            **request, ClientRequestToken=case["token"])
+                        case.update(execution_arn=response["PipelineExecutionArn"], status="Executing",
+                                    started_at=_now())
+                        self._save()
+                except Exception as error:
+                    if not case.get("execution_arn"):
+                        # A lost response may mean AWS accepted the request. Keep its token.
+                        case["status"] = "Start unconfirmed"
+                    errors.append(self._record_failure(case, "Start request", error))
+                    self._save()
+                    self._notify()
+                    continue
                 cases.append(case)
         self._wait(cases)
-        errors = []
         for case in cases:
-            prefix = f"{case['model']}/{case['phase']}/"
-            self.state["checks"] = {k: v for k, v in self.state["checks"].items()
-                                    if not k.startswith(prefix)}
             try:
+                if case.get("error"):
+                    raise ValueError(case["error"])
                 self._check(case, "Pipeline succeeded", case["status"] == "Succeeded",
                             case.get("failure", case["status"]))
                 self._verify_parameters(case)
@@ -299,25 +326,37 @@ class IntegrationSuite:
                 else:
                     self._verify_inference(case)
             except Exception as error:
-                case["verification"] = "Failed"
-                self.state["checks"][f"{case['model']}/{case['phase']}/validation"] = {
-                    "model": case["model"], "phase": case["phase"], "check": "Required outputs",
-                    "result": "FAIL", "detail": str(error)}
-                errors.append(f"{case['model']}/{case['phase']}: {error}")
+                errors.append(self._record_failure(case, "Required outputs", error))
             else:
                 case["verification"] = "Passed"
             self._save()
             self._notify()
-        if errors:
-            raise RuntimeError("\n".join(errors))
+        return errors
+
+    @staticmethod
+    def _verified(case):
+        return case.get("status") == "Succeeded" and case.get("verification") == "Passed"
+
+    def _record_failure(self, case, check, error):
+        case.update(verification="Failed", error=str(error))
+        self.state["checks"][f"{case['model']}/{case['phase']}/{check}"] = {
+            "model": case["model"], "phase": case["phase"], "check": check,
+            "result": "FAIL", "detail": str(error)}
+        return f"{case['model']}/{case['phase']}: {error}"
 
     def _wait(self, cases):
+        remaining = list(cases)
         while True:
             pending = []
-            for case in cases:
-                detail = self.sm.describe_pipeline_execution(PipelineExecutionArn=case["execution_arn"])
-                case["status"] = detail["PipelineExecutionStatus"]
-                case["steps"] = self._execution_steps(case["execution_arn"])
+            for case in remaining:
+                try:
+                    detail = self.sm.describe_pipeline_execution(PipelineExecutionArn=case["execution_arn"])
+                    case["status"] = detail["PipelineExecutionStatus"]
+                    case["steps"] = self._execution_steps(case["execution_arn"])
+                except Exception as error:
+                    case["error"] = (f"Could not inspect execution: {error}. Jobs are not cancelled; "
+                                     "use the same RUN_LABEL to resume inspection.")
+                    continue
                 if detail.get("CreationTime"):
                     case["started_at"] = detail["CreationTime"].isoformat()
                 if case["status"] in TERMINAL:
@@ -325,13 +364,14 @@ class IntegrationSuite:
                                         if detail.get("LastModifiedTime") else _now())
                     failures = [f"{s['StepName']}: {s.get('FailureReason', s['StepStatus'])}"
                                 for s in case["steps"] if s["StepStatus"] in {"Failed", "Stopped"}]
-                    case["failure"] = detail.get("FailureReason") or "; ".join(failures)
+                    case["failure"] = "; ".join(filter(None, [detail.get("FailureReason"), *failures]))
                 else:
                     pending.append(case)
             self._save()
             self._notify()
             if not pending:
                 return
+            remaining = pending
             self._pause("Waiting for " + ", ".join(c["model"] + "/" + c["phase"] for c in pending))
 
     def _pause(self, reason):
@@ -442,29 +482,42 @@ class IntegrationSuite:
                         mounts)
 
     def _approve_full_models(self):
+        errors = []
         for model in self.models:
             case = self.state["executions"][f"{model}/full"]
-            # Recheck the exact version immediately before mutating its two approval fields.
-            self._verify_training(case)
-            arn = case["package_arn"]
-            package = self.sm.describe_model_package(ModelPackageName=arn)
-            if (package.get("ModelApprovalStatus") != "Approved" or
-                    package.get("ModelLifeCycle", {}).get("StageStatus") != "Approved"):
-                self.sm.update_model_package(
-                    ModelPackageArn=arn, ModelApprovalStatus="Approved",
-                    ModelLifeCycle={"Stage": "Development", "StageStatus": "Approved"},
-                    ApprovalDescription=f"Integration test {self.settings['run_label']}: verified full training outputs")
-            while True:
+            if not self._verified(case):
+                case["approval"] = "Blocked"
+                continue
+            case["approval"] = "Pending"
+            try:
+                # Recheck the exact version immediately before mutating its two approval fields.
+                self._verify_training(case)
+                arn = case["package_arn"]
                 package = self.sm.describe_model_package(ModelPackageName=arn)
-                issues = check_model_package(
-                    package, case["registry_group"], self.namespace, model,
-                    self.pipelines["training"]["definition"]["Metadata"]["Environment"])
-                if not issues:
-                    break
-                self._pause(f"Waiting for both approvals on {arn}: " + "; ".join(issues))
-            self._check(case, "Both Development approvals", True, arn)
+                if (package.get("ModelApprovalStatus") != "Approved" or
+                        package.get("ModelLifeCycle", {}).get("StageStatus") != "Approved"):
+                    self.sm.update_model_package(
+                        ModelPackageArn=arn, ModelApprovalStatus="Approved",
+                        ModelLifeCycle={"Stage": "Development", "StageStatus": "Approved"},
+                        ApprovalDescription=f"Integration test {self.settings['run_label']}: verified full training outputs")
+                while True:
+                    package = self.sm.describe_model_package(ModelPackageName=arn)
+                    issues = check_model_package(
+                        package, case["registry_group"], self.namespace, model,
+                        self.pipelines["training"]["definition"]["Metadata"]["Environment"])
+                    if not issues:
+                        break
+                    self._pause(f"Waiting for both approvals on {arn}: " + "; ".join(issues))
+                self._check(case, "Both Development approvals", True, arn)
+                case["approval"] = "Passed"
+            except TimeoutError:
+                raise
+            except Exception as error:
+                case["approval"] = "Failed"
+                errors.append(self._record_failure(case, "Both Development approvals", error))
             self._save()
             self._notify()
+        return errors
 
     def _files(self, uri):
         bucket, prefix = _location(uri.rstrip("/") + "/")
@@ -526,7 +579,7 @@ class IntegrationSuite:
                          "model_package": case.get("package_arn", ""),
                          "metadata_uri": case.get("metadata_uri", ""),
                          "analysis_uri": case.get("analysis_uri", ""),
-                         "failure": case.get("failure", "")})
+                         "failure": case.get("error") or case.get("failure", "")})
         checks = list(self.state["checks"].values())
         return {"status": self.state["status"], "error": self.state.get("error", ""),
                 "elapsed_minutes": elapsed(self.state["started_at"], ended) if self.state.get("started_at") else 0,
