@@ -75,7 +75,7 @@ class IntegrationSuite:
         targets = deepcopy(publication.get("pipelines", {}))
         targets.update(pipelines or {})
         if not all(targets.get(kind) for kind in ("training", "inference")):
-            raise ValueError("Run notebook 02 first, or provide the training and inference names/ARNs in PIPELINES.")
+            raise ValueError("Run notebook 00 (or 02) first, or provide the training and inference names/ARNs in PIPELINES.")
         self.combined = not targets.get("testing")
         self.phases = ("preliminary", "full", "prediction_inference") if self.combined else PHASES
         self.targets = {
@@ -282,8 +282,11 @@ class IntegrationSuite:
                         model, phase, metadata_uri=prior.get("metadata_uri", ""),
                         package_arn=full.get("package_arn", ""))
                     display_name = (
-                        f"{model}-{phase.removeprefix('prediction_')}-{self.settings['run_label']}"
-                    )[:82].rstrip("-")
+                        f"{self.settings['run_label']}-{phase.removeprefix('prediction_')}-{model}"
+                    )
+                    if len(display_name) > 82:
+                        suffix = hashlib.sha256(display_name.encode()).hexdigest()[:8]
+                        display_name = display_name[:73].rstrip("-") + "-" + suffix
                     # A resume retains the original submitted request and token.
                     if case.get("request"):
                         display_name = case["request"]["PipelineExecutionDisplayName"]
